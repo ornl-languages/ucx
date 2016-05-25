@@ -155,6 +155,7 @@ enum ucp_dt_type {
 #define ucp_dt_make_contig(_elem_size) \
     (((ucp_datatype_t)(_elem_size) << UCP_DATATYPE_SHIFT) | UCP_DATATYPE_CONTIG)
 
+typedef void * ucp_request_merged_t;
 
 /**
  * @ingroup UCP_DATATYPE
@@ -1250,6 +1251,38 @@ ucs_status_t ucp_put_nbi(ucp_ep_h ep, const void *buffer, size_t length,
 
 /**
  * @ingroup UCP_COMM
+ * @brief Non-blocking implicit remote memory put operation with explicit
+ *        handle.
+ *
+ * This routine initiates a storage of contiguous block of data that is
+ * described by the local address @a buffer in the remote contiguous memory
+ * region described by @a remote_addr address and the @ref ucp_rkey_h "memory
+ * handle" @a rkey.  The routine returns immediately and @b does @b not
+ * guarantee re-usability of the source address @e buffer. If the operation is
+ * completed immediately the routine return UCS_OK, otherwise UCS_INPROGRESS
+ * or an error is returned to user.
+ *
+ * @note A user can use @ref ucp_worker_flush "ucp_worker_flush()"
+ * in order to guarantee re-usability of the source address @e buffer.
+ *
+ * @param [in]  ep           Remote endpoint handle.
+ * @param [in]  buffer       Pointer to the local source address.
+ * @param [in]  length       Length of the data (in bytes) stored under the
+ *                           source address.
+ * @param [in]  remote_addr  Pointer to the destination remote address
+ *                           to write to.
+ * @param [in]  rkey         Remote memory key associated with the
+ *                           remote address.
+ * @param [out] req          The request handle
+ *
+ * @return Error code as defined by @ref ucs_status_t
+ */
+ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
+                         uint64_t remote_addr, ucp_rkey_h rkey,
+                         ucp_mem_h mem, ucp_request_merged_t *req);
+
+/**
+ * @ingroup UCP_COMM
  * @brief Blocking remote memory get operation.
  *
  * This routine loads contiguous block of data that is described by the remote
@@ -1300,6 +1333,37 @@ ucs_status_t ucp_get(ucp_ep_h ep, void *buffer, size_t length,
  */
 ucs_status_t ucp_get_nbi(ucp_ep_h ep, void *buffer, size_t length,
                          uint64_t remote_addr, ucp_rkey_h rkey);
+
+/**
+ * @ingroup UCP_COMM
+ * @brief Non-blocking implicit remote memory get operation with explicit
+ *        handle.
+ *
+ * This routine initiate a load of contiguous block of data that is described
+ * by the remote address @a remote_addr and the @ref ucp_rkey_h "memory handle"
+ * @a rkey in the local contiguous memory region described by @a buffer
+ * address.  The routine returns immediately and @b does @b not guarantee that
+ * remote data is loaded and stored under the local address @e buffer.
+ *
+ * @note A user can use @ref ucp_worker_flush "ucp_worker_flush()" in order
+ * guarantee that remote data is loaded and stored under the local address
+ * @e buffer.
+ *
+ * @param [in]  ep           Remote endpoint handle.
+ * @param [in]  buffer       Pointer to the local source address.
+ * @param [in]  length       Length of the data (in bytes) stored under the
+ *                           source address.
+ * @param [in]  remote_addr  Pointer to the destination remote address
+ *                           to write to.
+ * @param [in]  rkey         Remote memory key associated with the
+ *                           remote address.
+ * @param [out] req          The request handle
+ *
+ * @return Error code as defined by @ref ucs_status_t
+ */
+ucs_status_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
+                         uint64_t remote_addr, ucp_rkey_h rkey,
+                         ucp_mem_h mem, ucp_request_merged_t *req);
 
 /**
  * @ingroup UCP_COMM
@@ -1561,6 +1625,15 @@ ucs_status_t ucp_atomic_cswap64(ucp_ep_h ep, uint64_t compare, uint64_t swap,
  */
 int ucp_request_is_completed(void *request);
 
+/**
+ * @ingroup UCP_COMM
+ * @brief Wait for a Request to be completed.
+ *
+ * This routine waits for a request to be completed.
+ *
+ * @param [in]  request      Non-blocking request to check.
+ */
+void ucp_request_wait(void* request);
 
 /**
  * @ingroup UCP_COMM
