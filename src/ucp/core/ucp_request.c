@@ -4,13 +4,17 @@
  * See file LICENSE for terms.
  */
 
+#include "ucp_ep.inl"
 #include "ucp_request.h"
 #include "ucp_context.h"
 #include "ucp_worker.h"
+#include "ucp_mm.h"
 
+#include "uct/api/uct.h"
 #include <ucp/tag/match.h>
 #include <ucs/datastruct/mpool.inl>
 #include <ucs/debug/log.h>
+#include <ucs/arch/bitops.h>
 #include <ucs/type/status.h>
 
 
@@ -23,14 +27,13 @@ int ucp_request_is_completed(void *request)
 void ucp_request_wait(void *request)
 {
 //    ucs_status_t status;
-    ucp_request_t *req = (ucp_request_t*)request - 1;
+    ucp_request_t *req = (ucp_request_t*)request;
 
-//    printf("ucp_request_wait\n");fflush(NULL);
 #if 0
     ucp_worker_progress(req->send.ep->worker);
 //    ucp_worker_flush(req->send.ep->worker);
 #else
-    while(!ucp_request_is_completed(request)) {
+    while(!ucp_request_is_completed( ((ucp_request_t*)request+1) )) {
 //        printf("worker_progress\n");fflush(NULL);
         ucp_worker_progress(req->send.ep->worker);
         req->flags |= UCP_REQUEST_FLAG_COMPLETED;
@@ -54,7 +57,24 @@ void ucp_request_wait(void *request)
             //break;
         }
     }
+#if 1
+    if (NULL != req->send.state.dt.contig.memh) {
+        ucp_lane_index_t lane;
+        ucp_ep_config_t *config;
+        ucp_pd_lane_map_t ep_lane_map, rkey_pd_map;
+        uint8_t bit_index;
+
+        config     = ucp_ep_config(req->send.ep);
+        ep_lane_map = config->key.rma_lane_map;
+        rkey_pd_map = ucp_ep_pd_map_expand((req->send.rma.rkey)->pd_map);
+        bit_index    = ucs_ffs64(ep_lane_map & rkey_pd_map);
+        lane         = bit_index / UCP_PD_INDEX_BITS;
+        uct_pd_h uct_pd = ucp_ep_pd(req->send.ep, lane);
+        uct_pd_mem_dereg(uct_pd, req->send.state.dt.contig.memh);
+    }
 #endif
+#endif
+    ucp_request_release(((ucp_request_t*)request+1));
 }
 
 void ucp_request_release(void *request)

@@ -144,33 +144,33 @@ static ucs_status_t ucp_progress_put_nbe(uct_pending_req_t *self)
     uct_ep_h uct_ep;
     ucp_ep_config_t *config;
     ucp_lane_index_t lane;
+    ucp_ep_rma_config_t *rma_config;
 
     UCP_EP_RESOLVE_RKEY(ep, rkey, rma, config, lane, uct_rkey);
     uct_ep = ep->uct_eps[lane];
+    rma_config = &config->rma[lane];
+
+    if (req->send.length <= rma_config->max_put_short) {
+        status = uct_ep_put_short(uct_ep, req->send.buffer,
+                                  req->send.length, req->send.rma.remote_addr,
+                                  uct_rkey);
+        return status;
+    }
     for (;;) {
-        size_t frag_length = ucs_min(config->max_am_zcopy, req->send.length);
         status = uct_ep_put_zcopy(uct_ep, req->send.buffer,
                                   req->send.length,
-                                  req->send.mem, req->send.rma.remote_addr,
+                                  req->send.state.dt.contig.memh, req->send.rma.remote_addr,
                                   uct_rkey, &req->send.uct_comp);
 
         if (ucs_likely(status == UCS_OK)) {
-            goto posted;
+            break;
         } else if (status == UCS_INPROGRESS) {
             ++req->send.uct_comp.count;
-            goto posted;
+            break;
         } else {
             /* Return - Error occured */
             return status;
         }
-posted:
-        req->send.length      -= frag_length;
-        if (req->send.length == 0) {
-            break;
-        }
-
-        req->send.buffer      += frag_length;
-        req->send.rma.remote_addr += frag_length;
     }
 
     return status;
@@ -192,14 +192,22 @@ void ucp_add_pending_rma(ucp_request_t *req, ucp_ep_h ep, uct_ep_h uct_ep,
 }
 
 static UCS_F_ALWAYS_INLINE
-void ucp_add_pending_rma_e(ucp_request_t *req, uct_mem_h mem, ucp_ep_h ep,
+void init_rma_request(ucp_request_t *req, ucp_ep_h ep, ucp_rkey_h rkey) {
+    req->send.ep = ep;
+    req->flags = 0;
+    req->send.state.dt.contig.memh = NULL;
+    req->send.rma.rkey = rkey;
+    req->send.uct_comp.count = 1;
+}
+
+static UCS_F_ALWAYS_INLINE
+void ucp_add_pending_rma_e(ucp_request_t *req, ucp_ep_h ep,
                            uct_ep_h uct_ep, const void *buffer, size_t length,
                            uint64_t remote_addr, ucp_rkey_h rkey,
                            uct_pending_callback_t cb)
 {
     req->send.ep = ep;
     req->send.buffer = buffer;
-    req->send.mem = mem;
     req->send.length = length;
     req->send.rma.remote_addr = remote_addr;
     req->send.rma.rkey = rkey;
@@ -294,10 +302,9 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
     ucp_ep_rma_config_t *rma_config;
     ucs_status_t status;
     uct_rkey_t uct_rkey;
-    size_t frag_length;
     uct_ep_h uct_ep;
     ssize_t packed_len;
-    ucp_request_t *_req, *__req;
+    ucp_request_t *_req;
 
     UCP_RMA_CHECK_PARAMS(buffer, length);
 
@@ -313,13 +320,18 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
         return UCS_ERR_NO_MEMORY;
     }
 
-    _req->send.uct_comp.count = 1;
+    init_rma_request(_req, ep, rkey);
 
     if (length <= rma_config->max_put_short) {
         status = uct_ep_put_short(uct_ep, buffer,
                                   length, remote_addr,
                                   uct_rkey);
-        ucp_worker_progress(ep->worker);
+        if (ucs_unlikely(status == UCS_ERR_NO_RESOURCE)) {
+                /* Out of resources - adding request for later schedule */
+                ucp_add_pending_rma_e(_req, ep, uct_ep, buffer, length,
+                                      remote_addr, rkey, ucp_progress_put_nbe);
+                status = UCS_INPROGRESS;
+        }
     } else  if (length <= rma_config->max_put_bcopy) {
         ucp_memcpy_pack_context_t pack_ctx;
         pack_ctx.src    = buffer;
@@ -329,24 +341,23 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
                                       remote_addr, uct_rkey);
 
         status = (packed_len > 0) ? UCS_OK : (ucs_status_t)packed_len;
-        ucp_worker_progress(ep->worker);
     } else {
-        uct_mem_h mem;
         uct_pd_h uct_pd = ucp_ep_pd(ep, lane);
-        status = uct_pd_mem_reg(uct_pd, (void*)buffer, length, &mem);
+        status = uct_pd_mem_reg(uct_pd, (void*)buffer, length,
+                                &_req->send.state.dt.contig.memh);
         for(;;) {
-            frag_length = ucs_min(config->max_am_zcopy, length);
-            status = uct_ep_put_zcopy(uct_ep, buffer, frag_length,
-                                      mem, remote_addr, uct_rkey, &_req->send.uct_comp);
+            status = uct_ep_put_zcopy(uct_ep, buffer, length,
+                                      _req->send.state.dt.contig.memh, remote_addr,
+                                      uct_rkey, &_req->send.uct_comp);
 
             if (ucs_likely(status == UCS_OK)) {
-                goto posted;
+                break;
             } else if (status == UCS_INPROGRESS) {
                 ++_req->send.uct_comp.count;
-                goto posted;
+                break;
             } else if (status == UCS_ERR_NO_RESOURCE) {
                 /* Out of resources - adding request for later schedule */
-                ucp_add_pending_rma_e(_req, mem, ep, uct_ep, buffer, length,
+                ucp_add_pending_rma_e(_req, ep, uct_ep, buffer, length,
                                       remote_addr, rkey, ucp_progress_put_nbe);
                 status = UCS_INPROGRESS;
                 break;
@@ -354,20 +365,10 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
                 /* Return - Error occured */
                 return status;
             }
-posted:
-            length      -= frag_length;
-            if (length == 0) {
-                _req->flags |= UCP_REQUEST_FLAG_COMPLETED;
-                break;
-            }
-
-            buffer      += frag_length;
-            remote_addr += frag_length;
         }
     }
 
-    __req = _req + 1;
-    *req = (ucp_request_merged_t *) __req;
+    *req = (ucp_request_merged_t *) _req;
 
     return status;
 }
@@ -474,7 +475,6 @@ static ucs_status_t ucp_progress_get_nbe(uct_pending_req_t *self)
     ucp_ep_t *ep       = req->send.ep;
     ucs_status_t status;
     uct_rkey_t uct_rkey;
-    size_t frag_length;
     uct_ep_h uct_ep;
 
     ucp_ep_config_t *config;
@@ -484,29 +484,18 @@ static ucs_status_t ucp_progress_get_nbe(uct_pending_req_t *self)
     uct_ep = ep->uct_eps[lane];
 
     for (;;) {
-        frag_length = ucs_min(config->max_am_zcopy, req->send.length);
         status = uct_ep_get_zcopy(uct_ep,
-                                  (void *)(req->send.buffer), frag_length,
-                                  req->send.mem, req->send.rma.remote_addr,
+                                  (void *)(req->send.buffer), req->send.length,
+                                  req->send.state.dt.contig.memh, req->send.rma.remote_addr,
                                   uct_rkey, &req->send.uct_comp);
         if (ucs_likely(status == UCS_OK)) {
-            goto posted;
+            break;
         } else if (status == UCS_INPROGRESS) {
-            ++req->send.uct_comp.count;
-            goto posted;
+            //++req->send.uct_comp.count;
+            break;
         } else {
             /* Error - abort */
             return status;
-        }
-posted:
-        req->send.length -= frag_length;
-        req->send.buffer += frag_length;
-        req->send.rma.remote_addr += frag_length;
-        if (req->send.length == 0) {
-            /* Get was posted */
-            status = UCS_OK;
-            req->flags |= UCP_REQUEST_FLAG_COMPLETED;
-            break;
         }
     }
 
@@ -573,9 +562,8 @@ ucs_status_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
     ucp_ep_rma_config_t *rma_config;
     ucs_status_t status;
     uct_rkey_t uct_rkey;
-    size_t frag_length;
     uct_ep_h uct_ep;
-    ucp_request_t *_req, *__req;
+    ucp_request_t *_req;
 
     UCP_RMA_CHECK_PARAMS(buffer, length);
 
@@ -596,7 +584,7 @@ ucs_status_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
         return UCS_ERR_NO_MEMORY;
     }
 
-    _req->send.uct_comp.count = 1;
+    init_rma_request(_req, ep, rkey);
 
     if (length <= rma_config->max_get_bcopy) {
         status = uct_ep_get_bcopy(uct_ep,
@@ -604,25 +592,31 @@ ucs_status_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
                                   (void *)buffer, length,
                                   remote_addr,
                                   uct_rkey, &_req->send.uct_comp);
-        ++_req->send.uct_comp.count;
+        if (status == UCS_INPROGRESS) {
+            ++_req->send.uct_comp.count;
+        } else if (status == UCS_ERR_NO_RESOURCE) {
+            /* Out of resources - adding request for later schedule */
+            ucp_add_pending_rma_e(_req, ep, uct_ep, buffer, length,
+                                  remote_addr, rkey, ucp_progress_get_nbe);
+            status = UCS_INPROGRESS;
+        }
     } else {
-        uct_mem_h mem;
-        uct_pd_h uct_pd = ucp_ep_pd(ep, lane);
-        status = uct_pd_mem_reg(uct_pd, (void*)buffer, length, &mem);
+            uct_pd_h uct_pd = ucp_ep_pd(ep, lane);
+            status = uct_pd_mem_reg(uct_pd, (void*)buffer, length,
+                                    &_req->send.state.dt.contig.memh);
         for (;;) {
-            frag_length = ucs_min(config->max_am_zcopy, length);
             status = uct_ep_get_zcopy(uct_ep,
-                                      buffer, frag_length,
-                                      mem, remote_addr,
+                                      buffer, length,
+                                      _req->send.state.dt.contig.memh, remote_addr,
                                       uct_rkey, &_req->send.uct_comp);
             if (ucs_likely(status == UCS_OK)) {
-                goto posted;
+                break;
             } else if (status == UCS_INPROGRESS) {
                 ++_req->send.uct_comp.count;
-                goto posted;
+                break;
             } else if (status == UCS_ERR_NO_RESOURCE) {
                 /* Out of resources - adding request for later schedule */
-                ucp_add_pending_rma_e(_req, mem, ep, uct_ep, buffer, length,
+                ucp_add_pending_rma_e(_req, ep, uct_ep, buffer, length,
                                       remote_addr, rkey, ucp_progress_get_nbe);
                 status = UCS_INPROGRESS;
                 break;
@@ -630,20 +624,10 @@ ucs_status_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
                 /* Error - abort */
                 return status;
             }
-posted:
-            length -= frag_length;
-            if (length == 0) {
-                _req->flags |= UCP_REQUEST_FLAG_COMPLETED;
-                break;
-            }
-
-            buffer += frag_length;
-            remote_addr += frag_length;
         }
     }
 
-    __req = _req + 1;
-    *req = (ucp_request_merged_t *) __req;
+    *req = (ucp_request_merged_t *) _req;
     return status;
 }
 
