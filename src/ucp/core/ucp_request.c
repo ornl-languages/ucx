@@ -26,38 +26,16 @@ int ucp_request_is_completed(void *request)
 
 void ucp_request_wait(void *request)
 {
-//    ucs_status_t status;
     ucp_request_t *req = (ucp_request_t*)request;
 
-#if 0
-    ucp_worker_progress(req->send.ep->worker);
-//    ucp_worker_flush(req->send.ep->worker);
-#else
-    while(!ucp_request_is_completed( ((ucp_request_t*)request+1) )) {
-//        printf("worker_progress\n");fflush(NULL);
+    while(!(req->flags & UCP_REQUEST_FLAG_COMPLETED)) {
         ucp_worker_progress(req->send.ep->worker);
         req->flags |= UCP_REQUEST_FLAG_COMPLETED;
     }
     while(1 < req->send.uct_comp.count) {
-//        int debug = 1;
-//        while (debug) {};
-//        printf("Waiting\n");fflush(NULL);
-        if ( NULL != req->send.ep) {
-//            printf("Wait flush\n");fflush(NULL);
-//            ucp_worker_progress(req->send.ep->worker);
-//            ucp_worker_flush(req->send.ep->worker);
-
-//            uct_ep_flush(req->send.ep->uct_eps[UCP_EP_OP_RMA]);
-            ucp_ep_flush(req->send.ep);
-            //ucs_status_t status = uct_ep_flush(req->send.ep->uct_eps[UCP_EP_OP_RMA]);
-//            printf("%s; comp count = %d\n", ucs_status_string(status),req->send.uct_comp.count);
-//            printf("comp count = %d\n", req->send.uct_comp.count);
-        } else {
-            printf("Ups, no ep\n"); fflush(NULL);
-            //break;
-        }
+        ucp_ep_flush(req->send.ep);
     }
-#if 1
+
     if (NULL != req->send.state.dt.contig.memh) {
         ucp_lane_index_t lane;
         ucp_ep_config_t *config;
@@ -72,9 +50,8 @@ void ucp_request_wait(void *request)
         uct_pd_h uct_pd = ucp_ep_pd(req->send.ep, lane);
         uct_pd_mem_dereg(uct_pd, req->send.state.dt.contig.memh);
     }
-#endif
-#endif
-    ucp_request_release(((ucp_request_t*)request+1));
+
+    ucs_mpool_put_inline(req);
 }
 
 void ucp_request_release(void *request)

@@ -212,7 +212,7 @@ void ucp_add_pending_rma_e(ucp_request_t *req, ucp_ep_h ep,
     req->send.rma.remote_addr = remote_addr;
     req->send.rma.rkey = rkey;
     req->send.uct.func = cb;
-    ucp_ep_add_pending(ep, uct_ep, req, 1);
+    ucp_ep_add_pending(ep, uct_ep, req, 0);
 }
 
 ucs_status_t ucp_put_nbi(ucp_ep_h ep, const void *buffer, size_t length,
@@ -322,6 +322,7 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
 
     init_rma_request(_req, ep, rkey);
 
+retry:
     if (length <= rma_config->max_put_short) {
         status = uct_ep_put_short(uct_ep, buffer,
                                   length, remote_addr,
@@ -341,6 +342,10 @@ ucs_status_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
                                       remote_addr, uct_rkey);
 
         status = (packed_len > 0) ? UCS_OK : (ucs_status_t)packed_len;
+        if (ucs_unlikely(status != UCS_OK)) {
+            ucp_worker_progress(ep->worker);
+            goto retry;
+        }
     } else {
         uct_pd_h uct_pd = ucp_ep_pd(ep, lane);
         status = uct_pd_mem_reg(uct_pd, (void*)buffer, length,
