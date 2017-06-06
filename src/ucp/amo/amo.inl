@@ -250,13 +250,14 @@ static inline void init_amo_common(ucp_request_t *req, ucp_ep_h ep, uint64_t rem
 
 static inline void init_amo_req(ucp_request_t *req, ucp_ep_h ep, void *buffer,
                                 ucp_atomic_fetch_op_t op, size_t op_size, uint64_t remote_addr,
-                                ucp_rkey_h rkey, uint64_t value)
+                                ucp_rkey_h rkey, uint64_t value, void *cb_data)
 {
     init_amo_common(req, ep, remote_addr, rkey, value);
     req->send.uct_comp.count  = 1;
     req->send.uct_comp.func   = ucp_amo_completed_single;
     req->send.amo.result = buffer;
     req->send.uct.func   = ucp_amo_select_uct_func(op, op_size);
+    req->send.cb_data    = cb_data;
 }
 
 static inline void init_amo_post(ucp_request_t *req, ucp_ep_h ep, ucp_atomic_post_op_t op,

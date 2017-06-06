@@ -71,6 +71,12 @@ ucp_request_release_common(void *request, uint8_t cb_flag, const char *debug_nam
     UCP_THREAD_CS_EXIT_CONDITIONAL(&worker->mt_lock);
 }
 
+void ucp_request_get_cb_data(void *request, void **cb_data)
+{
+    ucp_request_t *req = (ucp_request_t*)request - 1;
+    *cb_data = req->send.cb_data;
+}
+
 UCS_PROFILE_FUNC_VOID(ucp_request_release, (request), void *request)
 {
     /* mark request as released */
