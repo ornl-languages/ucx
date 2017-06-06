@@ -27,7 +27,27 @@ ucs_status_ptr_t ucp_atomic_fetch_nb(ucp_ep_h ep, ucp_atomic_fetch_op_t opcode,
         UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
         return UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
     }
-    init_amo_req(req, ep, result, opcode, op_size, remote_addr, rkey, value);
+    init_amo_req(req, ep, result, opcode, op_size, remote_addr, rkey, value, NULL);
+    status = ucp_amo_send_request(req, cb);
+    UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
+    return status;
+}
+
+ucs_status_ptr_t ucp_atomic_fetch_nbe(ucp_ep_h ep, ucp_atomic_fetch_op_t opcode,
+                                      uint64_t value, void *result, size_t op_size,
+                                      uint64_t remote_addr, ucp_rkey_h rkey,
+                                      ucp_send_callback_t cb, void *cb_data)
+{
+    ucp_request_t *req;
+    ucs_status_ptr_t status;
+    UCP_RMA_CHECK_ATOMIC_PTR(remote_addr, op_size);
+    UCP_THREAD_CS_ENTER_CONDITIONAL(&ep->worker->mt_lock);
+    req = ucp_request_get(ep->worker);
+    if (ucs_unlikely(NULL == req)) {
+        UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
+        return UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
+    }
+    init_amo_req(req, ep, result, opcode, op_size, remote_addr, rkey, value, cb_data);
     status = ucp_amo_send_request(req, cb);
     UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
     return status;
