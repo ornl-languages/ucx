@@ -337,4 +337,6 @@ typedef enum ucp_wakeup_event_types {
     UCP_WAKEUP_TAG_RECV    = UCS_BIT(3)  /**< Tag receive completion */
 } ucp_wakeup_event_t;
 
+typedef struct ucp_request              ucp_request_t;
+
 #endif

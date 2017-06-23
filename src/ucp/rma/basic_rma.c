@@ -87,9 +87,10 @@ static void ucp_rma_request_zcopy_completion(uct_completion_t *self,
 }
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
-ucp_rma_request_init(ucp_request_t *req, ucp_ep_h ep, const void *buffer, 
+ucp_rma_request_init(ucp_request_t *req, ucp_ep_h ep, const void *buffer,
                      size_t length, uint64_t remote_addr, ucp_rkey_h rkey,
-                     uct_pending_callback_t cb, size_t zcopy_thresh, int flags)
+                     uct_pending_callback_t cb, size_t zcopy_thresh, int flags,
+                     ucp_send_callback_t send_cb, void *cb_data)
 {
     req->flags                = flags; /* Implicit release */
     req->send.ep              = ep;
@@ -101,9 +102,10 @@ ucp_rma_request_init(ucp_request_t *req, ucp_ep_h ep, const void *buffer,
     req->send.uct.func        = cb;
     req->send.lane            = rkey->cache.rma_lane;
     req->send.uct_comp.count  = 0; 
-#if ENABLE_ASSERT
-    req->send.cb              = NULL;
-#endif
+
+    req->send.cb              = send_cb;
+    req->send.cb_data         = cb_data;
+
     if (length < zcopy_thresh) {
         req->send.uct_comp.func        = ucp_rma_request_bcopy_completion;
         req->send.state.dt.contig.memh = UCT_MEM_HANDLE_NULL;
@@ -226,7 +228,7 @@ ucp_rma_blocking(ucp_ep_h ep, const void *buffer, size_t length,
     ucp_request_t req;
 
     status = ucp_rma_request_init(&req, ep, buffer, length, remote_addr, rkey,
-                                  NULL, zcopy_thresh, 0);
+                                  NULL, zcopy_thresh, 0, NULL, NULL);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
@@ -268,13 +270,44 @@ ucp_rma_nonblocking(ucp_ep_h ep, const void *buffer, size_t length,
 
     status = ucp_rma_request_init(req, ep, buffer, length, remote_addr, rkey,
                                   progress_cb, zcopy_thresh,
-                                  UCP_REQUEST_FLAG_RELEASED);
+                                  UCP_REQUEST_FLAG_RELEASED, NULL, NULL);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
 
     return ucp_request_start_send(req);
 }
+
+static UCS_F_ALWAYS_INLINE ucs_status_ptr_t
+ucp_rma_nbe(ucp_ep_h ep, const void *buffer, size_t length,
+            uint64_t remote_addr, ucp_rkey_h rkey,
+            uct_pending_callback_t progress_cb, size_t zcopy_thresh,
+            ucp_send_callback_t send_cb, void *cb_data)
+{
+    ucs_status_t status;
+    ucp_request_t *req = NULL;
+    
+    req = ucp_request_get(ep->worker);
+    if (req == NULL) {
+        return UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
+    }
+    
+    status = ucp_rma_request_init(req, ep, buffer, length, remote_addr, rkey,
+                                  progress_cb, zcopy_thresh,
+                                  UCP_REQUEST_FLAG_CALLBACK, send_cb, cb_data);
+    
+    if (ucs_unlikely(status != UCS_OK)) {
+        return UCS_STATUS_PTR(status);
+    }
+    
+    status = ucp_request_start_send(req);
+    if (UCS_INPROGRESS == status) {
+        return req;
+    } else {
+        return UCS_STATUS_PTR(status);
+    }
+}
+
 
 UCS_PROFILE_FUNC(ucs_status_t, ucp_put, (ep, buffer, length, remote_addr, rkey),
                  ucp_ep_h ep, const void *buffer, size_t length,
@@ -394,6 +427,77 @@ ucs_status_t ucp_get_nbi(ucp_ep_h ep, void *buffer, size_t length,
 out_unlock:
     UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
     return status;
+}
+
+ucs_status_ptr_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
+                         uint64_t remote_addr, ucp_rkey_h rkey,
+                         ucp_send_callback_t send_cb, void *cb_data)
+{
+    ucp_ep_rma_config_t *rma_config;
+    ucs_status_t status;
+    ucs_status_ptr_t status_ptr = 0;
+    
+    if ((length) == 0) {
+        return UCS_STATUS_PTR(UCS_OK);
+    }
+    if (ENABLE_PARAMS_CHECK && ((buffer) == NULL)) {
+        return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
+    }
+    UCP_THREAD_CS_ENTER_CONDITIONAL(&ep->worker->mt_lock);
+    
+    status = UCP_RKEY_RESOLVE(rkey, ep, rma);
+    if (status != UCS_OK) {
+        status_ptr = UCS_STATUS_PTR(status);
+        goto out_unlock;
+    }
+    
+    /* Fast path for a single short message */
+    if (ucs_likely(length <= rkey->cache.max_put_short)) {
+        status = UCS_PROFILE_CALL(uct_ep_put_short, ep->uct_eps[rkey->cache.rma_lane],
+                                  buffer, length, remote_addr, rkey->cache.rma_rkey);
+        if (ucs_likely(status != UCS_ERR_NO_RESOURCE)) {
+            goto out_unlock;
+        }
+    }
+    
+    rma_config = &ucp_ep_config(ep)->rma[rkey->cache.rma_lane];
+    status_ptr = ucp_rma_nbe(ep, buffer, length, remote_addr, rkey,
+                             ucp_progress_put, rma_config->put_zcopy_thresh,
+                             send_cb, cb_data);
+out_unlock:
+    UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
+    return status_ptr;
+}
+
+ucs_status_ptr_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
+                         uint64_t remote_addr, ucp_rkey_h rkey,
+                         ucp_send_callback_t send_cb, void *cb_data)
+{
+    ucp_ep_rma_config_t *rma_config;
+    ucs_status_t status;
+    ucs_status_ptr_t status_ptr = 0;
+    
+    if ((length) == 0) {
+        return UCS_STATUS_PTR(UCS_OK);
+    }
+    if (ENABLE_PARAMS_CHECK && ((buffer) == NULL)) {
+        return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
+    }
+    UCP_THREAD_CS_ENTER_CONDITIONAL(&ep->worker->mt_lock);
+    
+    status = UCP_RKEY_RESOLVE(rkey, ep, rma);
+    if (status != UCS_OK) {
+        status_ptr = UCS_STATUS_PTR(status);
+        goto out_unlock;
+    }
+    
+    rma_config = &ucp_ep_config(ep)->rma[rkey->cache.rma_lane];
+    status_ptr = ucp_rma_nbe(ep, buffer, length, remote_addr, rkey,
+                             ucp_progress_get, rma_config->get_zcopy_thresh,
+                             send_cb, cb_data);
+out_unlock:
+    UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
+    return status_ptr;
 }
 
 UCS_PROFILE_FUNC(ucs_status_t, ucp_worker_fence, (worker), ucp_worker_h worker)
