@@ -17,19 +17,19 @@
 enum {
     UCP_ADDRESS_IFACE_FLAGS =
          UCT_IFACE_FLAG_CONNECT_TO_IFACE |
-         UCT_IFACE_FLAG_AM_CB_SYNC |
-         UCT_IFACE_FLAG_AM_CB_ASYNC |
+         UCT_IFACE_FLAG_CB_SYNC |
+         UCT_IFACE_FLAG_CB_ASYNC |
          UCT_IFACE_FLAG_AM_BCOPY |
          UCT_IFACE_FLAG_PUT_SHORT |
          UCT_IFACE_FLAG_PUT_BCOPY |
          UCT_IFACE_FLAG_GET_BCOPY |
          UCT_IFACE_FLAG_GET_ZCOPY |
+         UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+         UCT_IFACE_FLAG_TAG_RNDV_ZCOPY  |
          UCP_UCT_IFACE_ATOMIC32_FLAGS |
          UCP_UCT_IFACE_ATOMIC64_FLAGS |
-         UCT_IFACE_FLAG_ATOMIC_FADD64 |
-         UCT_IFACE_FLAG_ATOMIC_SWAP64 |
-         UCT_IFACE_FLAG_ATOMIC_CSWAP64 |
-         UCT_IFACE_FLAG_WAKEUP |
+         UCT_IFACE_FLAG_EVENT_RECV_AM |
+         UCT_IFACE_FLAG_EVENT_RECV_SIG_AM |
          UCT_IFACE_FLAG_PENDING
 };
 
@@ -42,6 +42,7 @@ struct ucp_address_iface_attr {
     double                     overhead;      /* Interface performance - overhead */
     double                     bandwidth;     /* Interface performance - bandwidth */
     int                        priority;      /* Priority of device */
+    double                     lat_ovh;       /* latency overhead */
 };
 
 
@@ -50,17 +51,12 @@ struct ucp_address_iface_attr {
  */
 struct ucp_address_entry {
     const uct_device_addr_t    *dev_addr;      /* Points to device address */
-    size_t                     dev_addr_len;   /* Device address length */
     uint16_t                   tl_name_csum;   /* Checksum of transport name */
     ucp_rsc_index_t            md_index;       /* Memory domain index */
     uint64_t                   md_flags;       /* MD reg/alloc flags */
     ucp_address_iface_attr_t   iface_attr;     /* Interface attributes information */
-    size_t                     tl_addr_len;    /* Transport address length */
-    union {
-        const uct_iface_addr_t *iface_addr;    /* Interface address */
-        const uct_ep_addr_t    *ep_addr;       /* Endpoint address */
-        const void             *tl_addr;
-    };
+    const uct_iface_addr_t     *iface_addr;    /* Interface address, NULL if not available */
+    const uct_ep_addr_t        *ep_addr;       /* Endpoint address, NULL if not available */
 };
 
 

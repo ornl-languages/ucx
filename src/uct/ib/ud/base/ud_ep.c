@@ -74,7 +74,7 @@ static void uct_ud_ep_ca_drop(uct_ud_ep_t *ep)
     ep->tx.max_psn    = ep->tx.acked_psn + ep->ca.cwnd;
     if (UCT_UD_PSN_COMPARE(ep->tx.max_psn, >, ep->tx.psn)) {
         /* do not send more until we get acks going */
-        ep->tx.max_psn = ep->tx.psn;
+        uct_ud_ep_tx_stop(ep);
     }
 }
 
@@ -102,7 +102,7 @@ static void uct_ud_ep_reset(uct_ud_ep_t *ep)
 
     ep->rx.acked_psn = UCT_UD_INITIAL_PSN - 1;
     ucs_frag_list_init(ep->tx.psn-1, &ep->rx.ooo_pkts, 0 /*TODO: ooo support */
-                       UCS_STATS_ARG(ep->rx.stats));
+                       UCS_STATS_ARG(ep->super.stats));
 }
 
 static void uct_ud_ep_slow_timer(ucs_wtimer_t *self)
@@ -111,34 +111,38 @@ static void uct_ud_ep_slow_timer(ucs_wtimer_t *self)
     uct_ud_iface_t *iface = ucs_derived_of(ep->super.super.iface,
                                            uct_ud_iface_t);
     ucs_time_t now;
+    ucs_time_t diff;
 
     UCT_UD_EP_HOOK_CALL_TIMER(ep);
     now = ucs_twheel_get_time(&iface->async.slow_timer);
+    diff = now - ep->tx.send_time;
 
     if (ucs_queue_is_empty(&ep->tx.window)) {
         return;
     }
 
-    /* It is possible that the sender is slow.
-     * Try to flush the window twice before going into
-     * full resend mode.
-     */
-    if (now - ep->tx.send_time > uct_ud_slow_tick() &&
-        uct_ud_ep_is_connected(ep)) {
-        uct_ud_ep_ctl_op_add(iface, ep, UCT_UD_EP_OP_ACK_REQ);
-    }
-
-    if (now - ep->tx.send_time > 3*uct_ud_slow_tick()) {
-        ucs_trace("sceduling resend now: %llu send_time: %llu diff: %llu tick: %llu",
-                   now, ep->tx.send_time, now - ep->tx.send_time, uct_ud_slow_tick());
-        ep->tx.send_time = ucs_twheel_get_time(&iface->async.slow_timer);
+    if (diff > iface->config.peer_timeout) {
+        iface->super.ops->handle_failure(&iface->super, ep);
+        return;
+    } else if (diff > 3*iface->async.slow_tick) {
+        ucs_trace("scheduling resend now: %lu send_time: %lu diff: %lu tick: %lu",
+                  now, ep->tx.send_time, now - ep->tx.send_time,
+                  ep->tx.slow_tick);
         uct_ud_ep_ctl_op_del(ep, UCT_UD_EP_OP_ACK_REQ);
         uct_ud_ep_ca_drop(ep);
         uct_ud_ep_resend_start(iface, ep);
+    } else if ((diff > iface->async.slow_tick) && uct_ud_ep_is_connected(ep)) {
+        /* It is possible that the sender is slow.
+         * Try to flush the window twice before going into
+         * full resend mode.
+         */
+        uct_ud_ep_ctl_op_add(iface, ep, UCT_UD_EP_OP_ACK_REQ);
     }
 
-    ucs_wtimer_add(&iface->async.slow_timer, &ep->slow_timer,
-                   uct_ud_slow_tick());
+    /* Cool down the timer on rescheduling/resending */
+    ep->tx.slow_tick *= iface->config.slow_timer_backoff;
+    ep->tx.slow_tick = ucs_min(ep->tx.slow_tick, iface->config.peer_timeout/3);
+    ucs_wtimer_add(&iface->async.slow_timer, &ep->slow_timer, ep->tx.slow_tick);
 }
 
 UCS_CLASS_INIT_FUNC(uct_ud_ep_t, uct_ud_iface_t *iface)
@@ -152,24 +156,16 @@ UCS_CLASS_INIT_FUNC(uct_ud_ep_t, uct_ud_iface_t *iface)
     uct_ud_ep_reset(self);
     ucs_list_head_init(&self->cep_list);
     uct_ud_iface_add_ep(iface, self);
+    self->tx.slow_tick = iface->async.slow_tick;
     ucs_wtimer_init(&self->slow_timer, uct_ud_ep_slow_timer);
     ucs_arbiter_group_init(&self->tx.pending.group);
     ucs_arbiter_elem_init(&self->tx.pending.elem);
 
     self->path_bits = iface->super.path_bits[0]; /* TODO multi-rail */
 
-    uct_worker_progress_register(iface->super.super.worker,
-                                 ucs_derived_of(iface->super.ops, uct_ud_iface_ops_t)->progress,
-                                 iface);
-
-    /* need to remove handler from the async */
-    ucs_debug("worker=%p iface=%p remove async handler fd=%d",
-              iface->super.super.worker, iface, iface->super.comp_channel->fd);
-    ucs_async_remove_handler(iface->super.comp_channel->fd, 0);
-
     UCT_UD_EP_HOOK_INIT(self);
-    ucs_debug("NEW EP: iface=%p ep=%p id=%d src_path_bits=%d",
-              iface, self, self->ep_id, self->path_bits);
+    ucs_debug("created ep ep=%p iface=%p id=%d src_path_bits=%d",
+              self, iface, self->ep_id, self->path_bits);
     return UCS_OK;
 }
 
@@ -202,10 +198,6 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ud_ep_t)
     uct_ud_iface_t *iface = ucs_derived_of(self->super.super.iface, uct_ud_iface_t);
 
     ucs_trace_func("ep=%p id=%d conn_id=%d", self, self->ep_id, self->conn_id);
-
-    uct_worker_progress_unregister(iface->super.super.worker,
-                                   ucs_derived_of(iface->super.ops, uct_ud_iface_ops_t)->progress,
-                                   iface);
 
     ucs_wtimer_remove(&self->slow_timer);
     uct_ud_iface_remove_ep(iface, self);
@@ -289,6 +281,7 @@ ucs_status_t uct_ud_ep_create_connected_common(uct_ud_iface_t *iface,
 
     ep = uct_ud_iface_cep_lookup(iface, ib_addr, if_addr, UCT_UD_EP_CONN_ID_MAX);
     if (ep) {
+        uct_ud_ep_set_state(ep, UCT_UD_EP_FLAG_CREQ_NOTSENT);
         *new_ep_p = ep;
         *skb_p    = NULL;
         return UCS_ERR_ALREADY_EXISTS;
@@ -359,10 +352,39 @@ ucs_status_t uct_ud_ep_connect_to_ep(uct_ud_ep_t *ep,
 }
 
 static UCS_F_ALWAYS_INLINE void
+uct_ud_iface_add_async_comp(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
+                            uct_ud_send_skb_t *skb, ucs_status_t status)
+{
+    uct_ud_comp_desc_t *cdesc;
+
+    skb->status = status;
+    if (status != UCS_OK) {
+        if (!(skb->flags & UCT_UD_SEND_SKB_FLAG_COMP)) {
+            skb->len = 0;
+        }
+
+        if (status == UCS_ERR_ENDPOINT_TIMEOUT) {
+            skb->flags |= UCT_UD_SEND_SKB_FLAG_ERR;
+            ++ep->tx.err_skb_count;
+        } else if (status == UCS_ERR_CANCELED) {
+            skb->flags |= UCT_UD_SEND_SKB_FLAG_CANCEL;
+        }
+    }
+
+    cdesc = uct_ud_comp_desc(skb);
+
+    /* don't call user completion from async context. instead, put
+     * it on a queue which will be progressed from main thread.
+     */
+    ucs_queue_push(&iface->tx.async_comp_q, &skb->queue);
+    cdesc->ep  = ep;
+    ep->flags |= UCT_UD_EP_FLAG_ASYNC_COMPS;
+}
+
+static UCS_F_ALWAYS_INLINE void
 uct_ud_ep_process_ack(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
                       uct_ud_psn_t ack_psn, int is_async)
 {
-    uct_ud_comp_desc_t *cdesc;
     uct_ud_send_skb_t *skb;
     if (ucs_unlikely(UCT_UD_PSN_COMPARE(ack_psn, <=, ep->tx.acked_psn))) {
         return;
@@ -374,18 +396,12 @@ uct_ud_ep_process_ack(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
     ucs_queue_for_each_extract(skb, &ep->tx.window, queue,
                                UCT_UD_PSN_COMPARE(skb->neth->psn, <=, ack_psn)) {
         if (ucs_unlikely(skb->flags & UCT_UD_SEND_SKB_FLAG_COMP)) {
-            cdesc = uct_ud_comp_desc(skb);
             if (ucs_unlikely(is_async)) {
-                /* don't call user completion from async context. instead, put
-                 * it on a queue which will be progresed from main thread.
-                 */
-                ucs_queue_push(&iface->tx.async_comp_q, &skb->queue);
-                ep->flags |= UCT_UD_EP_FLAG_ASYNC_COMPS;
-                cdesc->ep = ep;
+                uct_ud_iface_add_async_comp(iface, ep, skb, UCS_OK);
                 continue;
             }
 
-            uct_invoke_completion(cdesc->comp, UCS_OK);
+            uct_invoke_completion(uct_ud_comp_desc(skb)->comp, UCS_OK);
         }
 
         skb->flags = 0; /* reset also ACK_REQ flag */
@@ -400,6 +416,7 @@ uct_ud_ep_process_ack(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
 
     ucs_arbiter_group_schedule(&iface->tx.pending_q, &ep->tx.pending.group);
 
+    ep->tx.slow_tick = iface->async.slow_tick;
     ep->tx.send_time = uct_ud_iface_get_async_time(iface);
 }
 
@@ -420,7 +437,7 @@ static uct_ud_ep_t *uct_ud_ep_create_passive(uct_ud_iface_t *iface, uct_ud_ctl_h
     uct_ep_t *ep_h;
     uct_iface_t *iface_h =  &iface->super.super.super;
     /* create new endpoint */
-    status = iface_h->ops.ep_create(iface_h, &ep_h);
+    status = uct_ep_create(iface_h, &ep_h);
     ucs_assert_always(status == UCS_OK);
     ep = ucs_derived_of(ep_h, uct_ud_ep_t);
 
@@ -478,6 +495,9 @@ static void uct_ud_ep_rx_creq(uct_ud_iface_t *iface, uct_ud_neth_t *neth)
     ucs_assert_always(ep->rx.ooo_pkts.head_sn == neth->psn);
     /* scedule connection reply op */
     UCT_UD_EP_HOOK_CALL_RX(ep, neth, sizeof(*neth) + sizeof(*ctl));
+    if (uct_ud_ep_ctl_op_check(ep, UCT_UD_EP_OP_CREQ)) {
+        uct_ud_ep_set_state(ep, UCT_UD_EP_FLAG_CREQ_NOTSENT);
+    }
     uct_ud_ep_ctl_op_del(ep, UCT_UD_EP_OP_CREQ);
     uct_ud_ep_set_state(ep, UCT_UD_EP_FLAG_CREQ_RCVD);
 }
@@ -590,7 +610,7 @@ void uct_ud_ep_process_rx(uct_ud_iface_t *iface, uct_ud_neth_t *neth, unsigned b
     }
 
     if (ucs_unlikely(!is_am)) {
-        if ((byte_len == sizeof(*neth))) {
+        if ((size_t)byte_len == sizeof(*neth)) {
             goto out;
         }
         if (neth->packet_type & UCT_UD_PACKET_FLAG_CTL) {
@@ -618,12 +638,12 @@ void uct_ud_ep_process_rx(uct_ud_iface_t *iface, uct_ud_neth_t *neth, unsigned b
     }
 
     if (ucs_unlikely(is_async &&
-                     (iface->super.super.am[am_id].flags & UCT_AM_CB_FLAG_SYNC))) {
+                     (iface->super.super.am[am_id].flags & UCT_CB_FLAG_SYNC))) {
         skb->u.am.len = byte_len - sizeof(*neth);
         ucs_queue_push(&iface->rx.pending_q, &skb->u.am.queue);
     } else {
-        uct_ib_iface_invoke_am(&iface->super, am_id, neth + 1,
-                               byte_len - sizeof(*neth), &skb->super);
+        uct_ib_iface_invoke_am_desc(&iface->super, am_id, neth + 1,
+                                    byte_len - sizeof(*neth), &skb->super);
     }
     return;
 
@@ -708,7 +728,7 @@ ucs_status_t uct_ud_ep_flush_nolock(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
             /* Add dummy skb to the window, which would call user completion
              * callback when getting ACK.
              */
-            skb->flags                 |= UCT_UD_SEND_SKB_FLAG_COMP;
+            skb->flags                  = UCT_UD_SEND_SKB_FLAG_COMP;
             skb->len                    = sizeof(skb->neth[0]);
             skb->neth->packet_type      = 0;
             skb->neth->psn              = psn;
@@ -725,6 +745,18 @@ ucs_status_t uct_ud_ep_flush_nolock(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
     return UCS_INPROGRESS;
 }
 
+void uct_ud_tx_wnd_purge_outstanding(uct_ud_iface_t *iface, uct_ud_ep_t *ud_ep,
+                                     ucs_status_t status)
+{
+    uct_ud_send_skb_t  *skb;
+
+    uct_ud_ep_tx_stop(ud_ep);
+
+    ucs_queue_for_each_extract(skb, &ud_ep->tx.window, queue, 1) {
+        uct_ud_iface_add_async_comp(iface, ud_ep, skb, status);
+    }
+}
+
 ucs_status_t uct_ud_ep_flush(uct_ep_h ep_h, unsigned flags,
                              uct_completion_t *comp)
 {
@@ -734,6 +766,18 @@ ucs_status_t uct_ud_ep_flush(uct_ep_h ep_h, unsigned flags,
                                            uct_ud_iface_t);
 
     uct_ud_enter(iface);
+
+    if (ucs_unlikely(flags & UCT_FLUSH_FLAG_CANCEL)) {
+        uct_ud_tx_wnd_purge_outstanding(iface, ep, UCS_ERR_CANCELED);
+        uct_ud_iface_dispatch_zcopy_comps(iface);
+        uct_ep_pending_purge(ep_h, NULL, 0);
+        /* Open window after cancellation for next sending */
+        uct_ud_ep_ca_ack(ep);
+
+        uct_ud_leave(iface);
+        return UCS_OK;
+    }
+
     uct_ud_iface_progress_pending_tx(iface);
     status = uct_ud_ep_flush_nolock(iface, ep, comp);
     if (status == UCS_OK) {
@@ -808,7 +852,7 @@ static uct_ud_send_skb_t *uct_ud_ep_resend(uct_ud_ep_t *ep)
                        !(sent_skb->neth->packet_type & UCT_UD_PACKET_FLAG_AM)),
                        "ep(%p): CREQ resend on endpoint which is already connected", ep);
 
-    skb = uct_ud_iface_res_skb_get(iface);
+    skb = uct_ud_iface_resend_skb_get(iface);
     ucs_assert_always(skb != NULL);
 
     ep->resend.pos = ucs_queue_iter_next(ep->resend.pos);
@@ -857,12 +901,14 @@ static void uct_ud_ep_do_pending_ctl(uct_ud_ep_t *ep, uct_ud_iface_t *iface)
         skb = uct_ud_ep_prepare_creq(ep);
         if (skb) {
             flag = 1;
+            uct_ud_ep_set_state(ep, UCT_UD_EP_FLAG_CREQ_SENT);
             uct_ud_ep_ctl_op_del(ep, UCT_UD_EP_OP_CREQ);
         }
     } else if (uct_ud_ep_ctl_op_check(ep, UCT_UD_EP_OP_CREP)) {
         skb = uct_ud_ep_prepare_crep(ep);
         if (skb) {
             flag = 1;
+            uct_ud_ep_set_state(ep, UCT_UD_EP_FLAG_CREP_SENT);
             uct_ud_ep_ctl_op_del(ep, UCT_UD_EP_OP_CREP);
         }
     } else if (uct_ud_ep_ctl_op_check(ep, UCT_UD_EP_OP_RESEND)) {
@@ -901,7 +947,7 @@ static void uct_ud_ep_do_pending_ctl(uct_ud_ep_t *ep, uct_ud_iface_t *iface)
          */
         uct_ud_iface_complete_tx_skb(iface, ep, skb);
     } else {
-        uct_ud_iface_res_skb_put(iface, skb);
+        uct_ud_iface_resend_skb_put(iface, skb);
     }
 }
 
@@ -1063,7 +1109,7 @@ uct_ud_ep_pending_purge_cb(ucs_arbiter_t *arbiter, ucs_arbiter_elem_t *elem,
     if (cb) {
         cb(req, cb_args->arg);
     } else {
-        ucs_warn("ep=%p cancelling user pending request %p", ep, req);
+        ucs_debug("ep=%p cancelling user pending request %p", ep, req);
     }
     iface->tx.pending_q_len--;
 

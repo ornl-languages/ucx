@@ -38,13 +38,15 @@ typedef struct {
     /**
      * Calculates score of a potential transport.
      *
+     * @param [in]  context      UCP context.
      * @param [in]  md_attr      Local MD attributes.
      * @param [in]  iface_attr   Local interface attributes.
      * @param [in]  remote_info  Remote peer attributes.
      *
      * @return Transport score, the higher the better.
      */
-    double      (*calc_score)(const uct_md_attr_t *md_attr,
+    double      (*calc_score)(ucp_context_h context,
+                              const uct_md_attr_t *md_attr,
                               const uct_iface_attr_t *iface_attr,
                               const ucp_address_iface_attr_t *remote_iface_attr);
 
@@ -59,6 +61,7 @@ typedef struct ucp_wireup_msg {
     uint8_t          tli[UCP_MAX_LANES];  /* For REQUEST - which p2p lanes must be connected
                                              For REPLY - which p2p lanes have been connected
                                            */
+    ucp_err_handling_mode_t err_mode;
     /* packed addresses follow */
 } UCS_S_PACKED ucp_wireup_msg_t;
 
@@ -66,29 +69,36 @@ typedef struct ucp_wireup_msg {
 ucs_status_t ucp_wireup_send_request(ucp_ep_h ep);
 
 ucs_status_t ucp_wireup_select_aux_transport(ucp_ep_h ep,
+                                             const ucp_ep_params_t *params,
                                              const ucp_address_entry_t *address_list,
                                              unsigned address_count,
                                              ucp_rsc_index_t *rsc_index_p,
                                              unsigned *addr_index_p);
 
-double ucp_wireup_amo_score_func(const uct_md_attr_t *md_attr,
+double ucp_wireup_amo_score_func(ucp_context_h context,
+                                 const uct_md_attr_t *md_attr,
                                  const uct_iface_attr_t *iface_attr,
                                  const ucp_address_iface_attr_t *remote_iface_attr);
 
 ucs_status_t ucp_wireup_msg_progress(uct_pending_req_t *self);
 
-ucs_status_t ucp_wireup_init_lanes(ucp_ep_h ep, unsigned address_count,
+ucs_status_t ucp_wireup_init_lanes(ucp_ep_h ep, const ucp_ep_params_t *params,
+                                   unsigned address_count,
                                    const ucp_address_entry_t *address_list,
                                    uint8_t *addr_indices);
 
-ucs_status_t ucp_wireup_select_lanes(ucp_ep_h ep, unsigned address_count,
+ucs_status_t ucp_wireup_select_lanes(ucp_ep_h ep, const ucp_ep_params_t *params,
+                                     unsigned address_count,
                                      const ucp_address_entry_t *address_list,
                                      uint8_t *addr_indices,
                                      ucp_ep_config_key_t *key);
 
+ucs_status_t ucp_signaling_ep_create(ucp_ep_h ucp_ep, uct_ep_h uct_ep,
+                                     int is_owner, uct_ep_h *signaling_ep);
+
 static inline int ucp_worker_is_tl_p2p(ucp_worker_h worker, ucp_rsc_index_t rsc_index)
 {
-    return !(worker->iface_attrs[rsc_index].cap.flags & UCT_IFACE_FLAG_CONNECT_TO_IFACE);
+    return !(worker->ifaces[rsc_index].attr.cap.flags & UCT_IFACE_FLAG_CONNECT_TO_IFACE);
 }
 
 

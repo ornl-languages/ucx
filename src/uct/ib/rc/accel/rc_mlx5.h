@@ -52,6 +52,7 @@ typedef struct {
 } uct_rc_mlx5_iface_t;
 
 
+UCS_CLASS_DECLARE(uct_rc_mlx5_ep_t, uct_iface_h);
 UCS_CLASS_DECLARE_NEW_FUNC(uct_rc_mlx5_ep_t, uct_ep_t, uct_iface_h);
 UCS_CLASS_DECLARE_DELETE_FUNC(uct_rc_mlx5_ep_t, uct_ep_t);
 
@@ -79,11 +80,13 @@ ucs_status_t uct_rc_mlx5_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header
                                      const void *payload, unsigned length);
 
 ssize_t uct_rc_mlx5_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
-                                uct_pack_callback_t pack_cb, void *arg);
+                                uct_pack_callback_t pack_cb, void *arg,
+                                unsigned flags);
 
 ucs_status_t uct_rc_mlx5_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id, const void *header,
                                      unsigned header_length, const uct_iov_t *iov,
-                                     size_t iovcnt, uct_completion_t *comp);
+                                     size_t iovcnt, unsigned flags,
+                                     uct_completion_t *comp);
 
 ucs_status_t uct_rc_mlx5_ep_atomic_add64(uct_ep_h tl_ep, uint64_t add,
                                          uint64_t remote_addr, uct_rkey_t rkey);
@@ -120,6 +123,6 @@ ucs_status_t uct_rc_mlx5_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion
 ucs_status_t uct_rc_mlx5_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
                                     uct_rc_fc_request_t *req);
 
-void uct_rc_mlx5_iface_progress(void *arg);
+unsigned uct_rc_mlx5_iface_progress(void *arg);
 
 #endif

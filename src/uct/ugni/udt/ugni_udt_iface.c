@@ -1,24 +1,19 @@
 /**
- * Copyright (c) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
+ * Copyright (c) UT-Battelle, LLC. 2014-2017. ALL RIGHTS RESERVED.
  * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
 
-#include <pmi.h>
-#include "ucs/type/class.h"
-#include "uct/base/uct_md.h"
-
-#include <ucs/async/async.h>
-#include <ucs/arch/cpu.h>
-#include <uct/ugni/base/ugni_iface.h>
 #include "ugni_udt_iface.h"
 #include "ugni_udt_ep.h"
+#include <uct/ugni/base/ugni_device.h>
+#include <uct/ugni/base/ugni_md.h>
 #include <poll.h>
 
 #define UCT_UGNI_UDT_TL_NAME "ugni_udt"
 
 static ucs_config_field_t uct_ugni_udt_iface_config_table[] = {
-    {"", "ALLOC=huge,mmap,heap", NULL,
+    {"", "ALLOC=huge,thp,mmap,heap", NULL,
     ucs_offsetof(uct_ugni_iface_config_t, super),
     UCS_CONFIG_TYPE_TABLE(uct_iface_config_table)},
 
@@ -34,15 +29,14 @@ static ucs_status_t processs_datagram(uct_ugni_udt_iface_t *iface, uct_ugni_udt_
 {
     ucs_status_t status;
     uct_ugni_udt_header_t *header;
-    void *payload, *user_desc;
+    void *payload;
 
     header = uct_ugni_udt_get_rheader(desc, iface);
     payload = uct_ugni_udt_get_rpayload(desc, iface);
-    user_desc = uct_ugni_udt_get_user_desc(desc, iface);
     uct_iface_trace_am(&iface->super.super, UCT_AM_TRACE_TYPE_RECV,
                        header->am_id, payload, header->length, "RX: AM");
     status = uct_iface_invoke_am(&iface->super.super, header->am_id, payload,
-                                 header->length, user_desc);
+                                 header->length, UCT_CB_PARAM_FLAG_DESC);
     return status;
 }
 
@@ -56,6 +50,8 @@ static ucs_status_t recieve_datagram(uct_ugni_udt_iface_t *iface, uint64_t id, u
     uct_ugni_udt_desc_t *desc;
     uct_ugni_udt_header_t *header;
 
+    ucs_trace_func("iface=%p, id=%lx", iface, id);
+
     if (UCT_UGNI_UDT_ANY == id) {
         ep = NULL;
         gni_ep = iface->ep_any;
@@ -68,20 +64,16 @@ static ucs_status_t recieve_datagram(uct_ugni_udt_iface_t *iface, uint64_t id, u
     }
 
     *ep_out = ep;
-    pthread_mutex_lock(&uct_ugni_global_lock);
+    uct_ugni_device_lock(&iface->super.cdm);
     ugni_rc = GNI_EpPostDataWaitById(gni_ep, id, -1, &post_state, &rem_addr, &rem_id);
-    pthread_mutex_unlock(&uct_ugni_global_lock);
+    uct_ugni_device_unlock(&iface->super.cdm);
     if (ucs_unlikely(GNI_RC_SUCCESS != ugni_rc)) {
-        ucs_error("GNI_EpPostDataWaitById, Error status: %s %d",
-                  gni_err_str[ugni_rc], ugni_rc);
+        ucs_error("GNI_EpPostDataWaitById, id=%lu Error status: %s %d",
+                  id, gni_err_str[ugni_rc], ugni_rc);
         return UCS_ERR_IO_ERROR;
     }
     if (GNI_POST_TERMINATED == post_state) {
-        if(UCT_UGNI_UDT_ANY == id) {
-            return UCS_ERR_CANCELED;
-        } else {
-            return UCS_OK;
-        }
+        return UCS_ERR_CANCELED;
     }
 
     if (GNI_POST_COMPLETED != post_state) {
@@ -91,8 +83,6 @@ static ucs_status_t recieve_datagram(uct_ugni_udt_iface_t *iface, uint64_t id, u
 
     if (UCT_UGNI_UDT_ANY != id) {
         --iface->super.outstanding;
-        --ep->super.outstanding;
-        uct_ugni_ep_check_flush(&ep->super);
     }
 
     header = uct_ugni_udt_get_rheader(desc, iface);
@@ -103,7 +93,7 @@ static ucs_status_t recieve_datagram(uct_ugni_udt_iface_t *iface, uint64_t id, u
         /* ack message, no data */
         ucs_assert_always(NULL != ep);
         ucs_mpool_put(ep->posted_desc);
-        uct_ugni_ep_check_flush(&ep->super);
+        uct_ugni_check_flush(ep->desc_flush_group);
         ep->posted_desc = NULL;
         return UCS_OK;
     }
@@ -123,7 +113,7 @@ static void *uct_ugni_udt_device_thread(void *arg)
             pthread_cond_wait(&iface->device_condition, &iface->device_lock);
         }
         pthread_mutex_unlock(&iface->device_lock);
-        ugni_rc = GNI_PostdataProbeWaitById(iface->super.nic_handle,-1,&id);
+        ugni_rc = GNI_PostdataProbeWaitById(uct_ugni_udt_iface_nic_handle(iface),-1,&id);
         if (ucs_unlikely(GNI_RC_SUCCESS != ugni_rc)) {
             ucs_error("GNI_PostDataProbeWaitById, Error status: %s %d\n",
                       gni_err_str[ugni_rc], ugni_rc);
@@ -143,21 +133,23 @@ static void *uct_ugni_udt_device_thread(void *arg)
     return NULL;
 }
 
-void uct_ugni_udt_progress(void *arg)
+unsigned uct_ugni_udt_progress(void *arg)
 {
     uct_ugni_udt_iface_t * iface = (uct_ugni_udt_iface_t *)arg;
 
     uct_ugni_enter_async(&iface->super);
     ucs_arbiter_dispatch(&iface->super.arbiter, 1, uct_ugni_udt_ep_process_pending, NULL);
     uct_ugni_leave_async(&iface->super);
+    return 0;
 }
 
-static void uct_ugni_udt_iface_release_am_desc(uct_iface_t *tl_iface, void *desc)
+static void uct_ugni_udt_iface_release_desc(uct_recv_desc_t *self, void *desc)
 {
     uct_ugni_udt_desc_t *ugni_desc;
-    uct_ugni_udt_iface_t *iface = ucs_derived_of(tl_iface, uct_ugni_udt_iface_t);
+    uct_ugni_udt_iface_t *iface = ucs_container_of(self, uct_ugni_udt_iface_t,
+                                                   release_desc);
 
-    ugni_desc = (uct_ugni_udt_desc_t *)((uct_am_recv_desc_t *)desc - 1);
+    ugni_desc = (uct_ugni_udt_desc_t *)((uct_recv_desc_t *)desc - 1);
     ucs_assert_always(NULL != ugni_desc);
     uct_ugni_udt_reset_desc(ugni_desc, iface);
     ucs_mpool_put(ugni_desc);
@@ -185,14 +177,16 @@ static ucs_status_t uct_ugni_udt_iface_query(uct_iface_h tl_iface, uct_iface_att
     iface_attr->device_addr_len        = sizeof(uct_devaddr_ugni_t);
     iface_attr->iface_addr_len         = sizeof(uct_sockaddr_ugni_t);
     iface_attr->ep_addr_len            = 0;
+    iface_attr->max_conn_priv          = 0;
     iface_attr->cap.flags              = UCT_IFACE_FLAG_AM_SHORT |
                                          UCT_IFACE_FLAG_AM_BCOPY |
                                          UCT_IFACE_FLAG_CONNECT_TO_IFACE |
                                          UCT_IFACE_FLAG_PENDING |
-                                         UCT_IFACE_FLAG_AM_CB_ASYNC;
+                                         UCT_IFACE_FLAG_CB_ASYNC;
 
     iface_attr->overhead               = 1e-6;  /* 1 usec */
-    iface_attr->latency                = 40e-6; /* 40 usec */
+    iface_attr->latency.overhead       = 40e-6; /* 40 usec */
+    iface_attr->latency.growth         = 0;
     iface_attr->bandwidth              = pow(1024, 2); /* bytes */
     iface_attr->priority               = 0;
     return UCS_OK;
@@ -207,9 +201,11 @@ void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
     gni_return_t ugni_rc;
     uint64_t id;
 
-    pthread_mutex_lock(&uct_ugni_global_lock);
-    ugni_rc = GNI_PostDataProbeById(iface->super.nic_handle, &id);
-    pthread_mutex_unlock(&uct_ugni_global_lock);
+    ucs_trace_func("");
+
+    uct_ugni_device_lock(&iface->super.cdm);
+    ugni_rc = GNI_PostDataProbeById(uct_ugni_udt_iface_nic_handle(iface), &id);
+    uct_ugni_device_unlock(&iface->super.cdm);
     while (GNI_RC_SUCCESS == ugni_rc) {
         status = recieve_datagram(iface, id, &ep);
         if (UCS_INPROGRESS == status) {
@@ -219,12 +215,12 @@ void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
                 status = processs_datagram(iface, datagram);
                 if (UCS_OK != status) {
                     user_desc = uct_ugni_udt_get_user_desc(datagram, iface);
-                    uct_recv_desc_iface(user_desc) = &iface->super.super.super;
+                    uct_recv_desc(user_desc) = &iface->release_desc;
                 } else {
                     ucs_mpool_put(datagram);
                 }
                 ep->posted_desc = NULL;
-                uct_ugni_ep_check_flush(&ep->super);
+                uct_ugni_check_flush(ep->desc_flush_group);
             } else {
                 ucs_trace_data("Processing wildcard");
                 datagram = iface->desc_any;
@@ -233,11 +229,9 @@ void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
                     UCT_TL_IFACE_GET_TX_DESC(&iface->super.super, &iface->free_desc,
                                              iface->desc_any, iface->desc_any=NULL);
                     user_desc = uct_ugni_udt_get_user_desc(datagram, iface);
-                    uct_recv_desc_iface(user_desc) = &iface->super.super.super;
+                    uct_recv_desc(user_desc) = &iface->release_desc;
                 }
-                pthread_mutex_lock(&uct_ugni_global_lock);
                 status = uct_ugni_udt_ep_any_post(iface);
-                pthread_mutex_unlock(&uct_ugni_global_lock);
                 if (UCS_OK != status) {
                     /* We can't continue if we can't post the first receive */
                     ucs_error("Failed to post wildcard request");
@@ -245,9 +239,9 @@ void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
                 }
             }
         }
-        pthread_mutex_lock(&uct_ugni_global_lock);
-        ugni_rc = GNI_PostDataProbeById(iface->super.nic_handle, &id);
-        pthread_mutex_unlock(&uct_ugni_global_lock);
+        uct_ugni_device_lock(&iface->super.cdm);
+        ugni_rc = GNI_PostDataProbeById(uct_ugni_udt_iface_nic_handle(iface), &id);
+        uct_ugni_device_unlock(&iface->super.cdm);
     }
 
     ucs_async_pipe_drain(&iface->event_pipe);
@@ -262,11 +256,35 @@ void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
 static void uct_ugni_udt_clean_wildcard(uct_ugni_udt_iface_t *iface)
 {
     gni_return_t ugni_rc;
+    uint32_t rem_addr, rem_id;
+    gni_post_state_t post_state;
+    uct_ugni_device_lock(&iface->super.cdm);
+    ugni_rc = GNI_EpPostDataCancelById(iface->ep_any, UCT_UGNI_UDT_ANY);
+    if (GNI_RC_SUCCESS != ugni_rc) {
+        uct_ugni_device_unlock(&iface->super.cdm);
+        ucs_error("GNI_EpPostDataCancel failed, Error status: %s %d",
+                  gni_err_str[ugni_rc], ugni_rc);
+        return;
+    }
+    ugni_rc = GNI_EpPostDataTestById(iface->ep_any, UCT_UGNI_UDT_ANY, &post_state, &rem_addr, &rem_id);
+    if (GNI_RC_SUCCESS != ugni_rc) {
+        if (GNI_RC_NO_MATCH != ugni_rc) {
+            uct_ugni_device_unlock(&iface->super.cdm);
+            ucs_error("GNI_EpPostDataTestById failed, Error status: %s %d",
+                      gni_err_str[ugni_rc], ugni_rc);
+            return;
+        }
+    } else {
+        if (GNI_POST_PENDING == post_state) {
+            ugni_rc = GNI_EpPostDataWaitById(iface->ep_any, UCT_UGNI_UDT_ANY, -1, &post_state, &rem_addr, &rem_id);
+        }
+    }
     ugni_rc = GNI_EpDestroy(iface->ep_any);
     if (GNI_RC_SUCCESS != ugni_rc) {
         ucs_error("GNI_EpDestroy failed, Error status: %s %d\n",
                   gni_err_str[ugni_rc], ugni_rc);
     }
+    uct_ugni_device_unlock(&iface->super.cdm);
 }
 
 /* Before this function is called, you MUST
@@ -279,15 +297,18 @@ static inline void uct_ugni_udt_terminate_thread(uct_ugni_udt_iface_t *iface)
     gni_return_t ugni_rc;
     gni_ep_handle_t   ep;
 
-    ugni_rc = GNI_EpCreate(iface->super.nic_handle, iface->super.local_cq, &ep);
+    uct_ugni_device_lock(&iface->super.cdm);
+    ugni_rc = GNI_EpCreate(uct_ugni_udt_iface_nic_handle(iface), iface->super.local_cq, &ep);
     if (GNI_RC_SUCCESS != ugni_rc) {
+        uct_ugni_device_unlock(&iface->super.cdm);
         ucs_error("GNI_EpCreate, Error status: %s %d",
                   gni_err_str[ugni_rc], ugni_rc);
         return;
     }
-    ugni_rc = GNI_EpBind(ep, iface->super.dev->address, iface->super.domain_id);
+    ugni_rc = GNI_EpBind(ep, iface->super.cdm.dev->address, iface->super.cdm.domain_id);
     if (GNI_RC_SUCCESS != ugni_rc) {
         GNI_EpDestroy(ep);
+        uct_ugni_device_unlock(&iface->super.cdm);
         ucs_error("GNI_EpBind failed, Error status: %s %d",
                   gni_err_str[ugni_rc], ugni_rc);
         return;
@@ -302,6 +323,7 @@ static inline void uct_ugni_udt_terminate_thread(uct_ugni_udt_iface_t *iface)
     }
     /* When the gni_ep is destroyed the above post will be canceled */
     ugni_rc = GNI_EpDestroy(ep);
+    uct_ugni_device_unlock(&iface->super.cdm);
     if (GNI_RC_SUCCESS != ugni_rc) {
         ucs_error("GNI_EpDestroy failed, Error status: %s %d\n",
                   gni_err_str[ugni_rc], ugni_rc);
@@ -311,39 +333,42 @@ static inline void uct_ugni_udt_terminate_thread(uct_ugni_udt_iface_t *iface)
 static UCS_CLASS_CLEANUP_FUNC(uct_ugni_udt_iface_t)
 {
     void *dummy;
-
-    if (!self->super.activated) {
-        /* We done with release */
-        return;
-    }
-    ucs_debug("Cleaning up iface.");
-    ucs_async_remove_handler(ucs_async_pipe_rfd(&self->event_pipe),1);
+    uct_ugni_enter_async(&self->super);
     uct_ugni_udt_clean_wildcard(self);
-    uct_ugni_proccess_datagram_pipe(ucs_async_pipe_rfd(&self->event_pipe),self);
+    ucs_async_remove_handler(ucs_async_pipe_rfd(&self->event_pipe),1);
+    if (self->events_ready) {
+        uct_ugni_proccess_datagram_pipe(ucs_async_pipe_rfd(&self->event_pipe),self);
+    }
     uct_ugni_udt_terminate_thread(self);
     pthread_join(self->event_thread, &dummy);
     ucs_async_pipe_destroy(&self->event_pipe);
     ucs_mpool_put(self->desc_any);
     ucs_mpool_cleanup(&self->free_desc, 1);
+    pthread_mutex_destroy(&self->device_lock);
+    uct_ugni_leave_async(&self->super);
 }
 
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_ugni_udt_iface_t, uct_iface_t);
 
-uct_iface_ops_t uct_ugni_udt_iface_ops = {
-    .iface_query           = uct_ugni_udt_iface_query,
-    .iface_flush           = uct_ugni_iface_flush,
-    .iface_close           = UCS_CLASS_DELETE_FUNC_NAME(uct_ugni_udt_iface_t),
-    .iface_get_address     = uct_ugni_iface_get_address,
+static uct_iface_ops_t uct_ugni_udt_iface_ops = {
+    .ep_am_short              = uct_ugni_udt_ep_am_short,
+    .ep_am_bcopy              = uct_ugni_udt_ep_am_bcopy,
+    .ep_pending_add           = uct_ugni_udt_ep_pending_add,
+    .ep_pending_purge         = uct_ugni_udt_ep_pending_purge,
+    .ep_flush                 = uct_ugni_ep_flush,
+    .ep_fence                 = uct_base_ep_fence,
+    .ep_create_connected      = UCS_CLASS_NEW_FUNC_NAME(uct_ugni_udt_ep_t),
+    .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_ugni_udt_ep_t),
+    .iface_flush              = uct_ugni_iface_flush,
+    .iface_fence              = uct_base_iface_fence,
+    .iface_progress_enable    = ucs_empty_function,
+    .iface_progress_disable   = ucs_empty_function,
+    .iface_progress        = (void*)uct_ugni_udt_progress,
+    .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_ugni_udt_iface_t),
+    .iface_query              = uct_ugni_udt_iface_query,
+    .iface_get_address        = uct_ugni_iface_get_address,
     .iface_get_device_address = uct_ugni_iface_get_dev_address,
-    .iface_is_reachable    = uct_ugni_iface_is_reachable,
-    .iface_release_am_desc = uct_ugni_udt_iface_release_am_desc,
-    .ep_create_connected   = UCS_CLASS_NEW_FUNC_NAME(uct_ugni_udt_ep_t),
-    .ep_destroy            = UCS_CLASS_DELETE_FUNC_NAME(uct_ugni_udt_ep_t),
-    .ep_pending_add        = uct_ugni_udt_ep_pending_add,
-    .ep_pending_purge      = uct_ugni_ep_pending_purge,
-    .ep_am_short           = uct_ugni_udt_ep_am_short,
-    .ep_am_bcopy           = uct_ugni_udt_ep_am_bcopy,
-    .ep_flush              = uct_ugni_ep_flush,
+    .iface_is_reachable       = uct_ugni_iface_is_reachable
 };
 
 static ucs_mpool_ops_t uct_ugni_udt_desc_mpool_ops = {
@@ -370,6 +395,7 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_udt_iface_t, uct_md_h md, uct_worker_h worke
     /* Setting initial configuration */
     self->config.udt_seg_size = GNI_DATAGRAM_MAXSIZE;
     self->config.rx_headroom  = params->rx_headroom;
+    self->release_desc.cb     = uct_ugni_udt_iface_release_desc;
 
     status = ucs_async_pipe_create(&self->event_pipe);
     if (UCS_OK != status) {
@@ -392,20 +418,12 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_udt_iface_t, uct_md_h md, uct_worker_h worke
         goto clean_pipe;
     }
 
-    pthread_mutex_lock(&uct_ugni_global_lock);
-    status = ugni_activate_iface(&self->super);
-    pthread_mutex_unlock(&uct_ugni_global_lock);
-    if (UCS_OK != status) {
-        ucs_error("Failed to activate the interface");
-        goto clean_free_desc;
-    }
-
-    ugni_rc = GNI_EpCreate(self->super.nic_handle, NULL, &self->ep_any);
+    ugni_rc = GNI_EpCreate(uct_ugni_udt_iface_nic_handle(self), NULL, &self->ep_any);
     if (GNI_RC_SUCCESS != ugni_rc) {
         ucs_error("GNI_EpCreate failed, Error status: %s %d",
                   gni_err_str[ugni_rc], ugni_rc);
         status = UCS_ERR_NO_DEVICE;
-        goto clean_iface_activate;
+        goto clean_free_desc;
     }
 
     UCT_TL_IFACE_GET_TX_DESC(&self->super.super, &self->free_desc,
@@ -414,9 +432,7 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_udt_iface_t, uct_md_h md, uct_worker_h worke
 
     /* Init any desc */
     self->desc_any = desc;
-    pthread_mutex_lock(&uct_ugni_global_lock);
     status = uct_ugni_udt_ep_any_post(self);
-    pthread_mutex_unlock(&uct_ugni_global_lock);
     if (UCS_OK != status) {
         /* We can't continue if we can't post the first receive */
         ucs_error("Failed to post wildcard request");
@@ -456,13 +472,12 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_udt_iface_t, uct_md_h md, uct_worker_h worke
         ucs_warn("GNI_EpDestroy failed, Error status: %s %d",
                  gni_err_str[ugni_rc], ugni_rc);
     }
- clean_iface_activate:
-    ugni_deactivate_iface(&self->super);
  clean_free_desc:
     ucs_mpool_cleanup(&self->free_desc, 1);
  clean_pipe:
     ucs_async_pipe_destroy(&self->event_pipe);
  exit:
+    uct_ugni_cleanup_base_iface(&self->super);
     ucs_error("Failed to activate interface");
     return status;
 }

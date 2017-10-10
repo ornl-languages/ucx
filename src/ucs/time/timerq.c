@@ -18,6 +18,7 @@ ucs_status_t ucs_timerq_init(ucs_timer_queue_t *timerq)
     pthread_spin_init(&timerq->lock, 0);
     timerq->timers       = NULL;
     timerq->num_timers   = 0;
+    /* coverity[missing_lock] */
     timerq->min_interval = UCS_TIME_INFINITY;
     return UCS_OK;
 }
@@ -61,6 +62,7 @@ ucs_status_t ucs_timerq_add(ucs_timer_queue_t *timerq, int timer_id,
     timerq->timers = ptr;
     ++timerq->num_timers;
     timerq->min_interval = ucs_min(interval, timerq->min_interval);
+    ucs_assert(timerq->min_interval != UCS_TIME_INFINITY);
 
     /* Initialize the new timer */
     ptr = &timerq->timers[timerq->num_timers - 1];
@@ -86,13 +88,14 @@ ucs_status_t ucs_timerq_remove(ucs_timer_queue_t *timerq, int timer_id)
 
     pthread_spin_lock(&timerq->lock);
     timerq->min_interval = UCS_TIME_INFINITY;
-    for (ptr = timerq->timers; ptr < timerq->timers + timerq->num_timers; ++ptr) {
+    ptr = timerq->timers;
+    while (ptr < timerq->timers + timerq->num_timers) {
         if (ptr->id == timer_id) {
             *ptr = timerq->timers[--timerq->num_timers];
             status = UCS_OK;
-            break;
         } else {
             timerq->min_interval = ucs_min(timerq->min_interval, ptr->interval);
+            ++ptr;
         }
     }
 
@@ -101,6 +104,8 @@ ucs_status_t ucs_timerq_remove(ucs_timer_queue_t *timerq, int timer_id)
         ucs_assert(timerq->min_interval == UCS_TIME_INFINITY);
         free(timerq->timers);
         timerq->timers = NULL;
+    } else {
+        ucs_assert(timerq->min_interval != UCS_TIME_INFINITY);
     }
 
     pthread_spin_unlock(&timerq->lock);

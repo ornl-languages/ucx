@@ -8,6 +8,7 @@
 #ifndef UCT_UD_IFACE_H
 #define UCT_UD_IFACE_H
 
+#include <uct/base/uct_worker.h>
 #include <uct/ib/base/ib_iface.h>
 #include <ucs/datastruct/sglib_wrapper.h>
 #include <ucs/datastruct/ptr_array.h>
@@ -23,10 +24,18 @@
 
 #define UCT_UD_MIN_INLINE   48
 
+enum {
+    UCT_UD_IFACE_STAT_RX_DROP,
+    UCT_UD_IFACE_STAT_LAST
+};
+
 /* TODO: maybe tx_moderation can be defined at compile-time since tx completions are used only to know how much space is there in tx qp */
 
 typedef struct uct_ud_iface_config {
     uct_ib_iface_config_t    super;
+    double                   peer_timeout;
+    double                   slow_timer_backoff;
+    int                      dgid_check;
 } uct_ud_iface_config_t;
 
 struct uct_ud_iface_peer {
@@ -88,7 +97,6 @@ static inline ucs_status_t uct_ud_iface_null_hook(uct_ud_iface_t *iface,
 
 typedef struct uct_ud_iface_ops {
     uct_ib_iface_ops_t        super;
-    ucs_callback_t            progress;
     void                      (*async_progress)(uct_ud_iface_t *iface);
     void                      (*tx_skb)(uct_ud_ep_t *ep, uct_ud_send_skb_t *skb,
                                         int solicited);
@@ -109,21 +117,30 @@ struct uct_ud_iface {
         ucs_mpool_t            mp;
         int16_t                available;
         unsigned               unsignaled;
-        /* pool of skbs that are reserved for retransmissions/ctl packects */
-        ucs_queue_head_t       res_skbs;
+        /* pool of skbs that are reserved for retransmissions */
+        ucs_queue_head_t       resend_skbs;
+        unsigned               resend_skbs_quota;
         ucs_arbiter_t          pending_q;
         int                    pending_q_len;
         int                    in_pending;
         ucs_queue_head_t       async_comp_q;
     } tx;
     struct {
+        ucs_time_t           peer_timeout;
+        double               slow_timer_backoff;
         unsigned             tx_qp_len;
         unsigned             max_inline;
+        int                  check_grh_dgid;
+        unsigned             gid_len;
     } config;
+
+    UCS_STATS_NODE_DECLARE(stats);
+
     ucs_ptr_array_t       eps;
     uct_ud_iface_peer_t  *peers[UCT_UD_HASH_SIZE];
     struct {
         ucs_twheel_t              slow_timer;
+        ucs_time_t                slow_tick;
         int                       timer_id;
     } async;
 };
@@ -152,8 +169,8 @@ struct uct_ud_ctl_hdr {
 
 extern ucs_config_field_t uct_ud_iface_config_table[];
 
-void uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_attr);
-void uct_ud_iface_release_am_desc(uct_iface_t *tl_iface, void *desc);
+ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_attr);
+void uct_ud_iface_release_desc(uct_recv_desc_t *self, void *desc);
 
 ucs_status_t uct_ud_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *addr);
 
@@ -166,7 +183,7 @@ ucs_status_t uct_ud_iface_flush(uct_iface_h tl_iface, unsigned flags,
 
 ucs_status_t uct_ud_iface_complete_init(uct_ud_iface_t *iface);
 
-void uct_ud_iface_begin_cleanup(uct_ud_iface_t *iface);
+void uct_ud_iface_remove_async_handlers(uct_ud_iface_t *iface);
 
 void uct_ud_dump_packet(uct_base_iface_t *iface, uct_am_trace_type_t type,
                         void *data, size_t length, size_t valid_length,
@@ -184,13 +201,13 @@ static UCS_F_ALWAYS_INLINE int uct_ud_iface_has_skbs(uct_ud_iface_t *iface)
 }
 
 
-uct_ud_send_skb_t *uct_ud_iface_res_skb_get(uct_ud_iface_t *iface);
+uct_ud_send_skb_t *uct_ud_iface_resend_skb_get(uct_ud_iface_t *iface);
 
 static inline void
-uct_ud_iface_res_skb_put(uct_ud_iface_t *iface, uct_ud_send_skb_t *skb)
+uct_ud_iface_resend_skb_put(uct_ud_iface_t *iface, uct_ud_send_skb_t *skb)
 {
     if (skb != &iface->tx.skb_inl.super) {
-        ucs_queue_push(&iface->tx.res_skbs, &skb->queue);
+        ucs_queue_push(&iface->tx.resend_skbs, &skb->queue);
     }
 }
 
@@ -208,6 +225,32 @@ static UCS_F_ALWAYS_INLINE void uct_ud_enter(uct_ud_iface_t *iface)
 static UCS_F_ALWAYS_INLINE void uct_ud_leave(uct_ud_iface_t *iface)
 {
     UCS_ASYNC_UNBLOCK(iface->super.super.worker->async);
+}
+
+static UCS_F_ALWAYS_INLINE int
+uct_ud_iface_check_grh(uct_ud_iface_t *iface, void *grh_end, int is_grh_present)
+{
+    void *dest_gid, *local_gid;
+
+    if (!iface->config.check_grh_dgid) {
+        return 1;
+    }
+
+    if (ucs_unlikely(!is_grh_present)) {
+        ucs_warn("RoCE packet does not contain GRH");
+        return 1;
+    }
+
+    local_gid = (char*)iface->super.gid.raw + (16 - iface->config.gid_len);
+    dest_gid  = (char*)grh_end - iface->config.gid_len;
+
+    if (memcmp(local_gid, dest_gid, iface->config.gid_len)) {
+        UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_UD_IFACE_STAT_RX_DROP, 1);
+        ucs_trace_data("Drop packet with wrong dgid");
+        return 0;
+    }
+
+    return 1;
 }
 
 /*
@@ -363,6 +406,10 @@ uct_ud_iface_progress_pending_tx(uct_ud_iface_t *iface)
 
 ucs_status_t uct_ud_iface_dispatch_pending_rx_do(uct_ud_iface_t *iface);
 
+void uct_ud_iface_handle_failure(uct_ib_iface_t *iface, void *arg);
+
+ucs_status_t uct_ud_iface_event_arm(uct_iface_h tl_iface, unsigned events);
+
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_ud_iface_dispatch_pending_rx(uct_ud_iface_t *iface)
 {
@@ -389,7 +436,7 @@ uct_ud_iface_dispatch_zcopy_comps(uct_ud_iface_t *iface)
          int mtu; \
          mtu =  uct_ib_mtu_value(uct_ib_iface_port_attr(&(iface)->super)->active_mtu); \
          UCT_CHECK_LENGTH(sizeof(uct_ud_neth_t) + payload_len + header_len, \
-                          mtu, msg); \
+                          0, mtu, msg); \
      } while(0);
 
 #define UCT_UD_CHECK_BCOPY_LENGTH(iface, len) \

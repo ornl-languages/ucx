@@ -17,6 +17,8 @@
 #include <ucs/datastruct/sglib_wrapper.h>
 #include <ucs/sys/compiler.h>
 #include <ucs/sys/math.h>
+#include <ucs/sys/checker.h>
+#include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 
 
@@ -265,7 +267,8 @@ void *ucs_mmap(void *addr, size_t length, int prot, int flags, int fd,
 {
     ucs_memtrack_buffer_t *buffer;
 
-    if ((flags & MAP_FIXED) || !(prot & PROT_WRITE)) {
+    if (ucs_memtrack_is_enabled() &&
+        ((flags & MAP_FIXED) || !(prot & PROT_WRITE))) {
         return MAP_FAILED;
     }
 
@@ -320,6 +323,19 @@ int ucs_munmap(void *addr, size_t length)
     ucs_memtrack_record_release(buffer, length);
     return munmap((void*)buffer - buffer->offset,
                   length + sizeof(*buffer) + buffer->offset);
+}
+
+char *ucs_strdup(const char *src, const char *name)
+{
+    char *str;
+    size_t len = strlen(src);
+
+    str = ucs_malloc(len + 1, name);
+    if (str) {
+        memcpy(str, src, len + 1);
+    }
+
+    return str;
 }
 
 static unsigned ucs_memtrack_total_internal(ucs_memtrack_entry_t* total)
@@ -420,8 +436,9 @@ static void ucs_memtrack_generate_report()
     const char *next_token;
     int need_close;
 
-    status = ucs_open_output_stream(ucs_global_opts.memtrack_dest, &output_stream,
-                                   &need_close, &next_token);
+    status = ucs_open_output_stream(ucs_global_opts.memtrack_dest,
+                                    UCS_LOG_LEVEL_ERROR, &output_stream,
+                                    &need_close, &next_token);
     if (status != UCS_OK) {
         return;
     }
@@ -445,7 +462,9 @@ void ucs_memtrack_init()
     }
 
     sglib_hashed_ucs_memtrack_entry_t_init(ucs_memtrack_context.entries);
-    status = UCS_STATS_NODE_ALLOC(&ucs_memtrack_context.stats, &ucs_memtrack_stats_class, NULL);
+    status = UCS_STATS_NODE_ALLOC(&ucs_memtrack_context.stats,
+                                  &ucs_memtrack_stats_class,
+                                  ucs_stats_get_root());
     if (status != UCS_OK) {
         return;
     }

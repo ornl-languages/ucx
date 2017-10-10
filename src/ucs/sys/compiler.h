@@ -8,21 +8,13 @@
 #define UCS_COMPILER_H_
 
 #include "preprocessor.h"
+#include "compiler_def.h"
 
 #include <stddef.h>
 #include <stdarg.h>
 
 #ifndef ULLONG_MAX
 #define ULLONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1)
-#endif
-
-
-#ifdef __cplusplus
-# define BEGIN_C_DECLS  extern "C" {
-# define END_C_DECLS    }
-#else
-# define BEGIN_C_DECLS
-# define END_C_DECLS
 #endif
 
 
@@ -37,9 +29,6 @@
  */
 #define UCS_STATIC_ASSERT(_cond) \
      switch(0) {case 0:case (_cond):;}
-
-/* Packed structure */
-#define UCS_S_PACKED __attribute__((packed))
 
 /* Aliasing structure */
 #define UCS_S_MAY_ALIAS __attribute__((may_alias))
@@ -57,23 +46,8 @@
 #define UCS_F_NOOPTIMIZE
 #endif
 
-/* Always inline the function */
-#ifdef __GNUC__
-#define UCS_F_ALWAYS_INLINE inline __attribute__ ((always_inline))
-#else
-#define UCS_F_ALWAYS_INLINE inline 
-#endif
-
 /* Avoid inlining the function */
 #define UCS_F_NOINLINE __attribute__ ((noinline))
-
-/*
- * Enable compiler checks for printf-like formatting.
- *
- * @param fmtargN number of formatting argument
- * @param vargN   number of variadic argument
- */
-#define UCS_F_PRINTF(fmtargN, vargN) __attribute__((format(printf, fmtargN, vargN)))
 
 /* Shared library constructor and destructor */
 #define UCS_F_CTOR __attribute__((constructor))

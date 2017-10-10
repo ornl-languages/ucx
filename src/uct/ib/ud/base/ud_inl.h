@@ -32,6 +32,12 @@ uct_ud_ep_ctl_op_add_safe(uct_ud_iface_t *iface, uct_ud_ep_t *ep, int op)
     }
 }
 
+static UCS_F_ALWAYS_INLINE void
+uct_ud_ep_tx_stop(uct_ud_ep_t *ep)
+{
+    ep->tx.max_psn = ep->tx.psn;
+}
+
 /*
  * check iface resources:tx_queue and return
  * prefetched/cached skb
@@ -87,16 +93,6 @@ uct_ud_ep_get_tx_skb(uct_ud_iface_t *iface, uct_ud_ep_t *ep)
     return uct_ud_iface_get_tx_skb(iface, ep);
 }
 
-static inline ucs_time_t uct_ud_slow_tick()
-{
-    return ucs_time_from_msec(100);
-}
-
-static inline ucs_time_t uct_ud_fast_tick()
-{
-    return ucs_time_from_usec(1024);
-}
-
 static UCS_F_ALWAYS_INLINE void
 uct_ud_am_set_zcopy_desc(uct_ud_send_skb_t *skb, const uct_iov_t *iov, size_t iovcnt,
                          uct_completion_t *comp)
@@ -130,10 +126,11 @@ uct_ud_iface_complete_tx_inl(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
     skb->len += length;
     memcpy(data, buffer, length);
     ucs_queue_push(&ep->tx.window, &skb->queue);
+    ep->tx.slow_tick = iface->async.slow_tick;
     ucs_wtimer_add(&iface->async.slow_timer, &ep->slow_timer,
                    uct_ud_iface_get_async_time(iface) -
                    ucs_twheel_get_time(&iface->async.slow_timer) +
-                   uct_ud_slow_tick());
+                   ep->tx.slow_tick);
     ep->tx.send_time = uct_ud_iface_get_async_time(iface);
 }
 
@@ -144,10 +141,11 @@ uct_ud_iface_complete_tx_skb(uct_ud_iface_t *iface, uct_ud_ep_t *ep,
     iface->tx.skb = ucs_mpool_get(&iface->tx.mp);
     ep->tx.psn++;
     ucs_queue_push(&ep->tx.window, &skb->queue);
+    ep->tx.slow_tick = iface->async.slow_tick;
     ucs_wtimer_add(&iface->async.slow_timer, &ep->slow_timer,
                    uct_ud_iface_get_async_time(iface) -
                    ucs_twheel_get_time(&iface->async.slow_timer) +
-                   uct_ud_slow_tick());
+                   ep->tx.slow_tick);
     ep->tx.send_time = uct_ud_iface_get_async_time(iface);
 }
 
@@ -187,4 +185,3 @@ uct_ud_skb_bcopy(uct_ud_send_skb_t *skb, uct_pack_callback_t pack_cb, void *arg)
     skb->len = sizeof(skb->neth[0]) + payload_len;
     return payload_len;
 }
-

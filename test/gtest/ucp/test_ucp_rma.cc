@@ -17,6 +17,20 @@ public:
         return params;
     }
 
+    std::vector<ucp_test_param>
+    static enum_test_params(const ucp_params_t& ctx_params,
+                            const std::string& name,
+                            const std::string& test_case_name,
+                            const std::string& tls)
+    {
+        std::vector<ucp_test_param> result;
+        generate_test_params_variant(ctx_params, name, test_case_name, tls, 0,
+                                     result);
+        generate_test_params_variant(ctx_params, name, test_case_name + "/map_nb",
+                                     tls, UCP_MEM_MAP_NONBLOCK, result);
+        return result;
+    }
+
     void nonblocking_put_nbi(entity *e, size_t max_size,
                              void *memheap_addr,
                              ucp_rkey_h rkey,
@@ -240,4 +254,3 @@ UCS_TEST_P(test_ucp_rma, nonblocking_stream_get_nbi_flush_ep) {
 }
 
 UCP_INSTANTIATE_TEST_CASE(test_ucp_rma)
-

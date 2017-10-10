@@ -289,7 +289,7 @@ void ucs_config_parser_print_opts(FILE *stream, const char *title, const void *o
  *
  * @param opts       User-defined options structure.
  * @param fields     Array of fields which define how to parse.
- * @param name       Option name.
+ * @param name       Option name including subtable prefixes.
  * @param value      Filled with option value (as a string).
  * @param max        Number of bytes reserved in 'value'.
  */
@@ -317,5 +317,13 @@ ucs_status_t ucs_config_parser_set_value(void *opts, ucs_config_field_t *fields,
 size_t ucs_config_memunits_get(size_t config_size, size_t auto_size,
                                size_t max_size);
 
+/**
+ * Look for a string in config names array.
+ *
+ * @param config_names     lookup array of counters patterns.
+ * @param str              string to search.
+ */
+int ucs_config_names_search(ucs_config_names_array_t config_names,
+                            const char *str);
 
 #endif

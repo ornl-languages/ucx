@@ -10,9 +10,11 @@
 #include "parser.h"
 
 #include <ucs/sys/sys.h>
+#include <ucs/sys/string.h>
 #include <ucs/debug/log.h>
 #include <ucs/debug/debug.h>
 #include <ucs/time/time.h>
+#include <fnmatch.h>
 
 
 typedef UCS_CONFIG_ARRAY_FIELD(void, data) ucs_config_array_field_t;
@@ -929,21 +931,47 @@ ucs_status_t ucs_config_parser_set_value(void *opts, ucs_config_field_t *fields,
 }
 
 ucs_status_t ucs_config_parser_get_value(void *opts, ucs_config_field_t *fields,
-                                        const char *name, char *value, size_t max)
+                                         const char *name, char *value,
+                                         size_t max)
 {
-    ucs_config_field_t *field;
-    void *value_ptr;
+    ucs_config_field_t  *field;
+    ucs_config_field_t  *sub_fields;
+    void                *sub_opts;
+    void                *value_ptr;
+    size_t              name_len;
+    ucs_status_t        status;
 
-    for (field = fields; field->name; ++field) {
-        //TODO table
-       if (!strcmp(field->name, name)) {
-           value_ptr = (char*)opts + field->offset;
-           field->parser.write(value, max, value_ptr, field->parser.arg);
-           return UCS_OK;
-       }
+    if (!opts || !fields || !name || (!value && (max > 0))) {
+        return UCS_ERR_INVALID_PARAM;
     }
 
-    return UCS_ERR_INVALID_PARAM;
+    for (field = fields, status = UCS_ERR_NO_ELEM;
+         field->name && (status == UCS_ERR_NO_ELEM); ++field) {
+
+        name_len = strlen(field->name);
+
+        ucs_trace("compare name \"%s\" with field \"%s\" which is%s subtable",
+                  name, field->name,
+                  ucs_config_is_table_field(field) ? "" : " NOT");
+
+        if (ucs_config_is_table_field(field) &&
+            !strncmp(field->name, name, name_len)) {
+
+            sub_fields = (ucs_config_field_t*)field->parser.arg;
+            sub_opts   = (char*)opts + field->offset;
+            status     = ucs_config_parser_get_value(sub_opts, sub_fields,
+                                                     name + name_len,
+                                                     value, max);
+        } else if (!strncmp(field->name, name, strlen(name))) {
+            if (value) {
+                value_ptr = (char *)opts + field->offset;
+                field->parser.write(value, max, value_ptr, field->parser.arg);
+            }
+            status = UCS_OK;
+        }
+    }
+
+    return status;
 }
 
 ucs_status_t ucs_config_parser_clone_opts(const void *src, void *dst,
@@ -1138,3 +1166,18 @@ size_t ucs_config_memunits_get(size_t config_size, size_t auto_size,
         return ucs_min(config_size, max_size);
     }
 }
+
+int ucs_config_names_search(ucs_config_names_array_t config_names,
+                            const char *str)
+{
+    unsigned i;
+
+    for (i = 0; i < config_names.count; ++i) {
+        if (!fnmatch(config_names.names[i], str, 0)) {
+           return i;
+        }
+    }
+
+    return -1;
+}
+

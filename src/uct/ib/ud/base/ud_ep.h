@@ -188,9 +188,14 @@ enum {
     UCT_UD_EP_FLAG_ASYNC_COMPS       = UCS_BIT(0), /* set if there are completions that
                                                     * were picked by async thread and queued */
     /* debug flags */
-    UCT_UD_EP_FLAG_PRIVATE           = UCS_BIT(1),
-    UCT_UD_EP_FLAG_CREQ_RCVD         = UCS_BIT(2),
-    UCT_UD_EP_FLAG_CREP_RCVD         = UCS_BIT(3)
+    UCT_UD_EP_FLAG_PRIVATE           = UCS_BIT(1), /* EP is was created as internal */
+    UCT_UD_EP_FLAG_CREQ_RCVD         = UCS_BIT(2), /* CREQ message was received */
+    UCT_UD_EP_FLAG_CREP_RCVD         = UCS_BIT(3), /* CREP message was received */
+    UCT_UD_EP_FLAG_CREQ_SENT         = UCS_BIT(4), /* CREQ message was sent */
+    UCT_UD_EP_FLAG_CREP_SENT         = UCS_BIT(5), /* CREP message was sent */
+    UCT_UD_EP_FLAG_CREQ_NOTSENT      = UCS_BIT(6)  /* CREQ message is NOT sent, because
+                                                      connection establishment process
+                                                      is driven by remote side. */
 };
 
 typedef struct uct_ud_peer_name {
@@ -206,9 +211,11 @@ struct uct_ud_ep {
          uct_ud_psn_t           psn;          /* Next PSN to send */
          uct_ud_psn_t           max_psn;      /* Largest PSN that can be sent */
          uct_ud_psn_t           acked_psn;    /* last psn that was acked by remote side */
+         uint16_t               err_skb_count;/* number of failed SKBs on the ep */
          ucs_queue_head_t       window;       /* send window: [acked_psn+1, psn-1] */
          uct_ud_ep_pending_op_t pending;      /* pending ops */
          ucs_time_t             send_time;    /* tx time of last packet */
+         ucs_time_t             slow_tick;    /* timeout to trigger slow timer */
          UCS_STATS_NODE_DECLARE(stats);
          UCT_UD_EP_HOOK_DECLARE(tx_hook);
     } tx;
@@ -241,6 +248,9 @@ struct uct_ud_ep {
 };
 
 UCS_CLASS_DECLARE(uct_ud_ep_t, uct_ud_iface_t*)
+
+void uct_ud_tx_wnd_purge_outstanding(uct_ud_iface_t *iface, uct_ud_ep_t *ud_ep,
+                                     ucs_status_t status);
 
 ucs_status_t uct_ud_ep_flush(uct_ep_h ep, unsigned flags,
                              uct_completion_t *comp);
@@ -403,4 +413,3 @@ uct_ud_neth_ack_req(uct_ud_ep_t *ep, uct_ud_neth_t *neth)
 }
 
 #endif
-

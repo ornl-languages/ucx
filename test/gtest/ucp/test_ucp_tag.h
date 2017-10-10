@@ -44,6 +44,8 @@ protected:
 
     static void request_release(struct request *req);
 
+    static void request_free(struct request *req);
+
     static void send_callback(void *request, ucs_status_t status);
 
     static void recv_callback(void *request, ucs_status_t status,
@@ -68,17 +70,22 @@ protected:
                         ucp_tag_t tag, ucp_tag_t tag_mask, int buf_index = 0);
 
     ucs_status_t recv_b(void *buffer, size_t count, ucp_datatype_t datatype,
-                        ucp_tag_t tag, ucp_tag_t tag_mask, ucp_tag_recv_info_t *info, int buf_index = 0);
+                        ucp_tag_t tag, ucp_tag_t tag_mask,
+                        ucp_tag_recv_info_t *info, int buf_index = 0);
 
     ucs_status_t recv_req_b(void *buffer, size_t count, ucp_datatype_t datatype,
-                            ucp_tag_t tag, ucp_tag_t tag_mask, ucp_tag_recv_info_t *info, int buf_index = 0);
+                            ucp_tag_t tag, ucp_tag_t tag_mask,
+                            ucp_tag_recv_info_t *info, int buf_index = 0);
 
     ucs_status_t recv_cb_b(void *buffer, size_t count, ucp_datatype_t datatype,
-                           ucp_tag_t tag, ucp_tag_t tag_mask, ucp_tag_recv_info_t *info, int buf_index = 0);
+                           ucp_tag_t tag, ucp_tag_t tag_mask,
+                           ucp_tag_recv_info_t *info, int buf_index = 0);
 
     void wait(request *req, int buf_index = 0);
 
     void wait_and_validate(request *req);
+
+    void wait_for_unexpected_msg(ucp_context_h context, double sec);
 
     static void* dt_common_start(size_t count);
 
@@ -100,6 +107,8 @@ protected:
                                       size_t length);
 
     static void dt_common_finish(void *state);
+
+    virtual bool is_external_request();
 
     static const uint32_t MAGIC = 0xd7d7d7d7U;
     static const ucp_datatype_t DATATYPE;

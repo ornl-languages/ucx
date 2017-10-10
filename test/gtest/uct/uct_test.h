@@ -2,6 +2,8 @@
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
 *
 * Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
+* Copyright (C) ARM Ltd. 2017.  ALL RIGHTS RESERVED
+* Copyright (C) Advanced Micro Devices, Inc. 2016 - 2017. ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
 
@@ -15,6 +17,11 @@ extern "C" {
 }
 #include <common/test.h>
 #include <vector>
+
+
+#define UCT_TEST_TIMEOUT_IN_SEC   10.0
+#define DEFAULT_DELAY_MS           1.0
+#define DEFAULT_TIMEOUT_SEC       10.0
 
 
 /* Testing resource */
@@ -48,7 +55,7 @@ protected:
     class entity {
     public:
         entity(const resource& resource, uct_iface_config_t *iface_config,
-               size_t rx_headroom, uct_md_config_t *md_config);
+               uct_iface_params_t *params, uct_md_config_t *md_config);
 
         void mem_alloc(size_t length, uct_allocated_memory_t *mem,
                        uct_rkey_bundle *rkey_bundle) const;
@@ -56,7 +63,10 @@ protected:
         void mem_free(const uct_allocated_memory_t *mem,
                       const uct_rkey_bundle_t& rkey) const;
 
-        void progress() const;
+        unsigned progress() const;
+
+        bool is_caps_supported(uint64_t required_flags);
+        void check_caps(uint64_t required_flags, uint64_t invalid_flags = 0);
 
         uct_md_h md() const;
 
@@ -118,6 +128,7 @@ protected:
         size_t length() const;
         uct_mem_h memh() const;
         uct_rkey_t rkey() const;
+        const uct_iov_t* iov() const;
 
         void pattern_fill(uint64_t seed);
         void pattern_check(uint64_t seed);
@@ -135,6 +146,7 @@ protected:
         void                    *m_end;
         uct_rkey_bundle_t       m_rkey;
         uct_allocated_memory_t  m_mem;
+        uct_iov_t               m_iov;
     };
 
     template <typename T>
@@ -152,23 +164,50 @@ protected:
         return result;
     }
 
+    template <typename T>
+    void wait_for_flag(volatile T *flag, double timeout = DEFAULT_TIMEOUT_SEC) const
+    {
+        ucs_time_t deadline = ucs_get_time() +
+                              ucs_time_from_sec(timeout) * ucs::test_time_multiplier();
+        while ((ucs_get_time() < deadline) && (!(*flag))) {
+            short_progress_loop();
+        }
+    }
+
+    template <typename T>
+    void wait_for_value(volatile T *var, T value, bool progress,
+                        double timeout = DEFAULT_TIMEOUT_SEC) const
+    {
+        ucs_time_t deadline = ucs_get_time() +
+                              ucs_time_from_sec(timeout) * ucs::test_time_multiplier();
+        while ((ucs_get_time() < deadline) && (*var != value)) {
+            if (progress) {
+                short_progress_loop();
+            } else {
+                twait();
+            }
+        }
+    }
 
     virtual void init();
     virtual void cleanup();
-    virtual void modify_config(const std::string& name, const std::string& value);
+    virtual void modify_config(const std::string& name, const std::string& value,
+                               bool optional = false);
+    bool get_config(const std::string& name, std::string& value) const;
     void stats_activate();
     void stats_restore();
 
-
+    bool is_caps_supported(uint64_t required_flags);
     void check_caps(uint64_t required_flags, uint64_t invalid_flags = 0);
+    void check_caps(const entity& e, uint64_t required_flags, uint64_t invalid_flags = 0);
     const entity& ent(unsigned index) const;
-    void progress() const;
-    void flush() const;
-    virtual void short_progress_loop(double delay_ms=1.0) const;
-    void wait_for_flag(volatile unsigned *flag, double timeout = 10.0);
-    virtual void twait(int delta_ms);
+    unsigned progress() const;
+    void flush(ucs_time_t deadline = ULONG_MAX) const;
+    virtual void short_progress_loop(double delay_ms = DEFAULT_DELAY_MS) const;
+    virtual void twait(int delta_ms = DEFAULT_DELAY_MS) const;
 
     uct_test::entity* create_entity(size_t rx_headroom);
+    uct_test::entity* create_entity(uct_iface_params_t &params);
 
     ucs::ptr_vector<entity> m_entities;
     uct_iface_config_t      *m_iface_config;
@@ -197,7 +236,8 @@ std::ostream& operator<<(std::ostream& os, const resource* resource);
     mm,                      \
     cma,                     \
     knem,                    \
-    cuda
+    cuda,                    \
+    rocm
 
 #define UCT_TEST_TLS      \
     UCT_TEST_NO_SELF_TLS, \

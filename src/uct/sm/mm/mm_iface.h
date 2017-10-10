@@ -30,11 +30,6 @@
                                      (iface)->config.fifo_elem_size))
 
 
-typedef enum {
-    UCT_MM_IFACE_SIGNAL_CONNECT    = 0,
-} uct_mm_iface_conn_signal_t;
-
-
 typedef struct uct_mm_iface_config {
     uct_iface_config_t       super;
     unsigned                 fifo_size;            /* Size of the receive FIFO */
@@ -87,9 +82,7 @@ struct uct_mm_iface {
     size_t                  rx_headroom;
     ucs_arbiter_t           arbiter;
     const char              *path;            /* path to the backing file (for 'posix') */
-
-    uct_mm_fifo_ctl_t       dummy_fifo_ctl;   /* a dummy fifo_ctl to be used until
-                                               * connection is established */
+    uct_recv_desc_t         release_desc;
 
     struct {
         unsigned fifo_size;
@@ -120,22 +113,25 @@ struct uct_mm_recv_desc {
     uct_mm_id_t         key;
     void                *base_address;
     size_t              mpool_length;
-    uct_am_recv_desc_t  am_recv;   /* has to be in the end */
+    uct_recv_desc_t     recv;   /* has to be in the end */
 };
 
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_mm_iface_invoke_am(uct_mm_iface_t *iface, uint8_t am_id, void *data,
-                       unsigned length, uct_mm_recv_desc_t *mm_desc)
+                       unsigned length, unsigned flags)
 {
     ucs_status_t status;
-    void *desc = mm_desc + 1;    /* point the desc to the user's headroom */
+    void         *desc;
 
-    status = uct_iface_invoke_am(&iface->super, am_id, data, length, desc);
-    if (status != UCS_OK) {
-        /* save the iface of this desc for its later release */
-        uct_recv_desc_iface(desc) = &iface->super.super;
+    status = uct_iface_invoke_am(&iface->super, am_id, data, length, flags);
+
+    if (status == UCS_INPROGRESS) {
+        desc = (void *)((uintptr_t)data - iface->rx_headroom);
+        /* save the release_desc for later release of this desc */
+        uct_recv_desc(desc) = &iface->release_desc;
     }
+
     return status;
 }
 
@@ -164,10 +160,10 @@ static inline void uct_mm_set_fifo_elems_ptr(void *mem_region, void **fifo_elems
    *fifo_elems = (void*) fifo_ctl + UCT_MM_FIFO_CTL_SIZE_ALIGNED;
 }
 
-void uct_mm_iface_release_am_desc(uct_iface_t *tl_iface, void *desc);
+void uct_mm_iface_release_desc(uct_recv_desc_t *self, void *desc);
 ucs_status_t uct_mm_flush();
 
-void uct_mm_iface_progress(void *arg);
+unsigned uct_mm_iface_progress(void *arg);
 
 extern uct_tl_component_t uct_mm_tl;
 

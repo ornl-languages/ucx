@@ -7,6 +7,7 @@
 #include "log.h"
 #include "debug.h"
 
+#include <ucs/sys/checker.h>
 #include <ucs/sys/sys.h>
 #include <ucs/sys/math.h>
 #include <ucs/config/parser.h>
@@ -26,7 +27,8 @@ const char *ucs_log_level_names[] = {
     [UCS_LOG_LEVEL_TRACE_ASYNC]  = "ASYNC",
     [UCS_LOG_LEVEL_TRACE_FUNC]   = "FUNC",
     [UCS_LOG_LEVEL_TRACE_POLL]   = "POLL",
-    [UCS_LOG_LEVEL_LAST]         = NULL
+    [UCS_LOG_LEVEL_LAST]         = NULL,
+    [UCS_LOG_LEVEL_PRINT]        = "PRINT"
 };
 
 static unsigned ucs_log_num_handlers   = 0;
@@ -95,7 +97,7 @@ ucs_log_default_handler(const char *file, unsigned line, const char *function,
     char *buf;
     char *valg_buf;
 
-    if (!ucs_log_enabled(level)) {
+    if (!ucs_log_enabled(level) && (level != UCS_LOG_LEVEL_PRINT)) {
         return UCS_LOG_FUNC_RC_CONTINUE;
     }
 
@@ -106,12 +108,14 @@ ucs_log_default_handler(const char *file, unsigned line, const char *function,
     length = strlen(buf);
     vsnprintf(buf + length, buffer_size - length, message, ap);
 
-    gettimeofday(&tv, NULL);
-
     short_file = strrchr(file, '/');
     short_file = (short_file == NULL) ? file : short_file + 1;
+    gettimeofday(&tv, NULL);
 
-    if (RUNNING_ON_VALGRIND) {
+    if (level <= ucs_global_opts.log_level_trigger) {
+        ucs_handle_error(ucs_log_level_names[level], "%13s:%-4u %s: %s",
+                         short_file, line, ucs_log_level_names[level], buf);
+    } else if (RUNNING_ON_VALGRIND) {
         valg_buf = ucs_alloca(buffer_size + 1);
         snprintf(valg_buf, buffer_size,
                  "[%lu.%06lu] %16s:%-4u %-4s %-5s %s\n", tv.tv_sec, tv.tv_usec,
@@ -133,9 +137,6 @@ ucs_log_default_handler(const char *file, unsigned line, const char *function,
     /* flush the log file if the log_level of this message is fatal or error */
     if (level <= UCS_LOG_LEVEL_ERROR) {
         ucs_log_flush();
-        if (level <= UCS_LOG_LEVEL_FATAL) {
-            ucs_handle_error();
-        }
     }
 
     return UCS_LOG_FUNC_RC_CONTINUE;
@@ -206,8 +207,8 @@ void ucs_log_fatal_error(const char *fmt, ...)
     (void)ret;
 }
 
-void __ucs_abort(const char *file, unsigned line, const char *function,
-                 const char *message, ...)
+void __ucs_abort(const char *error_type, const char *file, unsigned line,
+                 const char *function, const char *message, ...)
 {
     size_t buffer_size = ucs_global_opts.log_buffer_size;
     const char *short_file;
@@ -219,13 +220,13 @@ void __ucs_abort(const char *file, unsigned line, const char *function,
     vsnprintf(buffer, buffer_size, message, ap);
     va_end(ap);
 
+    ucs_debug_cleanup();
+    ucs_log_flush();
+
     short_file = strrchr(file, '/');
     short_file = (short_file == NULL) ? file : short_file + 1;
-    ucs_log_fatal_error("%13s:%-4u %s", short_file, line, buffer);
+    ucs_handle_error(error_type, "%13s:%-4u %s", short_file, line, buffer);
 
-    ucs_log_flush();
-    ucs_debug_cleanup();
-    ucs_handle_error();
     abort();
 }
 
@@ -344,8 +345,8 @@ void ucs_log_init()
     ucs_log_push_handler(ucs_log_default_handler);
 
     if (strlen(ucs_global_opts.log_file) != 0) {
-         ucs_open_output_stream(ucs_global_opts.log_file, &ucs_log_file,
-                                &ucs_log_file_close, &next_token);
+         ucs_open_output_stream(ucs_global_opts.log_file, UCS_LOG_LEVEL_FATAL,
+                                &ucs_log_file, &ucs_log_file_close, &next_token);
     }
 
     ucs_debug("%s loaded at 0x%lx", ucs_debug_get_lib_path(),
@@ -359,4 +360,6 @@ void ucs_log_cleanup()
         fclose(ucs_log_file);
     }
     ucs_log_file = NULL;
+    ucs_log_initialized  = 0;
+    ucs_log_num_handlers = 0;
 }

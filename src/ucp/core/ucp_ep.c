@@ -9,12 +9,17 @@
 #include "ucp_ep.inl"
 #include "ucp_request.inl"
 
-#include <ucp/wireup/stub_ep.h>
+#include <ucp/wireup/wireup_ep.h>
 #include <ucp/wireup/wireup.h>
 #include <ucp/tag/eager.h>
+#include <ucp/tag/offload.h>
 #include <ucs/debug/memtrack.h>
 #include <ucs/debug/log.h>
+#include <ucs/sys/string.h>
 #include <string.h>
+
+
+extern const ucp_proto_t ucp_stream_am_proto;
 
 #if ENABLE_STATS
 static ucs_stats_class_t ucp_ep_stats_class = {
@@ -28,6 +33,21 @@ static ucs_stats_class_t ucp_ep_stats_class = {
 };
 #endif
 
+
+void ucp_ep_config_key_reset(ucp_ep_config_key_t *key)
+{
+    memset(key, 0, sizeof(*key));
+    key->num_lanes        = 0;
+    key->am_lane          = UCP_NULL_LANE;
+    key->rndv_lane        = UCP_NULL_LANE;
+    key->wireup_lane      = UCP_NULL_LANE;
+    key->tag_lane         = UCP_NULL_LANE;
+    key->reachable_md_map = 0;
+    key->err_mode         = UCP_ERR_HANDLING_MODE_NONE;
+    key->status           = UCS_OK;
+    memset(key->rma_lanes, UCP_NULL_LANE, sizeof(key->rma_lanes));
+    memset(key->amo_lanes, UCP_NULL_LANE, sizeof(key->amo_lanes));
+}
 
 ucs_status_t ucp_ep_new(ucp_worker_h worker, uint64_t dest_uuid,
                         const char *peer_name, const char *message,
@@ -46,22 +66,14 @@ ucs_status_t ucp_ep_new(ucp_worker_h worker, uint64_t dest_uuid,
         goto err;
     }
 
-    /* EP configuration without any lanes */
-    memset(&key, 0, sizeof(key));
-    key.rma_lane_map     = 0;
-    key.amo_lane_map     = 0;
-    key.reachable_md_map = 0;
-    key.am_lane          = UCP_NULL_RESOURCE;
-    key.rndv_lane        = UCP_NULL_RESOURCE;
-    key.wireup_msg_lane  = UCP_NULL_LANE;
-    key.num_lanes        = 0;
-    memset(key.amo_lanes, UCP_NULL_LANE, sizeof(key.amo_lanes));
-
+    ucp_ep_config_key_reset(&key);
     ep->worker           = worker;
     ep->dest_uuid        = dest_uuid;
     ep->cfg_index        = ucp_worker_get_ep_config(worker, &key);
     ep->am_lane          = UCP_NULL_LANE;
     ep->flags            = 0;
+    ucs_queue_head_init(&ep->stream_data);
+
 #if ENABLE_DEBUG_DATA
     ucs_snprintf_zero(ep->peer_name, UCP_WORKER_NAME_MAX, "%s", peer_name);
 #endif
@@ -105,6 +117,11 @@ static void ucp_ep_delete_from_hash(ucp_ep_h ep)
     if (hash_it != kh_end(&ep->worker->ep_hash)) {
         kh_del(ucp_worker_ep_hash, &ep->worker->ep_hash, hash_it);
     }
+
+    hash_it = kh_get(ucp_ep_errh_hash, &ep->worker->ep_errh_hash, (uintptr_t)ep);
+    if (hash_it != kh_end(&ep->worker->ep_errh_hash)) {
+        kh_del(ucp_ep_errh_hash, &ep->worker->ep_errh_hash, hash_it);
+    }
 }
 
 static void ucp_ep_delete(ucp_ep_h ep)
@@ -126,22 +143,20 @@ ucs_status_t ucp_ep_create_stub(ucp_worker_h worker, uint64_t dest_uuid,
         goto err;
     }
 
+    ucp_ep_config_key_reset(&key);
+
     /* all operations will use the first lane, which is a stub endpoint */
-    memset(&key, 0, sizeof(key));
-    key.rma_lane_map     = 1;
-    key.amo_lane_map     = 1;
-    key.reachable_md_map = 0; /* TODO */
-    key.am_lane          = 0;
-    key.rndv_lane        = 0;
-    key.wireup_msg_lane  = 0;
-    key.lanes[0]         = UCP_NULL_RESOURCE;
-    key.num_lanes        = 1;
-    memset(key.amo_lanes, UCP_NULL_LANE, sizeof(key.amo_lanes));
+    key.num_lanes             = 1;
+    key.lanes[0].rsc_index    = UCP_NULL_RESOURCE;
+    key.lanes[0].dst_md_index = UCP_NULL_RESOURCE;
+    key.am_lane               = 0;
+    key.rndv_lane             = 0;
+    key.wireup_lane           = 0;
 
     ep->cfg_index        = ucp_worker_get_ep_config(worker, &key);
     ep->am_lane          = 0;
 
-    status = ucp_stub_ep_create(ep, &ep->uct_eps[0]);
+    status = ucp_wireup_ep_create(ep, &ep->uct_eps[0]);
     if (status != UCS_OK) {
         goto err_destroy_uct_eps;
     }
@@ -159,6 +174,49 @@ err:
 int ucp_ep_is_stub(ucp_ep_h ep)
 {
     return ucp_ep_get_rsc_index(ep, 0) == UCP_NULL_RESOURCE;
+}
+
+static ucs_status_t
+ucp_ep_setup_err_handler(ucp_ep_h ep, ucp_err_handler_cb_t err_handler_cb)
+{
+    khiter_t hash_it;
+    int hash_extra_status = 0;
+
+    hash_it = kh_put(ucp_ep_errh_hash, &ep->worker->ep_errh_hash, (uintptr_t)ep,
+                     &hash_extra_status);
+    if (ucs_unlikely(hash_it == kh_end(&ep->worker->ep_errh_hash))) {
+        ucs_error("Hash failed on setup error handler of endpoint %p with status %d ",
+                  ep, hash_extra_status);
+        return UCS_ERR_NO_MEMORY;
+    }
+    kh_value(&ep->worker->ep_errh_hash, hash_it) = err_handler_cb;
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+ucp_ep_adjust_params(ucp_ep_h ep, const ucp_ep_params_t *params)
+{
+    ucs_status_t status = UCS_OK;
+
+    /* TODO: handle a case where the existing endpoint is incomplete */
+
+    if (params->field_mask & UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE) {
+        if (ucp_ep_config(ep)->key.err_mode != params->err_mode) {
+            ucs_error("asymmetric endpoint configuration not supported, "
+                      "error handling level mismatch");
+            return UCS_ERR_UNSUPPORTED;
+        }
+    }
+
+    if (params->field_mask & UCP_EP_PARAM_FIELD_ERR_HANDLER_CB) {
+        status = ucp_ep_setup_err_handler(ep, params->err_handler_cb);
+    }
+
+    ep->user_data = (params->field_mask & UCP_EP_PARAM_FIELD_USER_DATA) ?
+                    params->user_data : NULL;
+
+    return status;
 }
 
 ucs_status_t ucp_ep_create(ucp_worker_h worker,
@@ -192,9 +250,10 @@ ucs_status_t ucp_ep_create(ucp_worker_h worker,
 
     ep = ucp_worker_ep_find(worker, dest_uuid);
     if (ep != NULL) {
-        /* TODO handle a case where the existing endpoint is incomplete */
-        *ep_p = ep;
-        status = UCS_OK;
+        status = ucp_ep_adjust_params(ep, params);
+        if (status == UCS_OK) {
+            *ep_p = ep;
+        }
         goto out_free_address;
     }
 
@@ -205,10 +264,22 @@ ucs_status_t ucp_ep_create(ucp_worker_h worker,
     }
 
     /* initialize transport endpoints */
-    status = ucp_wireup_init_lanes(ep, address_count, address_list, addr_indices);
+    status = ucp_wireup_init_lanes(ep, params, address_count, address_list,
+                                   addr_indices);
     if (status != UCS_OK) {
         goto err_destroy_ep;
     }
+
+    /* Setup error handler */
+    if (params->field_mask & UCP_EP_PARAM_FIELD_ERR_HANDLER_CB) {
+        status = ucp_ep_setup_err_handler(ep, params->err_handler_cb);
+        if (status != UCS_OK) {
+            goto err_destroy_ep;
+        }
+    }
+
+    ep->user_data = (params->field_mask & UCP_EP_PARAM_FIELD_USER_DATA) ?
+                    params->user_data : NULL;
 
     /* send initial wireup message */
     if (!(ep->flags & UCP_EP_FLAG_LOCAL_CONNECTED)) {
@@ -233,7 +304,10 @@ out:
 
 static void ucp_ep_flush_error(ucp_request_t *req, ucs_status_t status)
 {
-    ucs_error("error during flush: %s", ucs_status_string(status));
+    if (ucp_ep_config(req->send.ep)->key.err_mode != UCP_ERR_HANDLING_MODE_PEER) {
+        ucs_error("error during flush: %s", ucs_status_string(status));
+    }
+
     req->status = status;
     --req->send.uct_comp.count;
 }
@@ -260,7 +334,12 @@ static void ucp_ep_flush_progress(ucp_request_t *req)
         }
 
         /* Start flush operation on UCT endpoint */
-        status = uct_ep_flush(uct_ep, 0, &req->send.uct_comp);
+        if (req->send.flush.uct_flags & UCT_FLUSH_FLAG_CANCEL) {
+            uct_ep_pending_purge(uct_ep, ucp_ep_err_pending_purge,
+                                 UCS_STATUS_PTR(UCS_ERR_CANCELED));
+        }
+        status = uct_ep_flush(uct_ep, req->send.flush.uct_flags,
+                              &req->send.uct_comp);
         ucs_trace("flushing ep %p lane[%d]: %s", ep, lane,
                   ucs_status_string(status));
         if (status == UCS_OK) {
@@ -276,11 +355,11 @@ static void ucp_ep_flush_progress(ucp_request_t *req)
                 break;
             }
 
-            req->send.lane = lane;
             status = uct_ep_pending_add(uct_ep, &req->send.uct);
             ucs_trace("adding pending flush on ep %p lane[%d]: %s", ep, lane,
                       ucs_status_string(status));
             if (status == UCS_OK) {
+                req->send.lane        = lane;
                 req->send.flush.lanes &= ~UCS_BIT(lane);
             } else if (status != UCS_ERR_BUSY) {
                 ucp_ep_flush_error(req, status);
@@ -296,16 +375,13 @@ static void ucp_ep_flush_progress(ucp_request_t *req)
 static void ucp_ep_flush_slow_path_remove(ucp_request_t *req)
 {
     ucp_ep_h ep = req->send.ep;
-    if (req->send.flush.cbq_elem_on) {
-        uct_worker_slowpath_progress_unregister(ep->worker->uct,
-                                                &req->send.flush.cbq_elem);
-        req->send.flush.cbq_elem_on = 0;
-    }
+    uct_worker_progress_unregister_safe(ep->worker->uct,
+                                        &req->send.flush.slow_cb_id);
 }
 
-static void ucp_ep_flushed_slow_path_callback(ucs_callbackq_slow_elem_t *self)
+static unsigned ucp_ep_flushed_slow_path_callback(void *arg)
 {
-    ucp_request_t *req = ucs_container_of(self, ucp_request_t, send.flush.cbq_elem);
+    ucp_request_t *req = arg;
     ucp_ep_h ep = req->send.ep;
 
     ucs_assert(!(req->flags & UCP_REQUEST_FLAG_COMPLETED));
@@ -317,9 +393,9 @@ static void ucp_ep_flushed_slow_path_callback(ucs_callbackq_slow_elem_t *self)
 
     /* Complete send request from here, to avoid releasing the request while
      * slow-path element is still pending */
-    ucs_trace_req("completing flush request %p (%p) with status %s", req, req + 1,
-                  ucs_status_string(req->status));
-    ucp_request_put(req, req->status);
+    ucp_request_complete_send(req, req->status);
+
+    return 0;
 }
 
 static int ucp_flush_check_completion(ucp_request_t *req)
@@ -333,20 +409,20 @@ static int ucp_flush_check_completion(ucp_request_t *req)
 
     ucs_trace("adding slow-path callback to destroy ep %p", ep);
     ucp_ep_flush_slow_path_remove(req);
-    req->send.flush.cbq_elem.cb = ucp_ep_flushed_slow_path_callback;
-    req->send.flush.cbq_elem_on = 1;
-    uct_worker_slowpath_progress_register(ep->worker->uct,
-                                          &req->send.flush.cbq_elem);
+    uct_worker_progress_register_safe(ep->worker->uct,
+                                      ucp_ep_flushed_slow_path_callback, req, 0,
+                                      &req->send.flush.slow_cb_id);
     return 1;
 }
 
-static void ucp_ep_flush_resume_slow_path_callback(ucs_callbackq_slow_elem_t *self)
+static unsigned ucp_ep_flush_resume_slow_path_callback(void *arg)
 {
-    ucp_request_t *req = ucs_container_of(self, ucp_request_t, send.flush.cbq_elem);
+    ucp_request_t *req = arg;
 
     ucp_ep_flush_slow_path_remove(req);
     ucp_ep_flush_progress(req);
     ucp_flush_check_completion(req);
+    return 0;
 }
 
 static ucs_status_t ucp_ep_flush_progress_pending(uct_pending_req_t *self)
@@ -359,7 +435,8 @@ static ucs_status_t ucp_ep_flush_progress_pending(uct_pending_req_t *self)
 
     ucs_assert(!(req->flags & UCP_REQUEST_FLAG_COMPLETED));
 
-    status = uct_ep_flush(ep->uct_eps[lane], 0, &req->send.uct_comp);
+    status = uct_ep_flush(ep->uct_eps[lane], req->send.flush.uct_flags,
+                          &req->send.uct_comp);
     ucs_trace("flushing ep %p lane[%d]: %s", ep, lane,
               ucs_status_string(status));
     if (status == UCS_OK) {
@@ -373,12 +450,11 @@ static ucs_status_t ucp_ep_flush_progress_pending(uct_pending_req_t *self)
     completed = ucp_flush_check_completion(req);
 
     /* If the operation has not completed, add slow-path progress to resume */
-    if (!completed && req->send.flush.lanes && !req->send.flush.cbq_elem_on) {
+    if (!completed && req->send.flush.lanes) {
         ucs_trace("ep %p: adding slow-path callback to resume flush", ep);
-        req->send.flush.cbq_elem.cb = ucp_ep_flush_resume_slow_path_callback;
-        req->send.flush.cbq_elem_on = 1;
-        uct_worker_slowpath_progress_register(ep->worker->uct,
-                                              &req->send.flush.cbq_elem);
+        uct_worker_progress_register_safe(ep->worker->uct,
+                                          ucp_ep_flush_resume_slow_path_callback,
+                                          req, 0, &req->send.flush.slow_cb_id);
     }
 
     if ((status == UCS_OK) || (status == UCS_INPROGRESS)) {
@@ -396,6 +472,8 @@ static void ucp_ep_flush_completion(uct_completion_t *self, ucs_status_t status)
 {
     ucp_request_t *req = ucs_container_of(self, ucp_request_t, send.uct_comp);
 
+    ucs_trace("flush completion req=%p status=%d", req, status);
+
     ucs_assert(!(req->flags & UCP_REQUEST_FLAG_COMPLETED));
 
     if (status == UCS_OK) {
@@ -406,6 +484,22 @@ static void ucp_ep_flush_completion(uct_completion_t *self, ucs_status_t status)
     ucp_flush_check_completion(req);
 }
 
+void ucp_ep_err_pending_purge(uct_pending_req_t *self, void *arg)
+{
+    ucp_request_t *req      = ucs_container_of(self, ucp_request_t, send.uct);
+    ucs_status_t  status    = UCS_PTR_STATUS(arg);
+
+    if (req->send.uct_comp.func) {
+        req->send.state.offset = req->send.length; /* fast-forward to data end */
+        if (status == UCS_ERR_CANCELED) {
+            req->send.uct_comp.count = 0;
+        }
+        req->send.uct_comp.func(&req->send.uct_comp, status);
+    } else {
+        ucp_request_complete_send(req, status);
+    }
+}
+
 static void ucp_destroyed_ep_pending_purge(uct_pending_req_t *self, void *arg)
 {
     ucs_bug("pending request %p on ep %p should have been flushed", self, arg);
@@ -413,10 +507,18 @@ static void ucp_destroyed_ep_pending_purge(uct_pending_req_t *self, void *arg)
 
 void ucp_ep_destroy_internal(ucp_ep_h ep, const char *message)
 {
-    ucp_lane_index_t lane;
+    ucp_lane_index_t lane, proxy_lane;
     uct_ep_h uct_ep;
 
     ucs_debug("destroy ep %p%s", ep, message);
+
+    for (lane = 0; lane < ucp_ep_num_lanes(ep); ++lane) {
+        uct_ep = ep->uct_eps[lane];
+        if (uct_ep != NULL) {
+            ucs_debug("ep %p: purge uct_ep[%d]=%p", ep, lane, uct_ep);
+            uct_ep_pending_purge(uct_ep, ucp_destroyed_ep_pending_purge, ep);
+        }
+    }
 
     for (lane = 0; lane < ucp_ep_num_lanes(ep); ++lane) {
         uct_ep = ep->uct_eps[lane];
@@ -424,8 +526,15 @@ void ucp_ep_destroy_internal(ucp_ep_h ep, const char *message)
             continue;
         }
 
-        uct_ep_pending_purge(uct_ep, ucp_destroyed_ep_pending_purge, ep);
-        ucs_debug("destroy ep %p lane[%d]=%p", ep, lane, uct_ep);
+        proxy_lane = ucp_ep_get_proxy_lane(ep, lane);
+        if ((proxy_lane != UCP_NULL_LANE) && (proxy_lane != lane) &&
+            (ep->uct_eps[lane] == ep->uct_eps[proxy_lane]))
+        {
+            /* duplicate of another lane */
+            continue;
+        }
+
+        ucs_debug("ep %p: destroy uct_ep[%d]=%p", ep, lane, uct_ep);
         uct_ep_destroy(uct_ep);
     }
 
@@ -433,9 +542,21 @@ void ucp_ep_destroy_internal(ucp_ep_h ep, const char *message)
     ucs_free(ep);
 }
 
-static void ucp_ep_disconnected(ucp_request_t *req)
+static void ucp_ep_disconnected(ucp_ep_h ep)
 {
-    ucp_ep_h ep = req->send.ep;
+    ucp_recv_desc_t  *rdesc;
+
+    while (!ucs_queue_is_empty(&ep->stream_data)) {
+        rdesc = ucs_queue_pull_elem_non_empty(&ep->stream_data, ucp_recv_desc_t,
+                                              stream_queue);
+
+        if (ucs_unlikely(rdesc->flags & UCP_RECV_DESC_FLAG_UCT_DESC)) {
+            /* TODO: remove ucp_eager_sync_hdr_t usage */
+            uct_iface_release_desc((char*)rdesc - sizeof(ucp_eager_sync_hdr_t));
+        } else {
+            ucs_mpool_put_inline(rdesc);
+        }
+    }
 
     if (ep->flags & UCP_EP_FLAG_REMOTE_CONNECTED) {
         /* Endpoints which have remote connection are destroyed only when the
@@ -450,12 +571,22 @@ static void ucp_ep_disconnected(ucp_request_t *req)
     ucp_ep_destroy_internal(ep, " from disconnect");
 }
 
-static ucs_status_ptr_t ucp_disconnect_nb_internal(ucp_ep_h ep)
+static void ucp_ep_flushed_callback(ucp_request_t *req)
+{
+    ucp_ep_disconnected(req->send.ep);
+}
+
+static ucs_status_ptr_t ucp_disconnect_nb_internal(ucp_ep_h ep, unsigned mode)
 {
     ucs_status_t status;
     ucp_request_t *req;
 
     ucs_debug("disconnect ep %p", ep);
+
+    if (ep->flags & UCP_EP_FLAG_FAILED) {
+        ucp_ep_disconnected(ep);
+        return NULL;
+    }
 
     req = ucs_mpool_get(&ep->worker->req_mp);
     if (req == NULL) {
@@ -476,10 +607,12 @@ static ucs_status_ptr_t ucp_disconnect_nb_internal(ucp_ep_h ep)
     req->flags                  = 0;
     req->status                 = UCS_OK;
     req->send.ep                = ep;
-    req->send.flush.flushed_cb  = ucp_ep_disconnected;
+    req->send.flush.flushed_cb  = ucp_ep_flushed_callback;
     req->send.flush.lanes       = UCS_MASK(ucp_ep_num_lanes(ep));
-    req->send.flush.cbq_elem.cb = ucp_ep_flushed_slow_path_callback;
-    req->send.flush.cbq_elem_on = 0;
+    req->send.flush.slow_cb_id  = UCS_CALLBACKQ_ID_NULL;
+    req->send.flush.uct_flags   = (mode == UCP_EP_CLOSE_MODE_FLUSH) ?
+                                  UCT_FLUSH_FLAG_LOCAL : UCT_FLUSH_FLAG_CANCEL;
+
     req->send.lane              = UCP_NULL_LANE;
     req->send.uct.func          = ucp_ep_flush_progress_pending;
     req->send.uct_comp.func     = ucp_ep_flush_completion;
@@ -489,10 +622,10 @@ static ucs_status_ptr_t ucp_disconnect_nb_internal(ucp_ep_h ep)
 
     if (req->send.uct_comp.count == 0) {
         status = req->status;
-        ucp_ep_disconnected(req);
         ucs_trace_req("ep %p: releasing flush request %p, returning status %s",
                       ep, req, ucs_status_string(status));
         ucs_mpool_put(req);
+        ucp_ep_disconnected(ep);
         return UCS_STATUS_PTR(status);
     }
 
@@ -501,20 +634,30 @@ static ucs_status_ptr_t ucp_disconnect_nb_internal(ucp_ep_h ep)
     return req + 1;
 }
 
-ucs_status_ptr_t ucp_disconnect_nb(ucp_ep_h ep)
+ucs_status_ptr_t ucp_ep_close_nb(ucp_ep_h ep, unsigned mode)
 {
     ucp_worker_h worker = ep->worker;
     void *request;
 
+    if ((mode == UCP_EP_CLOSE_MODE_FORCE) &&
+        (ucp_ep_config(ep)->key.err_mode != UCP_ERR_HANDLING_MODE_PEER)) {
+        return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
+    }
+
     UCP_THREAD_CS_ENTER_CONDITIONAL(&worker->mt_lock);
 
     UCS_ASYNC_BLOCK(&worker->async);
-    request = ucp_disconnect_nb_internal(ep);
+    request = ucp_disconnect_nb_internal(ep, mode);
     UCS_ASYNC_UNBLOCK(&worker->async);
 
     UCP_THREAD_CS_EXIT_CONDITIONAL(&worker->mt_lock);
 
     return request;
+}
+
+ucs_status_ptr_t ucp_disconnect_nb(ucp_ep_h ep)
+{
+    return ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FLUSH);
 }
 
 void ucp_ep_destroy(ucp_ep_h ep)
@@ -535,7 +678,7 @@ void ucp_ep_destroy(ucp_ep_h ep)
     } else {
         do {
             ucp_worker_progress(worker);
-            status = ucp_request_test(request, NULL);
+            status = ucp_request_check_status(request);
         } while (status == UCS_INPROGRESS);
         ucp_request_release(request);
     }
@@ -552,19 +695,24 @@ int ucp_ep_config_is_equal(const ucp_ep_config_key_t *key1,
 
 
     if ((key1->num_lanes        != key2->num_lanes) ||
-        (key1->rma_lane_map     != key2->rma_lane_map) ||
-        (key1->amo_lane_map     != key2->amo_lane_map) ||
+        memcmp(key1->rma_lanes, key2->rma_lanes, sizeof(key1->rma_lanes)) ||
         memcmp(key1->amo_lanes, key2->amo_lanes, sizeof(key1->amo_lanes)) ||
         (key1->reachable_md_map != key2->reachable_md_map) ||
         (key1->am_lane          != key2->am_lane) ||
         (key1->rndv_lane        != key2->rndv_lane) ||
-        (key1->wireup_msg_lane  != key2->wireup_msg_lane))
+        (key1->tag_lane         != key2->tag_lane) ||
+        (key1->wireup_lane      != key2->wireup_lane) ||
+        (key1->err_mode         != key2->err_mode) ||
+        (key1->status           != key2->status))
     {
         return 0;
     }
 
     for (lane = 0; lane < key1->num_lanes; ++lane) {
-        if (key1->lanes[lane] != key2->lanes[lane]) {
+        if ((key1->lanes[lane].rsc_index != key2->lanes[lane].rsc_index) ||
+            (key1->lanes[lane].proxy_lane != key2->lanes[lane].proxy_lane) ||
+            (key1->lanes[lane].dst_md_index != key2->lanes[lane].dst_md_index))
+        {
             return 0;
         }
     }
@@ -572,29 +720,217 @@ int ucp_ep_config_is_equal(const ucp_ep_config_key_t *key1,
     return 1;
 }
 
+static size_t ucp_ep_config_calc_rndv_thresh(ucp_context_h context,
+                                             uct_iface_attr_t *iface_attr,
+                                             uct_md_attr_t *md_attr,
+                                             size_t bcopy_bw, int recv_reg_cost)
+{
+    double numerator, denumerator, md_reg_growth, md_reg_overhead;
+    double diff_percent = 1.0 - context->config.ext.rndv_perf_diff / 100.0;
+
+    /* We calculate the Rendezvous threshold by finding the message size at which:
+     * AM/RMA rndv's latency is worse than the eager_zcopy
+     * latency by a small percentage (that is set by the user).
+     * Starting this message size (rndv_thresh), rndv may be used.
+     *
+     * The latency function for eager_zcopy is:
+     * [ reg_cost.overhead + size * md_attr->reg_cost.growth +
+     * max(size/bw , size/bcopy_bw) + overhead ]
+     *
+     * The latency function for Active message Rendezvous is:
+     * [ latency + overhead + reg_cost.overhead +
+     * size * md_attr->reg_cost.growth + overhead + latency +
+     * max(size/bw , size/bcopy_bw) + latency + overhead + latency ]
+     *
+     * The latency function for RMA (get_zcopy) Rendezvous is:
+     * [ reg_cost.overhead + size * md_attr->reg_cost.growth + latency + overhead +
+     *   reg_cost.overhead + size * md_attr->reg_cost.growth + overhead + latency +
+     *   size/bw + latency + overhead + latency ]
+     *
+     * Isolating the 'size' yields the rndv_thresh.
+     * The used latency functions for eager_zcopy and rndv are also specified in
+     * the UCX wiki */
+
+    if (md_attr->cap.flags & UCT_MD_FLAG_REG) {
+        md_reg_growth   = md_attr->reg_cost.growth;
+        md_reg_overhead = md_attr->reg_cost.overhead;
+    } else {
+        md_reg_growth   = 0;
+        md_reg_overhead = 0;
+    }
+
+    numerator = diff_percent * ((4 * ucp_tl_iface_latency(context, iface_attr)) +
+                (3 * iface_attr->overhead) +
+                (md_reg_overhead * (1 + recv_reg_cost))) -
+                 md_reg_overhead - iface_attr->overhead;
+
+    denumerator = md_reg_growth +
+                  ucs_max((1.0 / iface_attr->bandwidth), (1.0 / context->config.ext.bcopy_bw)) -
+                  (diff_percent * (ucs_max((1.0 / iface_attr->bandwidth), (1.0 / bcopy_bw)) +
+                   md_reg_growth * (1 + recv_reg_cost)));
+
+    if ((numerator > 0) && (denumerator > 0)) {
+        return (numerator / denumerator);
+    } else {
+        return context->config.ext.rndv_thresh_fallback;
+    }
+}
+
+static void ucp_ep_config_set_am_rndv_thresh(ucp_context_h context, uct_iface_attr_t *iface_attr,
+                                             uct_md_attr_t *md_attr, ucp_ep_config_t *config,
+                                             size_t adjust_min_val)
+{
+    size_t rndv_thresh;
+
+
+    ucs_assert(config->key.am_lane != UCP_NULL_LANE);
+    ucs_assert(config->key.lanes[config->key.am_lane].rsc_index != UCP_NULL_RESOURCE);
+
+    if (config->key.err_mode == UCP_ERR_HANDLING_MODE_PEER) {
+        /* Disable RNDV */
+        rndv_thresh = SIZE_MAX;
+    } else if (context->config.ext.rndv_thresh == UCS_CONFIG_MEMUNITS_AUTO) {
+        /* auto - Make UCX calculate the AM rndv threshold on its own.*/
+        rndv_thresh = ucp_ep_config_calc_rndv_thresh(context, iface_attr, md_attr,
+                                                     context->config.ext.bcopy_bw,
+                                                     0);
+        ucs_trace("Active Message rendezvous threshold is %zu", rndv_thresh);
+    } else {
+        rndv_thresh = context->config.ext.rndv_thresh;
+    }
+
+    ucs_assert(iface_attr->cap.am.min_zcopy <= iface_attr->cap.am.max_zcopy);
+    /* use rendezvous only starting from minimal zero-copy am size */
+    rndv_thresh = ucs_max(rndv_thresh, iface_attr->cap.am.min_zcopy);
+    config->tag.rndv.am_thresh = ucs_min(rndv_thresh, adjust_min_val);
+}
+
+static void ucp_ep_config_set_rndv_thresh(ucp_worker_t *worker,
+                                          ucp_ep_config_t *config,
+                                          ucp_lane_index_t lane,
+                                          uint64_t rndv_cap_flag,
+                                          size_t adjust_min_val)
+{
+    ucp_context_t *context = worker->context;
+    ucp_rsc_index_t rsc_index;
+    size_t rndv_thresh;
+    uct_iface_attr_t *iface_attr;
+    uct_md_attr_t *md_attr;
+
+    if (lane == UCP_NULL_LANE) {
+        ucs_debug("rendezvous (get_zcopy) protocol is not supported");
+        return;
+    }
+
+    rsc_index = config->key.lanes[lane].rsc_index;
+    if (rsc_index == UCP_NULL_RESOURCE) {
+        return;
+    }
+
+    iface_attr = &worker->ifaces[rsc_index].attr;
+    md_attr    = &context->tl_mds[context->tl_rscs[rsc_index].md_index].attr;
+    ucs_assert_always(iface_attr->cap.flags & rndv_cap_flag);
+
+    if (context->config.ext.rndv_thresh == UCS_CONFIG_MEMUNITS_AUTO) {
+        /* auto - Make UCX calculate the RMA (get_zcopy) rndv threshold on its own.*/
+        rndv_thresh = ucp_ep_config_calc_rndv_thresh(context, iface_attr,
+                                                     md_attr, SIZE_MAX, 1);
+    } else {
+        rndv_thresh = context->config.ext.rndv_thresh;
+    }
+
+    /* use rendezvous only starting from minimal zero-copy get size */
+    ucs_assert(iface_attr->cap.get.min_zcopy <= iface_attr->cap.get.max_zcopy);
+    rndv_thresh = ucs_max(rndv_thresh, iface_attr->cap.get.min_zcopy);
+
+    config->tag.rndv.max_get_zcopy = iface_attr->cap.get.max_zcopy;
+    config->tag.rndv.rma_thresh    = ucs_min(rndv_thresh, adjust_min_val);
+}
+
+static void ucp_ep_config_init_attrs(ucp_worker_t *worker, ucp_rsc_index_t rsc_index,
+                                     ucp_ep_msg_config_t *config, size_t max_short,
+                                     size_t max_bcopy, size_t max_zcopy,
+                                     size_t max_iov, uint64_t short_flag,
+                                     uint64_t bcopy_flag, uint64_t zcopy_flag,
+                                     unsigned hdr_len, size_t adjust_min_val)
+{
+    ucp_context_t *context       = worker->context;
+    uct_iface_attr_t *iface_attr = &worker->ifaces[rsc_index].attr;
+    uct_md_attr_t *md_attr       = &context->tl_mds[context->tl_rscs[rsc_index].md_index].attr;
+    size_t it;
+    size_t zcopy_thresh;
+
+    if (iface_attr->cap.flags & short_flag) {
+        config->max_short = max_short - hdr_len;
+    } else {
+        config->max_short = -1;
+    }
+
+    if (iface_attr->cap.flags & bcopy_flag) {
+        config->max_bcopy = max_bcopy;
+    }
+
+    if (!((iface_attr->cap.flags & zcopy_flag) && (md_attr->cap.flags & UCT_MD_FLAG_REG))) {
+        return;
+    }
+
+    config->max_zcopy = max_zcopy;
+    config->max_iov   = ucs_min(UCP_MAX_IOV, max_iov);
+
+    if (context->config.ext.zcopy_thresh == UCS_CONFIG_MEMUNITS_AUTO) {
+        config->zcopy_auto_thresh = 1;
+        for (it = 0; it < UCP_MAX_IOV; ++it) {
+            zcopy_thresh = ucp_ep_config_get_zcopy_auto_thresh(it + 1,
+                                                               &md_attr->reg_cost,
+                                                               context,
+                                                               iface_attr->bandwidth);
+            zcopy_thresh = ucs_min(zcopy_thresh, adjust_min_val);
+            config->sync_zcopy_thresh[it] = zcopy_thresh;
+            config->zcopy_thresh[it]      = zcopy_thresh;
+        }
+    } else {
+        config->zcopy_auto_thresh    = 0;
+        config->sync_zcopy_thresh[0] = config->zcopy_thresh[0] =
+                ucs_min(context->config.ext.zcopy_thresh, adjust_min_val);
+    }
+}
+
 void ucp_ep_config_init(ucp_worker_h worker, ucp_ep_config_t *config)
 {
     ucp_context_h context = worker->context;
     ucp_ep_rma_config_t *rma_config;
     uct_iface_attr_t *iface_attr;
-    ucp_rsc_index_t rsc_index;
     uct_md_attr_t *md_attr;
+    ucp_rsc_index_t rsc_index;
     ucp_lane_index_t lane;
-    double zcopy_thresh, numerator, denumerator;
-    size_t rndv_thresh;
+    size_t it;
+    size_t max_rndv_thresh;
+    size_t max_am_rndv_thresh;
 
     /* Default settings */
-    config->am.zcopy_thresh       = SIZE_MAX;
-    config->am.sync_zcopy_thresh  = -1;
-    config->bcopy_thresh          = context->config.ext.bcopy_thresh;
-    config->rndv.thresh           = SIZE_MAX;
-    config->rndv.sync_thresh      = SIZE_MAX;
-    config->rndv.max_get_zcopy    = SIZE_MAX;
-    config->p2p_lanes             = 0;
+    for (it = 0; it < UCP_MAX_IOV; ++it) {
+        config->am.zcopy_thresh[it]              = SIZE_MAX;
+        config->am.sync_zcopy_thresh[it]         = SIZE_MAX;
+        config->tag.eager.zcopy_thresh[it]       = SIZE_MAX;
+        config->tag.eager.sync_zcopy_thresh[it]  = SIZE_MAX;
+    }
+    config->tag.eager.zcopy_auto_thresh = 0;
+    config->am.zcopy_auto_thresh        = 0;
+    config->p2p_lanes                   = 0;
+    config->bcopy_thresh                = context->config.ext.bcopy_thresh;
+    config->tag.lane                    = UCP_NULL_LANE;
+    config->tag.proto                   = &ucp_tag_eager_proto;
+    config->tag.sync_proto              = &ucp_tag_eager_sync_proto;
+    config->tag.rndv.rma_thresh         = SIZE_MAX;
+    config->tag.rndv.max_get_zcopy      = SIZE_MAX;
+    config->tag.rndv.am_thresh          = SIZE_MAX;
+    config->stream.proto                = &ucp_stream_am_proto;
+    max_rndv_thresh                     = SIZE_MAX;
+    max_am_rndv_thresh                  = SIZE_MAX;
 
     /* Collect p2p lanes */
     for (lane = 0; lane < config->key.num_lanes; ++lane) {
-        rsc_index   = config->key.lanes[lane];
+        rsc_index   = config->key.lanes[lane].rsc_index;
         if ((rsc_index != UCP_NULL_RESOURCE) &&
             ucp_worker_is_tl_p2p(worker, rsc_index))
         {
@@ -602,68 +938,81 @@ void ucp_ep_config_init(ucp_worker_h worker, ucp_ep_config_t *config)
         }
     }
 
-    /* Configuration for active messages */
+    /* Configuration for tag offload */
+    if (config->key.tag_lane != UCP_NULL_LANE) {
+        lane      = config->key.tag_lane;
+        rsc_index = config->key.lanes[lane].rsc_index;
+        if (rsc_index != UCP_NULL_RESOURCE) {
+            iface_attr = &worker->ifaces[rsc_index].attr;
+            ucp_ep_config_init_attrs(worker, rsc_index, &config->tag.eager,
+                                     iface_attr->cap.tag.eager.max_short,
+                                     iface_attr->cap.tag.eager.max_bcopy,
+                                     iface_attr->cap.tag.eager.max_zcopy,
+                                     iface_attr->cap.tag.eager.max_iov,
+                                     UCT_IFACE_FLAG_TAG_EAGER_SHORT,
+                                     UCT_IFACE_FLAG_TAG_EAGER_BCOPY,
+                                     UCT_IFACE_FLAG_TAG_EAGER_ZCOPY, 0,
+                                     iface_attr->cap.tag.eager.max_bcopy);
+
+            config->tag.offload.max_rndv_iov   = iface_attr->cap.tag.rndv.max_iov;
+            config->tag.offload.max_rndv_zcopy = iface_attr->cap.tag.rndv.max_zcopy;
+            config->tag.sync_proto             = &ucp_tag_offload_sync_proto;
+            config->tag.proto                  = &ucp_tag_offload_proto;
+            config->tag.lane                   = lane;
+            max_rndv_thresh                    = iface_attr->cap.tag.eager.max_zcopy;
+            max_am_rndv_thresh                 = iface_attr->cap.tag.eager.max_bcopy;
+
+            ucp_ep_config_set_rndv_thresh(worker, config, lane,
+                                          UCT_IFACE_FLAG_TAG_RNDV_ZCOPY,
+                                          max_rndv_thresh);
+        }
+    }
+
     if (config->key.am_lane != UCP_NULL_LANE) {
         lane        = config->key.am_lane;
-        rsc_index   = config->key.lanes[lane];
+        rsc_index   = config->key.lanes[lane].rsc_index;
         if (rsc_index != UCP_NULL_RESOURCE) {
-            iface_attr  = &worker->iface_attrs[rsc_index];
-            md_attr     = &context->tl_mds[context->tl_rscs[rsc_index].md_index].attr;
+            iface_attr = &worker->ifaces[rsc_index].attr;
+            md_attr   = &context->tl_mds[context->tl_rscs[rsc_index].md_index].attr;
+            ucp_ep_config_init_attrs(worker, rsc_index, &config->am,
+                                     iface_attr->cap.am.max_short,
+                                     iface_attr->cap.am.max_bcopy,
+                                     iface_attr->cap.am.max_zcopy,
+                                     iface_attr->cap.am.max_iov,
+                                     UCT_IFACE_FLAG_AM_SHORT,
+                                     UCT_IFACE_FLAG_AM_BCOPY,
+                                     UCT_IFACE_FLAG_AM_ZCOPY,
+                                     sizeof(ucp_eager_hdr_t), SIZE_MAX);
 
-            if (iface_attr->cap.flags & UCT_IFACE_FLAG_AM_SHORT) {
-                config->am.max_eager_short = iface_attr->cap.am.max_short -
-                                             sizeof(ucp_eager_hdr_t);
-                config->am.max_short       = iface_attr->cap.am.max_short -
-                                             sizeof(uint64_t);
-            } else {
-                config->am.max_eager_short = -1;
-                config->am.max_short       = -1;
-            }
+            /* Calculate rndv threshold for AM Rendezvous, which may be used by
+             * any tag-matching protocol (AM and offload). */
+            ucp_ep_config_set_am_rndv_thresh(context, iface_attr, md_attr, config,
+                                             max_am_rndv_thresh);
 
-            if (iface_attr->cap.flags & UCT_IFACE_FLAG_AM_BCOPY) {
-                config->am.max_bcopy = iface_attr->cap.am.max_bcopy;
-            }
-
-            if ((iface_attr->cap.flags & UCT_IFACE_FLAG_AM_ZCOPY) &&
-                (md_attr->cap.flags & UCT_MD_FLAG_REG))
-            {
-                config->am.max_zcopy = iface_attr->cap.am.max_zcopy;
-
-                if (context->config.ext.zcopy_thresh == UCS_CONFIG_MEMUNITS_AUTO) {
-                    /* auto */
-                    zcopy_thresh = md_attr->reg_cost.overhead / (
-                                            (1.0 / context->config.ext.bcopy_bw) -
-                                            (1.0 / iface_attr->bandwidth) -
-                                            md_attr->reg_cost.growth);
-                    if (zcopy_thresh < 0) {
-                        config->am.zcopy_thresh      = SIZE_MAX;
-                        config->am.sync_zcopy_thresh = -1;
-                    } else {
-                        config->am.zcopy_thresh      = zcopy_thresh;
-                        config->am.sync_zcopy_thresh = zcopy_thresh;
-                    }
-                } else {
-                    config->am.zcopy_thresh      = context->config.ext.zcopy_thresh;
-                    config->am.sync_zcopy_thresh = context->config.ext.zcopy_thresh;
-                }
-
-                config->am.zcopy_thresh = ucs_max(config->am.zcopy_thresh,
-                                                  iface_attr->cap.am.min_zcopy);
+            if (!ucp_ep_is_tag_offload_enabled(config)) {
+                /* Tag offload is disabled, AM will be used for all
+                 * tag-matching protocols */
+                ucp_ep_config_set_rndv_thresh(worker, config, config->key.rndv_lane,
+                                              UCT_IFACE_FLAG_GET_ZCOPY,
+                                              max_rndv_thresh);
+                config->tag.eager      = config->am;
+                config->tag.lane       = lane;
             }
         } else {
-            config->am.max_bcopy = UCP_MIN_BCOPY; /* Stub endpoint */
+            /* Stub endpoint */
+            config->am.max_bcopy = UCP_MIN_BCOPY;
         }
     }
 
     /* Configuration for remote memory access */
     for (lane = 0; lane < config->key.num_lanes; ++lane) {
-        if (ucp_lane_map_get_lane(config->key.rma_lane_map, lane) == 0) {
+        if (ucp_ep_config_get_rma_prio(config->key.rma_lanes, lane) == -1) {
             continue;
         }
 
         rma_config = &config->rma[lane];
-        rsc_index  = config->key.lanes[lane];
-        iface_attr = &worker->iface_attrs[rsc_index];
+        rsc_index  = config->key.lanes[lane].rsc_index;
+        iface_attr = &worker->ifaces[rsc_index].attr;
 
         rma_config->put_zcopy_thresh = SIZE_MAX;
         rma_config->get_zcopy_thresh = SIZE_MAX;
@@ -704,219 +1053,203 @@ void ucp_ep_config_init(ucp_worker_h worker, ucp_ep_config_t *config)
             rma_config->max_put_bcopy = UCP_MIN_BCOPY; /* Stub endpoint */
         }
     }
-
-    /* Configuration for Rendezvous data */
-    if (config->key.rndv_lane != UCP_NULL_LANE) {
-        lane        = config->key.rndv_lane;
-        rsc_index   = config->key.lanes[lane];
-        if (rsc_index != UCP_NULL_RESOURCE) {
-            iface_attr = &worker->iface_attrs[rsc_index];
-            md_attr    = &context->tl_mds[context->tl_rscs[rsc_index].md_index].attr;
-            ucs_assert_always(iface_attr->cap.flags & UCT_IFACE_FLAG_GET_ZCOPY);
-
-            if (context->config.ext.rndv_thresh == UCS_CONFIG_MEMUNITS_AUTO) {
-                /* auto */
-                /* Make UCX calculate the rndv threshold on its own.
-                 * We do it by finding the message size at which rndv and eager_zcopy get
-                 * the same latency. Starting this message size (rndv_thresh), rndv's latency
-                 * would be lower and the reached bandwidth would be higher.
-                 * The latency function for eager_zcopy is:
-                 * [ reg_cost.overhead + size * md_attr->reg_cost.growth +
-                 * max(size/bw , size/bcopy_bw) + overhead ]
-                 * The latency function for Rendezvous is:
-                 * [ reg_cost.overhead + size * md_attr->reg_cost.growth + latency + overhead +
-                 *   reg_cost.overhead + size * md_attr->reg_cost.growth + overhead + latency +
-                 *   size/bw + latency + overhead + latency ]
-                 * Isolating the 'size' yields the rndv_thresh.
-                 * The used latency functions for eager_zcopy and rndv are also specified in
-                 * the UCX wiki */
-                numerator = ((2 * iface_attr->overhead) + (4 * iface_attr->latency) +
-                             md_attr->reg_cost.overhead);
-                denumerator = (ucs_max((1.0 / iface_attr->bandwidth),(1.0 / context->config.ext.bcopy_bw)) -
-                               md_attr->reg_cost.growth - (1.0 / iface_attr->bandwidth));
-
-                if (denumerator > 0) {
-                    rndv_thresh = numerator / denumerator;
-                    ucs_trace("rendezvous threshold is %zu ( = %f / %f)",
-                              rndv_thresh, numerator, denumerator);
-                } else {
-                    rndv_thresh = context->config.ext.rndv_thresh_fallback;
-                    ucs_trace("rendezvous threshold is %zu", rndv_thresh);
-                }
-            } else {
-                /* In order to disable rendezvous, need to set the threshold to
-                 * infinite (-1).
-                 */
-                rndv_thresh = context->config.ext.rndv_thresh;
-            }
-
-            /* use rendezvous only starting from minimal zero-copy get size */
-            ucs_assert(iface_attr->cap.get.min_zcopy <= iface_attr->cap.get.max_zcopy);
-            rndv_thresh                = ucs_max(rndv_thresh,
-                                                 iface_attr->cap.get.min_zcopy);
-
-            config->rndv.max_get_zcopy = iface_attr->cap.get.max_zcopy;
-            config->rndv.thresh        = rndv_thresh;
-            config->rndv.sync_thresh   = rndv_thresh;
-
-            ucs_trace("rendezvous threshold is %zu", config->rndv.thresh);
-        } else {
-            ucs_debug("rendezvous protocol is not supported ");
-        }
-    }
-}
-
-static ucp_lane_index_t ucp_ep_get_amo_lane_index(const ucp_ep_config_key_t *key,
-                                                  ucp_lane_index_t lane)
-{
-    ucp_lane_index_t i;
-
-    for (i = 0; i < UCP_MAX_LANES; ++i) {
-        if (key->amo_lanes[i] == lane) {
-            return i;
-        } else if (key->amo_lanes[i] == UCP_NULL_LANE) {
-            break;
-        }
-    }
-    return UCP_NULL_LANE;
-}
-
-ucp_md_map_t ucp_ep_config_get_rma_md_map(const ucp_ep_config_key_t *key,
-                                          ucp_lane_index_t lane)
-{
-    return ucp_lane_map_get_lane(key->rma_lane_map, lane);
-}
-
-ucp_md_map_t ucp_ep_config_get_amo_md_map(const ucp_ep_config_key_t *key,
-                                          ucp_lane_index_t lane)
-{
-    ucp_lane_index_t amo_lane= ucp_ep_get_amo_lane_index(key, lane);
-    if (amo_lane != UCP_NULL_LANE) {
-        return ucp_lane_map_get_lane(key->amo_lane_map, amo_lane);
-    } else {
-        return 0;
-    }
-}
-
-static void ucp_ep_config_print_md_map(FILE *stream, const char *name,
-                                       ucp_md_map_t md_map)
-{
-    ucp_rsc_index_t md_index;
-    int first;
-
-    first = 1;
-    fprintf(stream, "%s", name);
-    for (md_index = 0; md_index < UCP_MD_INDEX_BITS; ++md_index) {
-        if (md_map & UCS_BIT(md_index)) {
-            fprintf(stream, "%c%d", first ? '{' : ',', md_index);
-            first = 0;
-        }
-    }
-    fprintf(stream, "}");
 }
 
 static void ucp_ep_config_print_tag_proto(FILE *stream, const char *name,
                                           size_t max_eager_short,
-                                          size_t zcopy_thresh, size_t rndv_thresh)
+                                          size_t zcopy_thresh,
+                                          size_t rndv_rma_thresh,
+                                          size_t rndv_am_thresh)
 {
-    size_t max_bcopy;
+    size_t max_bcopy, min_rndv;
 
-    fprintf(stream, "# %18s: 0", name);
+    fprintf(stream, "# %23s: 0", name);
     if (max_eager_short > 0) {
         fprintf(stream, "..<egr/short>..%zu" , max_eager_short + 1);
     }
-    max_bcopy = ucs_min(zcopy_thresh, rndv_thresh);
+
+    min_rndv  = ucs_min(rndv_rma_thresh, rndv_am_thresh);
+    max_bcopy = ucs_min(zcopy_thresh, min_rndv);
     if (max_eager_short < max_bcopy) {
-        fprintf(stream, "..<egr/bcopy>..%zu", max_bcopy);
-    }
-    if (zcopy_thresh < rndv_thresh) {
-        fprintf(stream, "..<egr/zcopy>..");
-        if (rndv_thresh < SIZE_MAX) {
-            fprintf(stream, "%zu", rndv_thresh);
+        fprintf(stream, "..<egr/bcopy>..");
+        if (max_bcopy < SIZE_MAX) {
+            fprintf(stream, "%zu", max_bcopy);
         }
     }
-    if (rndv_thresh < SIZE_MAX) {
+    if (zcopy_thresh < min_rndv) {
+        fprintf(stream, "..<egr/zcopy>..");
+        if (min_rndv < SIZE_MAX) {
+            fprintf(stream, "%zu", min_rndv);
+        }
+    }
+
+    if (min_rndv < SIZE_MAX) {
         fprintf(stream, "..<rndv>..");
     }
     fprintf(stream, "(inf)\n");
 }
 
-static void ucp_ep_config_print_rma_proto(FILE *stream,
-                                          const ucp_ep_rma_config_t* rma_config,
-                                          size_t bcopy_thresh)
+static void ucp_ep_config_print_rma_proto(FILE *stream, const char *name,
+                                          ucp_lane_index_t lane,
+                                          size_t bcopy_thresh, size_t zcopy_thresh)
 {
-    size_t max_short;
 
-    max_short = ucs_max(rma_config->max_put_short + 1, bcopy_thresh);
-
-    fprintf(stream, "#                put: 0");
-    if (max_short > 0) {
-        fprintf(stream, "..<short>..%zu" , max_short);
+    fprintf(stream, "# %20s[%d]: 0", name, lane);
+    if (bcopy_thresh > 0) {
+        fprintf(stream, "..<short>");
     }
-    fprintf(stream, "..<bcopy>..(inf)\n");
-    fprintf(stream, "#                get: 0..<bcopy>..(inf)\n");
+    if (bcopy_thresh < zcopy_thresh) {
+        if (bcopy_thresh > 0) {
+            fprintf(stream, "..%zu", bcopy_thresh);
+        }
+        fprintf(stream, "..<bcopy>");
+    }
+    if (zcopy_thresh < SIZE_MAX) {
+        fprintf(stream, "..%zu..<zcopy>", zcopy_thresh);
+    }
+    fprintf(stream, "..(inf)\n");
+}
+
+int ucp_ep_config_get_rma_prio(const ucp_lane_index_t *lanes,
+                               ucp_lane_index_t lane)
+{
+    int prio;
+    for (prio = 0; prio < UCP_MAX_LANES; ++prio) {
+        if (lane == lanes[prio]) {
+            return prio;
+        }
+    }
+    return -1;
+}
+
+void ucp_ep_config_lane_info_str(ucp_context_h context,
+                                 const ucp_ep_config_key_t *key,
+                                 const uint8_t *addr_indices,
+                                 ucp_lane_index_t lane,
+                                 ucp_rsc_index_t aux_rsc_index,
+                                 char *buf, size_t max)
+{
+    uct_tl_resource_desc_t *rsc;
+    ucp_rsc_index_t rsc_index;
+    ucp_lane_index_t proxy_lane;
+    char *p, *endp;
+    char *desc_str;
+    int prio;
+
+    p          = buf;
+    endp       = buf + max;
+    rsc_index  = key->lanes[lane].rsc_index;
+    proxy_lane = key->lanes[lane].proxy_lane;
+    rsc        = &context->tl_rscs[rsc_index].tl_rsc;
+
+    if ((proxy_lane == lane) || (proxy_lane == UCP_NULL_LANE)) {
+        if (key->lanes[lane].proxy_lane == lane) {
+            desc_str = " <proxy>";
+        } else {
+            desc_str = "";
+        }
+        snprintf(p, endp - p, "lane[%d]: %d:" UCT_TL_RESOURCE_DESC_FMT " md[%d]%s %-*c-> ",
+                 lane, rsc_index, UCT_TL_RESOURCE_DESC_ARG(rsc),
+                 context->tl_rscs[rsc_index].md_index, desc_str,
+                 20 - (int)(strlen(rsc->dev_name) + strlen(rsc->tl_name) + strlen(desc_str)),
+                 ' ');
+        p += strlen(p);
+
+        if (addr_indices != NULL) {
+            snprintf(p, endp - p, "addr[%d].", addr_indices[lane]);
+            p += strlen(p);
+        }
+
+    } else {
+        snprintf(p, endp - p, "lane[%d]: proxy to lane[%d] %12c -> ", lane,
+                 proxy_lane, ' ');
+        p += strlen(p);
+    }
+
+    snprintf(p, endp - p, "md[%d]", key->lanes[lane].dst_md_index);
+    p += strlen(p);
+
+    prio = ucp_ep_config_get_rma_prio(key->rma_lanes, lane);
+    if (prio != -1) {
+        snprintf(p, endp - p, " rma#%d", prio);
+        p += strlen(p);
+    }
+
+    prio = ucp_ep_config_get_rma_prio(key->amo_lanes, lane);
+    if (prio != -1) {
+        snprintf(p, endp - p, " amo#%d", prio);
+        p += strlen(p);
+    }
+
+    if (key->am_lane == lane) {
+        snprintf(p, endp - p, " am");
+        p += strlen(p);
+    }
+
+    if (lane == key->rndv_lane) {
+        snprintf(p, endp - p, " zcopy_rndv");
+        p += strlen(p);
+    }
+
+    if (lane == key->tag_lane) {
+        snprintf(p, endp - p, " tag_offload");
+        p += strlen(p);
+    }
+
+    if (key->wireup_lane == lane) {
+        snprintf(p, endp - p, " wireup");
+        p += strlen(p);
+        if (aux_rsc_index != UCP_NULL_RESOURCE) {
+            snprintf(p, endp - p, "{" UCT_TL_RESOURCE_DESC_FMT "}",
+                     UCT_TL_RESOURCE_DESC_ARG(&context->tl_rscs[aux_rsc_index].tl_rsc));
+            p += strlen(p);
+        }
+    }
 }
 
 static void ucp_ep_config_print(FILE *stream, ucp_worker_h worker,
                                 const ucp_ep_config_t *config,
-                                const uint8_t *addr_indices)
+                                const uint8_t *addr_indices,
+                                ucp_rsc_index_t aux_rsc_index)
 {
-    ucp_context_h context   = worker->context;
-    ucp_tl_resource_desc_t *rsc;
-    ucp_rsc_index_t rsc_index;
+    ucp_context_h context = worker->context;
+    char lane_info[128]   = {0};
+    const ucp_ep_msg_config_t *tag_config;
     ucp_lane_index_t lane;
-    ucp_md_map_t md_map;
 
     for (lane = 0; lane < config->key.num_lanes; ++lane) {
-        rsc_index   = config->key.lanes[lane];
-        rsc         = &context->tl_rscs[rsc_index];
-        fprintf(stream, "#            lane[%d]: %d:" UCT_TL_RESOURCE_DESC_FMT,
-                lane, rsc_index, UCT_TL_RESOURCE_DESC_ARG(&rsc->tl_rsc));
-
-        if (addr_indices != NULL) {
-            fprintf(stream, "->addr[%d] ", addr_indices[lane]);
-        }
-        fprintf(stream, " -");
-        if (lane == config->key.am_lane) {
-            fprintf(stream, " am");
-        }
-        md_map = ucp_ep_config_get_rma_md_map(&config->key, lane);
-        if (md_map) {
-            ucp_ep_config_print_md_map(stream, " rma", md_map);
-        }
-        md_map = ucp_ep_config_get_amo_md_map(&config->key, lane);
-        if (md_map) {
-            ucp_ep_config_print_md_map(stream, " amo", md_map);
-        }
-        if (lane == config->key.rndv_lane) {
-            fprintf(stream, " rndv");
-        }
-        if (lane == config->key.wireup_msg_lane) {
-            fprintf(stream, " wireup");
-        }
-        fprintf(stream, "\n");
+        ucp_ep_config_lane_info_str(context, &config->key, addr_indices, lane,
+                                    aux_rsc_index, lane_info, sizeof(lane_info));
+        fprintf(stream, "#                 %s\n", lane_info);
     }
-
     fprintf(stream, "#\n");
 
     if (context->config.features & UCP_FEATURE_TAG) {
+         tag_config = (ucp_ep_is_tag_offload_enabled((ucp_ep_config_t *)config)) ?
+                       &config->tag.eager : &config->am;
          ucp_ep_config_print_tag_proto(stream, "tag_send",
-                                       config->am.max_eager_short,
-                                       config->am.zcopy_thresh,
-                                       config->rndv.thresh);
+                                       tag_config->max_short,
+                                       tag_config->zcopy_thresh[0],
+                                       config->tag.rndv.rma_thresh,
+                                       config->tag.rndv.am_thresh);
          ucp_ep_config_print_tag_proto(stream, "tag_send_sync",
-                                       config->am.max_eager_short,
-                                       config->am.sync_zcopy_thresh,
-                                       config->rndv.sync_thresh);
+                                       tag_config->max_short,
+                                       tag_config->sync_zcopy_thresh[0],
+                                       config->tag.rndv.rma_thresh,
+                                       config->tag.rndv.am_thresh);
      }
 
      if (context->config.features & UCP_FEATURE_RMA) {
          for (lane = 0; lane < config->key.num_lanes; ++lane) {
-             if (!ucp_ep_config_get_rma_md_map(&config->key, lane)) {
+             if (ucp_ep_config_get_rma_prio(config->key.rma_lanes, lane) == -1) {
                  continue;
              }
-             ucp_ep_config_print_rma_proto(stream, &config->rma[lane],
-                                           config->bcopy_thresh);
+             ucp_ep_config_print_rma_proto(stream, "put", lane,
+                                           ucs_max(config->rma[lane].max_put_short + 1,
+                                                   config->bcopy_thresh),
+                                           config->rma[lane].put_zcopy_thresh);
+             ucp_ep_config_print_rma_proto(stream, "get", lane, 0,
+                                           config->rma[lane].get_zcopy_thresh);
          }
      }
 
@@ -924,6 +1257,9 @@ static void ucp_ep_config_print(FILE *stream, ucp_worker_h worker,
 
 void ucp_ep_print_info(ucp_ep_h ep, FILE *stream)
 {
+    ucp_rsc_index_t aux_rsc_index;
+    uct_ep_h wireup_ep;
+
     UCP_THREAD_CS_ENTER_CONDITIONAL(&ep->worker->mt_lock);
 
     fprintf(stream, "#\n");
@@ -938,9 +1274,35 @@ void ucp_ep_print_info(ucp_ep_h ep, FILE *stream)
 #endif
             ep->dest_uuid);
 
-    ucp_ep_config_print(stream, ep->worker, ucp_ep_config(ep), NULL);
+    wireup_ep = ep->uct_eps[ucp_ep_get_wireup_msg_lane(ep)];
+    if (ucp_wireup_ep_test(wireup_ep)) {
+        aux_rsc_index = ucp_wireup_ep_get_aux_rsc_index(wireup_ep);
+    } else {
+        aux_rsc_index = UCP_NULL_RESOURCE;
+    }
+
+    ucp_ep_config_print(stream, ep->worker, ucp_ep_config(ep), NULL,
+                        aux_rsc_index);
 
     fprintf(stream, "#\n");
 
     UCP_THREAD_CS_EXIT_CONDITIONAL(&ep->worker->mt_lock);
+}
+
+size_t ucp_ep_config_get_zcopy_auto_thresh(size_t iovcnt,
+                                           const uct_linear_growth_t *reg_cost,
+                                           const ucp_context_h context,
+                                           double bandwidth)
+{
+    double zcopy_thresh;
+    double bcopy_bw = context->config.ext.bcopy_bw;
+
+    zcopy_thresh = (iovcnt * reg_cost->overhead) /
+                   ((1.0 / bcopy_bw) - (1.0 / bandwidth) - (iovcnt * reg_cost->growth));
+
+    if ((zcopy_thresh < 0.0) || (zcopy_thresh > SIZE_MAX)) {
+        return SIZE_MAX;
+    }
+
+    return zcopy_thresh;
 }

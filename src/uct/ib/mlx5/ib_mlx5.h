@@ -9,6 +9,7 @@
 #define UCT_IB_MLX5_H_
 
 
+#include <uct/base/uct_worker.h>
 #include <uct/ib/base/ib_log.h>
 #include <uct/ib/base/ib_device.h>
 #include <ucs/arch/cpu.h>
@@ -16,8 +17,8 @@
 #include <ucs/type/status.h>
 
 #include <infiniband/mlx5_hw.h>
-#include <infiniband/arch.h>
 #include <netinet/in.h>
+#include <endian.h>
 #include <string.h>
 
 
@@ -44,7 +45,9 @@
 #else
 
 #  define mlx5_av_base(_av)         (_av)
-#  define mlx5_av_grh(_av)          (_av)
+/* do not use direct cast from address of reserved0 to avoid compilation warnings */
+#  define mlx5_av_grh(_av)          ((struct mlx5_grh_av *)(((char*)(_av)) + \
+                                     ucs_offsetof(struct mlx5_wqe_av, reserved0[0])))
 #  define UCT_IB_MLX5_AV_BASE_SIZE  sizeof(struct mlx5_wqe_av)
 #  define UCT_IB_MLX5_AV_FULL_SIZE  sizeof(struct mlx5_wqe_av)
 
@@ -95,6 +98,9 @@ typedef struct uct_ib_mlx5_cq {
     unsigned           cq_ci;
     unsigned           cq_length;
     unsigned           cqe_size_log;
+#if ENABLE_DEBUG_DATA
+    unsigned           cq_num;
+#endif
 } uct_ib_mlx5_cq_t;
 
 
@@ -105,6 +111,7 @@ typedef struct uct_ib_mlx5_bf {
         void                    *ptr;
         uintptr_t               addr;
     } reg;
+    unsigned                    enable_bf;       /* BF/DB method selector. DB used if zero */
 } uct_ib_mlx5_bf_t;
 
 
@@ -164,7 +171,7 @@ typedef struct uct_rc_mlx5_srq_seg {
             uint16_t                   next_wqe_index; /* Network byte order */
             uint8_t                    signature;
             uint8_t                    rsvd1[2];
-            uint8_t                    ooo;
+            uint8_t                    free;           /* Released but not posted */
             uct_ib_iface_recv_desc_t   *desc;          /* Host byte order */
         } srq;
     };
@@ -214,6 +221,11 @@ unsigned uct_ib_mlx5_get_cq_ci(struct ibv_cq *cq);
 void uct_ib_mlx5_get_av(struct ibv_ah *ah, struct mlx5_wqe_av *av);
 
 /**
+ * Get flag indicating compact AV support.
+ */
+ucs_status_t uct_ib_mlx5_get_compact_av(uct_ib_iface_t *iface, int *compact_av);
+
+/**
  * Check for completion with error.
  */
 struct mlx5_cqe64* uct_ib_mlx5_check_completion(uct_ib_iface_t *iface,
@@ -223,9 +235,14 @@ struct mlx5_cqe64* uct_ib_mlx5_check_completion(uct_ib_iface_t *iface,
 /**
  * Initialize txwq structure.
  */
-ucs_status_t uct_ib_mlx5_txwq_init(uct_worker_h worker, uct_ib_mlx5_txwq_t *txwq,
+ucs_status_t uct_ib_mlx5_txwq_init(uct_priv_worker_t *worker, uct_ib_mlx5_txwq_t *txwq,
                                    struct ibv_qp *verbs_qp);
-void uct_ib_mlx5_txwq_cleanup(uct_worker_h worker, uct_ib_mlx5_txwq_t* txwq);
+void uct_ib_mlx5_txwq_cleanup(uct_ib_mlx5_txwq_t* txwq);
+
+/**
+ * Reset txwq contents and posting indices.
+ */
+void uct_ib_mlx5_txwq_reset(uct_ib_mlx5_txwq_t *txwq);
 
 /**
  * Initialize rxwq structure.

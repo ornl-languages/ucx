@@ -1,6 +1,6 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2015.  ALL RIGHTS RESERVED.
-* Copyright (C) ARM Ltd. 2016.  ALL RIGHTS RESERVED.
+* Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -8,6 +8,7 @@
 #ifndef UCS_AARCH64_CPU_H_
 #define UCS_AARCH64_CPU_H_
 
+#include "config.h"
 #include <time.h>
 #include <sys/times.h>
 #include <ucs/arch/generic/cpu.h>
@@ -25,10 +26,9 @@
 #define ucs_memory_bus_store_fence()  asm volatile ("dsb st" ::: "memory");
 #define ucs_memory_bus_load_fence()   asm volatile ("dsb ld" ::: "memory");
 
-#define ucs_memory_cpu_fence()        asm volatile ("dmb sy" ::: "memory");
-#define ucs_memory_cpu_store_fence()  asm volatile ("dmb st" ::: "memory");
-#define ucs_memory_cpu_load_fence()   asm volatile ("dmb ld" ::: "memory");
-
+#define ucs_memory_cpu_fence()        asm volatile ("dmb ish" ::: "memory");
+#define ucs_memory_cpu_store_fence()  asm volatile ("dmb ishst" ::: "memory");
+#define ucs_memory_cpu_load_fence()   asm volatile ("dmb ishld" ::: "memory");
 
 #if HAVE_HW_TIMER
 static inline uint64_t ucs_arch_read_hres_clock(void)
@@ -41,7 +41,7 @@ static inline uint64_t ucs_arch_read_hres_clock(void)
 
 static inline double ucs_arch_get_clocks_per_sec()
 {
-    uint32_t freq;
+    uint64_t freq;
     asm volatile("mrs %0, cntfrq_el0" : "=r" (freq));
     return (double) freq;
 }
@@ -64,3 +64,12 @@ static inline int ucs_arch_get_cpu_flag()
 }
 
 #endif
+
+static inline void ucs_arch_wait_mem(void *address)
+{
+    unsigned long tmp;
+    __asm__ __volatile__ ("ldxr %0, [%1] \n"
+                          "wfe           \n"
+                          : "=&r"(tmp)
+                          : "r"(address));
+}

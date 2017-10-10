@@ -1,7 +1,8 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-*
 * Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
+* Copyright (C) ARM Ltd. 2016-2017. ALL RIGHTS RESERVED.
+*
 * See file LICENSE for terms.
 */
 
@@ -12,7 +13,9 @@
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack.h>
 #include <ucs/type/class.h>
+#include <ucs/sys/string.h>
 #include <malloc.h>
+
 
 UCS_LIST_HEAD(uct_md_components_list);
 
@@ -68,7 +71,9 @@ ucs_status_t uct_query_md_resources(uct_md_resource_desc_t **resources_p,
         for (i = 0; i < num_md_resources; ++i) {
             ucs_assertv_always(!strncmp(mdc->name, md_resources[i].md_name,
                                        strlen(mdc->name)),
-                               "MD name must begin with MD component name");
+                               "MD name must begin with MD component name."
+                               "MD name: %s MD component name: %s ",
+                               md_resources[i].md_name, mdc->name);
         }
         resources = tmp;
         memcpy(resources + num_resources, md_resources,
@@ -209,57 +214,6 @@ ucs_status_t uct_md_stub_rkey_unpack(uct_md_component_t *mdc,
     return UCS_OK;
 }
 
-static UCS_CLASS_INIT_FUNC(uct_worker_t, ucs_async_context_t *async,
-                           ucs_thread_mode_t thread_mode)
-{
-    self->async       = async;
-    self->thread_mode = thread_mode;
-    ucs_callbackq_init(&self->progress_q, 64, async);
-    ucs_list_head_init(&self->tl_data);
-    return UCS_OK;
-}
-
-static UCS_CLASS_CLEANUP_FUNC(uct_worker_t)
-{
-    ucs_callbackq_cleanup(&self->progress_q);
-}
-
-void uct_worker_progress(uct_worker_h worker)
-{
-    ucs_callbackq_dispatch(&worker->progress_q);
-}
-
-void uct_worker_progress_register(uct_worker_h worker,
-                                  ucs_callback_t func, void *arg)
-{
-    ucs_callbackq_add(&worker->progress_q, func, arg);
-}
-
-void uct_worker_progress_unregister(uct_worker_h worker,
-                                    ucs_callback_t func, void *arg)
-{
-    ucs_callbackq_remove(&worker->progress_q, func, arg);
-}
-
-void uct_worker_slowpath_progress_register(uct_worker_h worker,
-                                           ucs_callbackq_slow_elem_t *elem)
-{
-    ucs_callbackq_add_slow_path(&worker->progress_q, elem);
-}
-
-void uct_worker_slowpath_progress_unregister(uct_worker_h worker,
-                                             ucs_callbackq_slow_elem_t *elem)
-{
-    ucs_callbackq_remove_slow_path(&worker->progress_q, elem);
-}
-
-
-UCS_CLASS_DEFINE(uct_worker_t, void);
-UCS_CLASS_DEFINE_NAMED_NEW_FUNC(uct_worker_create, uct_worker_t, uct_worker_t,
-                                ucs_async_context_t*, ucs_thread_mode_t)
-UCS_CLASS_DEFINE_NAMED_DELETE_FUNC(uct_worker_destroy, uct_worker_t, uct_worker_t)
-
-
 static ucs_status_t uct_config_read(uct_config_bundle_t **bundle,
                                     ucs_config_field_t *config_table,
                                     size_t config_size, const char *env_prefix,
@@ -282,7 +236,7 @@ static ucs_status_t uct_config_read(uct_config_bundle_t **bundle,
     }
 
     config_bundle->table = config_table;
-    config_bundle->table_prefix = strdup(cfg_prefix);
+    config_bundle->table_prefix = ucs_strdup(cfg_prefix, "uct_config");
     if (config_bundle->table_prefix == NULL) {
         status = UCS_ERR_NO_MEMORY;
         goto err_free_bundle;
@@ -298,43 +252,42 @@ err:
 }
 
 static uct_tl_component_t *uct_find_tl_on_md(uct_md_component_t *mdc,
+                                             uint64_t md_flags,
                                              const char *tl_name)
 {
     uct_md_registered_tl_t *tlr;
 
     ucs_list_for_each(tlr, &mdc->tl_list, list) {
-        if (!strcmp(tl_name, tlr->tl->name)) {
+        if (((tl_name != NULL) && !strcmp(tl_name, tlr->tl->name)) ||
+            ((tl_name == NULL) && (md_flags & UCT_MD_FLAG_SOCKADDR))) {
             return tlr->tl;
         }
     }
     return NULL;
 }
 
-static uct_tl_component_t *uct_find_tl(const char *tl_name)
-{
-    uct_md_component_t *mdc;
-    uct_tl_component_t *tlc;
-
-    ucs_list_for_each(mdc, &uct_md_components_list, list) {
-        tlc = uct_find_tl_on_md(mdc, tl_name);
-        if (tlc != NULL) {
-            return tlc;
-        }
-    }
-    return NULL;
-}
-
-ucs_status_t uct_iface_config_read(const char *tl_name, const char *env_prefix,
-                                   const char *filename,
-                                   uct_iface_config_t **config_p)
+ucs_status_t uct_md_iface_config_read(uct_md_h md, const char *tl_name,
+                                      const char *env_prefix, const char *filename,
+                                      uct_iface_config_t **config_p)
 {
     uct_config_bundle_t *bundle = NULL;
     uct_tl_component_t *tlc;
+    uct_md_attr_t md_attr;
     ucs_status_t status;
 
-    tlc = uct_find_tl(tl_name);
+    status = uct_md_query(md, &md_attr);
+    if (status != UCS_OK) {
+        ucs_error("Failed to query MD");
+        return status;
+    }
+
+    tlc = uct_find_tl_on_md(md->component, md_attr.cap.flags, tl_name);
     if (tlc == NULL) {
-        ucs_error("Transport '%s' does not exist", tl_name);
+        if (tl_name == NULL) {
+            ucs_error("There is no sockaddr transport registered on the md");
+        } else {
+            ucs_error("Transport '%s' does not exist", tl_name);
+        }
         status = UCS_ERR_NO_DEVICE; /* Non-existing transport */
         return status;
     }
@@ -356,8 +309,16 @@ ucs_status_t uct_iface_open(uct_md_h md, uct_worker_h worker,
                             uct_iface_h *iface_p)
 {
     uct_tl_component_t *tlc;
+    uct_md_attr_t md_attr;
+    ucs_status_t status;
 
-    tlc = uct_find_tl_on_md(md->component, params->tl_name);
+    status = uct_md_query(md, &md_attr);
+    if (status != UCS_OK) {
+        ucs_error("Failed to query MD");
+        return status;
+    }
+
+    tlc = uct_find_tl_on_md(md->component, md_attr.cap.flags, params->mode.device.tl_name);
     if (tlc == NULL) {
         /* Non-existing transport */
         return UCS_ERR_NO_DEVICE;
@@ -423,6 +384,14 @@ void uct_config_print(const void *config, FILE *stream, const char *title,
                                  bundle->table_prefix, print_flags);
 }
 
+ucs_status_t uct_config_get(void *config, const char *name, char *value,
+                            size_t max)
+{
+    uct_config_bundle_t *bundle = (uct_config_bundle_t *)config - 1;
+    return ucs_config_parser_get_value(bundle->data, bundle->table, name, value,
+                                       max);
+}
+
 ucs_status_t uct_config_modify(void *config, const char *name, const char *value)
 {
     uct_config_bundle_t *bundle = (uct_config_bundle_t *)config - 1;
@@ -453,8 +422,8 @@ void uct_md_component_config_print(ucs_config_print_flags_t print_flags)
 
 ucs_status_t uct_md_mkey_pack(uct_md_h md, uct_mem_h memh, void *rkey_buffer)
 {
-    memcpy(rkey_buffer, md->component->name, UCT_MD_COMPONENT_NAME_MAX);
-    return md->ops->mkey_pack(md, memh, rkey_buffer + UCT_MD_COMPONENT_NAME_MAX);
+    void *rbuf = uct_md_fill_md_name(md, rkey_buffer);
+    return md->ops->mkey_pack(md, memh, rbuf);
 }
 
 ucs_status_t uct_rkey_unpack(const void *rkey_buffer, uct_rkey_bundle_t *rkey_ob)
@@ -480,6 +449,14 @@ ucs_status_t uct_rkey_unpack(const void *rkey_buffer, uct_rkey_bundle_t *rkey_ob
     return UCS_ERR_UNSUPPORTED;
 }
 
+ucs_status_t uct_rkey_ptr(uct_rkey_bundle_t *rkey_ob, uint64_t remote_addr,
+                          void **local_addr_p)
+{
+    uct_md_component_t *mdc = rkey_ob->type;
+    return mdc->rkey_ptr(mdc, rkey_ob->rkey, rkey_ob->handle, remote_addr,
+                         local_addr_p);
+}
+
 ucs_status_t uct_rkey_release(const uct_rkey_bundle_t *rkey_ob)
 {
     uct_md_component_t *mdc = rkey_ob->type;
@@ -502,9 +479,24 @@ ucs_status_t uct_md_query(uct_md_h md, uct_md_attr_t *md_attr)
     return UCS_OK;
 }
 
+static ucs_status_t uct_mem_check_flags(unsigned flags)
+{
+    if (!(flags & UCT_MD_MEM_ACCESS_ALL)) {
+        return UCS_ERR_INVALID_PARAM;
+    }
+    return UCS_OK;
+}
+
 ucs_status_t uct_md_mem_alloc(uct_md_h md, size_t *length_p, void **address_p,
                               unsigned flags, const char *alloc_name, uct_mem_h *memh_p)
 {
+    ucs_status_t status;
+
+    status = uct_mem_check_flags(flags);
+    if (status != UCS_OK) {
+        return status;
+    }
+
     return md->ops->mem_alloc(md, length_p, address_p, flags, memh_p UCS_MEMTRACK_VAL);
 }
 
@@ -513,11 +505,29 @@ ucs_status_t uct_md_mem_free(uct_md_h md, uct_mem_h memh)
     return md->ops->mem_free(md, memh);
 }
 
+ucs_status_t 
+uct_md_mem_advise(uct_md_h md, uct_mem_h memh, void *addr, size_t length,
+                  unsigned advice)
+{
+    if ((length == 0) || (addr == NULL)) {
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    return md->ops->mem_advise(md, memh, addr, length, advice);
+}
+
 ucs_status_t uct_md_mem_reg(uct_md_h md, void *address, size_t length,
                             unsigned flags, uct_mem_h *memh_p)
 {
+    ucs_status_t status;
+
     if ((length == 0) || (address == NULL)) {
         return UCS_ERR_INVALID_PARAM;
+    }
+
+    status = uct_mem_check_flags(flags);
+    if (status != UCS_OK) {
+        return status;
     }
 
     return md->ops->mem_reg(md, address, length, flags, memh_p);
@@ -526,4 +536,10 @@ ucs_status_t uct_md_mem_reg(uct_md_h md, void *address, size_t length,
 ucs_status_t uct_md_mem_dereg(uct_md_h md, uct_mem_h memh)
 {
     return md->ops->mem_dereg(md, memh);
+}
+
+int uct_md_is_sockaddr_accessible(uct_md_h md, const ucs_sock_addr_t *sockaddr,
+                                  uct_sockaddr_accessibility_t mode)
+{
+    return md->ops->is_sockaddr_accessible(md, sockaddr, mode);
 }

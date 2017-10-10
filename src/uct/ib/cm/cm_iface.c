@@ -13,7 +13,6 @@
 #include <ucs/async/async.h>
 #include <ucs/debug/log.h>
 #include <poll.h>
-#include <infiniband/arch.h>
 
 
 static ucs_config_field_t uct_cm_iface_config_table[] = {
@@ -26,7 +25,7 @@ static ucs_config_field_t uct_cm_iface_config_table[] = {
   {"TIMEOUT", "300ms", "Timeout for MAD layer",
    ucs_offsetof(uct_cm_iface_config_t, timeout), UCS_CONFIG_TYPE_TIME},
 
-  {"RETRY_COUNT", "20", "Number of retries for MAD layer",
+  {"RETRY_COUNT", "100", "Number of retries for MAD layer",
    ucs_offsetof(uct_cm_iface_config_t, retry_count), UCS_CONFIG_TYPE_UINT},
 
   {"MAX_OP", "1024", "Maximal number of outstanding SIDR operations",
@@ -38,35 +37,46 @@ static ucs_config_field_t uct_cm_iface_config_table[] = {
 static uct_ib_iface_ops_t uct_cm_iface_ops;
 
 
-static void uct_cm_iface_progress(void *arg)
+static unsigned uct_cm_iface_progress(void *arg)
 {
     uct_cm_pending_req_priv_t *priv;
     uct_cm_iface_t *iface = arg;
     uct_cm_iface_op_t *op;
+    unsigned count;
 
     uct_cm_enter(iface);
 
     /* Invoke flush completions at the head of the queue - the sends which
      * started before them were already completed.
      */
+    count = 0;
     ucs_queue_for_each_extract(op, &iface->outstanding_q, queue, !op->is_id) {
         uct_invoke_completion(op->comp, UCS_OK);
         ucs_free(op);
+        ++count;
     }
 
     /* Dispatch pending operations */
     uct_pending_queue_dispatch(priv, &iface->notify_q,
                                iface->num_outstanding < iface->config.max_outstanding);
 
+    /* Remove the progress callback only if there is no user completion at the
+     * head of the queue. It could be added by the progress callback.
+     */
+    if (ucs_queue_is_empty(&iface->outstanding_q) ||
+        ucs_queue_head_elem_non_empty(&iface->outstanding_q, uct_cm_iface_op_t, queue)->is_id)
+    {
+        uct_worker_progress_unregister_safe(&uct_cm_iface_worker(iface)->super,
+                                            &iface->slow_prog_id);
+    }
+
     uct_cm_leave(iface);
 
-    ucs_callbackq_remove(&uct_cm_iface_worker(iface)->progress_q,
-                         uct_cm_iface_progress, iface);
+    return count;
 }
 
-ucs_status_t uct_cm_iface_flush_do(uct_iface_h tl_iface, uct_completion_t *comp)
+ucs_status_t uct_cm_iface_flush_do(uct_cm_iface_t *iface, uct_completion_t *comp)
 {
-    uct_cm_iface_t *iface = ucs_derived_of(tl_iface, uct_cm_iface_t);
     uct_cm_iface_op_t *op;
 
     if (iface->num_outstanding == 0) {
@@ -95,14 +105,18 @@ ucs_status_t uct_cm_iface_flush_do(uct_iface_h tl_iface, uct_completion_t *comp)
 ucs_status_t uct_cm_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                 uct_completion_t *comp)
 {
+    uct_cm_iface_t *iface = ucs_derived_of(tl_iface, uct_cm_iface_t);
     ucs_status_t status;
 
-    status = uct_cm_iface_flush_do(tl_iface, comp);
+    uct_cm_enter(iface);
+    status = uct_cm_iface_flush_do(iface, comp);
     if (status == UCS_OK) {
         UCT_TL_IFACE_STAT_FLUSH(ucs_derived_of(tl_iface, uct_base_iface_t));
     } else if (status == UCS_INPROGRESS){
         UCT_TL_IFACE_STAT_FLUSH_WAIT(ucs_derived_of(tl_iface, uct_base_iface_t));
     }
+    uct_cm_leave(iface);
+
     return status;
 }
 
@@ -111,22 +125,12 @@ static void uct_cm_iface_handle_sidr_req(uct_cm_iface_t *iface,
 {
     uct_cm_hdr_t *hdr = event->private_data;
     struct ib_cm_sidr_rep_param rep;
-    ucs_status_t status;
-    void *cm_desc, *desc;
     int ret;
 
     VALGRIND_MAKE_MEM_DEFINED(hdr, sizeof(hdr));
     VALGRIND_MAKE_MEM_DEFINED(hdr + 1, hdr->length);
 
     uct_cm_iface_trace_data(iface, UCT_AM_TRACE_TYPE_RECV, hdr, "RX: SIDR_REQ");
-
-    /* Allocate temporary buffer to serve as receive descriptor */
-    cm_desc = ucs_malloc(iface->super.config.rx_payload_offset + hdr->length,
-                         "cm_recv_desc");
-    if (cm_desc == NULL) {
-        ucs_error("failed to allocate cm receive descriptor");
-        return;
-    }
 
     /* Send reply */
     ucs_trace_data("TX: SIDR_REP [id %p{%u}]", event->cm_id,
@@ -138,14 +142,7 @@ static void uct_cm_iface_handle_sidr_req(uct_cm_iface_t *iface,
         ucs_error("ib_cm_send_sidr_rep() failed: %m");
     }
 
-    /* Call active message handler */
-    desc = cm_desc + iface->super.config.rx_headroom_offset;
-    uct_recv_desc_iface(desc) = &iface->super.super.super;
-    status = uct_iface_invoke_am(&iface->super.super, hdr->am_id, hdr + 1,
-                                 hdr->length, desc);
-    if (status == UCS_OK) {
-        ucs_free(cm_desc);
-    }
+    uct_iface_invoke_am(&iface->super.super, hdr->am_id, hdr + 1, hdr->length, 0);
 }
 
 static void uct_cm_iface_outstanding_remove(uct_cm_iface_t* iface,
@@ -241,15 +238,16 @@ static void uct_cm_iface_event_handler(int fd, void *arg)
             }
         }
 
-        ucs_callbackq_add_safe(&uct_cm_iface_worker(iface)->progress_q,
-                               uct_cm_iface_progress, iface);
+        uct_worker_progress_register_safe(&uct_cm_iface_worker(iface)->super,
+                                          uct_cm_iface_progress, iface, 0,
+                                          &iface->slow_prog_id);
     }
 }
 
-static void uct_cm_iface_release_am_desc(uct_iface_t *tl_iface, void *desc)
+static void uct_cm_iface_release_desc(uct_recv_desc_t *self, void *desc)
 {
-    uct_cm_iface_t *iface = ucs_derived_of(tl_iface, uct_cm_iface_t);
-    ucs_free(desc - iface->super.config.rx_headroom_offset);
+    uct_ib_iface_t *iface = ucs_container_of(self, uct_ib_iface_t, release_desc);
+    ucs_free(desc - iface->config.rx_headroom_offset);
 }
 
 static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
@@ -265,24 +263,27 @@ static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
     UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &uct_cm_iface_ops, md, worker,
                               params, 0 /* rx_priv_len */, 0 /* rx_hdr_len */,
                               1 /* tx_cq_len */,
+                              config->super.rx.queue_len /* rx_cq_len */,
                               IB_CM_SIDR_REQ_PRIVATE_DATA_SIZE, /* mss */
                               &config->super);
 
-    if (worker->async == NULL) {
+    if (self->super.super.worker->async == NULL) {
         ucs_error("cm must have async!=NULL");
         return UCS_ERR_INVALID_PARAM;
     }
 
-    self->service_id          = (uint32_t)(ucs_generate_uuid((uintptr_t)self) &
-                                             (~IB_CM_ASSIGN_SERVICE_ID_MASK));
     self->num_outstanding     = 0;
-
+    self->service_id          = 0;
     self->config.timeout_ms   = (int)(config->timeout * 1e3 + 0.5);
     self->config.max_outstanding = config->max_outstanding;
     self->config.retry_count  = ucs_min(config->retry_count, UINT8_MAX);
     self->notify_q.head       = NULL;
+    self->slow_prog_id        = UCS_CALLBACKQ_ID_NULL;
     ucs_queue_head_init(&self->notify_q);
     ucs_queue_head_init(&self->outstanding_q);
+
+    /* Redefine receive desc release callback */
+    self->super.release_desc.cb = uct_cm_iface_release_desc;
 
     self->cmdev = ib_cm_open_device(uct_ib_iface_device(&self->super)->ibv_context);
     if (self->cmdev == NULL) {
@@ -303,12 +304,26 @@ static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_close_device;
     }
 
-    ret = ib_cm_listen(self->listen_id, self->service_id, 0);
-    if (ret) {
-        ucs_error("ib_cm_listen() failed: %m");
-        status = UCS_ERR_INVALID_ADDR;
-        goto err_destroy_id;
-    }
+    do {
+        self->service_id = (uint32_t)(ucs_generate_uuid((uintptr_t)self) &
+                                      (~IB_CM_ASSIGN_SERVICE_ID_MASK));
+        ret = ib_cm_listen(self->listen_id, self->service_id, 0);
+        if (ret) {
+            if (errno == EBUSY) {
+                /* The generated service id is already in use - try to
+                 * generate another one.
+                 */
+                ucs_debug("ib_cm service id 0x%x already in use, "
+                          "trying another one", self->service_id);
+                continue;
+            } else {
+                ucs_error("ib_cm_listen(service_id=0x%x) failed: %m",
+                          self->service_id);
+                status = UCS_ERR_INVALID_ADDR;
+                goto err_destroy_id;
+            }
+        }
+    } while (ret);
 
     if (config->async_mode == UCS_ASYNC_MODE_SIGNAL) {
         ucs_warn("ib_cm fd does not support SIGIO");
@@ -316,7 +331,7 @@ static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
 
     status = ucs_async_set_event_handler(config->async_mode, self->cmdev->fd,
                                          POLLIN, uct_cm_iface_event_handler, self,
-                                         worker->async);
+                                         self->super.super.worker->async);
     if (status != UCS_OK) {
         ucs_error("failed to set event handler");
         goto err_destroy_id;
@@ -345,13 +360,13 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cm_iface_t)
     uct_cm_iface_outstanding_purge(self);
     ib_cm_destroy_id(self->listen_id);
     ib_cm_close_device(self->cmdev);
+    uct_worker_progress_unregister_safe(&uct_cm_iface_worker(self)->super,
+                                        &self->slow_prog_id);
     uct_cm_leave(self);
 
     /* At this point all outstanding have been removed, and no further events
      * can be added.
      */
-    ucs_callbackq_remove_all(&uct_cm_iface_worker(self)->progress_q,
-                             uct_cm_iface_progress, self);
 }
 
 UCS_CLASS_DEFINE(uct_cm_iface_t, uct_ib_iface_t);
@@ -363,9 +378,14 @@ static ucs_status_t uct_cm_iface_query(uct_iface_h tl_iface,
                                        uct_iface_attr_t *iface_attr)
 {
     uct_cm_iface_t *iface = ucs_derived_of(tl_iface, uct_cm_iface_t);
+    ucs_status_t status;
     size_t mtu;
 
-    uct_ib_iface_query(&iface->super, 32 /* TODO */, iface_attr);
+    status = uct_ib_iface_query(&iface->super, 32 /* TODO */, iface_attr);
+    if (status != UCS_OK) {
+        return status;
+    }
+
     iface_attr->overhead = 1200e-9;
 
     mtu = ucs_min(IB_CM_SIDR_REQ_PRIVATE_DATA_SIZE - sizeof(uct_cm_hdr_t),
@@ -374,10 +394,11 @@ static ucs_status_t uct_cm_iface_query(uct_iface_h tl_iface,
     iface_attr->cap.am.max_bcopy      = mtu;
     iface_attr->iface_addr_len        = sizeof(uint32_t);
     iface_attr->ep_addr_len           = 0;
+    iface_attr->max_conn_priv         = 0;
     iface_attr->cap.flags             = UCT_IFACE_FLAG_AM_BCOPY |
-                                        UCT_IFACE_FLAG_AM_DUP |
-                                        UCT_IFACE_FLAG_PENDING |
-                                        UCT_IFACE_FLAG_AM_CB_ASYNC |
+                                        UCT_IFACE_FLAG_AM_DUP   |
+                                        UCT_IFACE_FLAG_PENDING  |
+                                        UCT_IFACE_FLAG_CB_ASYNC |
                                         UCT_IFACE_FLAG_CONNECT_TO_IFACE;
     return UCS_OK;
 }
@@ -393,22 +414,26 @@ static ucs_status_t uct_cm_iface_get_address(uct_iface_h tl_iface,
 
 static uct_ib_iface_ops_t uct_cm_iface_ops = {
     {
-    .iface_query              = uct_cm_iface_query,
-    .iface_flush              = uct_cm_iface_flush,
-    .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cm_iface_t),
-    .iface_get_address        = uct_cm_iface_get_address,
-    .iface_get_device_address = uct_ib_iface_get_device_address,
-    .iface_is_reachable       = uct_ib_iface_is_reachable,
-    .ep_create_connected      = UCS_CLASS_NEW_FUNC_NAME(uct_cm_ep_t),
-    .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_cm_ep_t),
-    .iface_release_am_desc    = uct_cm_iface_release_am_desc,
     .ep_am_bcopy              = uct_cm_ep_am_bcopy,
     .ep_pending_add           = uct_cm_ep_pending_add,
     .ep_pending_purge         = uct_cm_ep_pending_purge,
     .ep_flush                 = uct_cm_ep_flush,
+    .ep_fence                 = uct_base_ep_fence,
+    .ep_create_connected      = UCS_CLASS_NEW_FUNC_NAME(uct_cm_ep_t),
+    .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_cm_ep_t),
+    .iface_flush              = uct_cm_iface_flush,
+    .iface_fence              = uct_base_iface_fence,
+    .iface_progress_enable    = ucs_empty_function,
+    .iface_progress_disable   = ucs_empty_function,
+    .iface_progress           = ucs_empty_function_return_zero,
+    .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cm_iface_t),
+    .iface_query              = uct_cm_iface_query,
+    .iface_get_device_address = uct_ib_iface_get_device_address,
+    .iface_get_address        = uct_cm_iface_get_address,
+    .iface_is_reachable       = uct_ib_iface_is_reachable
     },
     .arm_tx_cq                = (void*)ucs_empty_function_return_success,
-    .arm_rx_cq                = (void*)ucs_empty_function_return_success,
+    .arm_rx_cq                = (void*)ucs_empty_function_return_success
 };
 
 static ucs_status_t uct_cm_query_resources(uct_md_h md,

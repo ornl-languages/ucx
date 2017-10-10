@@ -27,29 +27,37 @@ public:
     }
 
     static std::vector<ucp_test_param> enum_test_params(const ucp_params_t& ctx_params,
-                                                        const ucp_worker_params_t& worker_params,
                                                         const std::string& name,
                                                         const std::string& test_case_name,
                                                         const std::string& tls)
     {
         std::vector<ucp_test_param> result;
 
-        generate_test_params_variant(ctx_params, worker_params, name, test_case_name, tls,
-                                     RECV_REQ_INTERNAL, result, MULTI_THREAD_CONTEXT);
-        generate_test_params_variant(ctx_params, worker_params, name, test_case_name, tls,
-                                     RECV_REQ_EXTERNAL, result, MULTI_THREAD_CONTEXT);
-        generate_test_params_variant(ctx_params, worker_params, name, test_case_name, tls,
-                                     RECV_REQ_INTERNAL, result, MULTI_THREAD_WORKER);
-        generate_test_params_variant(ctx_params, worker_params, name, test_case_name, tls,
-                                     RECV_REQ_EXTERNAL, result, MULTI_THREAD_WORKER);
+        generate_test_params_variant(ctx_params, name,
+                                     test_case_name, tls, RECV_REQ_INTERNAL,
+                                     result, MULTI_THREAD_CONTEXT);
+        generate_test_params_variant(ctx_params, name,
+                                     test_case_name, tls, RECV_REQ_EXTERNAL,
+                                     result, MULTI_THREAD_CONTEXT);
+        generate_test_params_variant(ctx_params, name,
+                                     test_case_name, tls, RECV_REQ_INTERNAL,
+                                     result, MULTI_THREAD_WORKER);
+        generate_test_params_variant(ctx_params, name,
+                                     test_case_name, tls, RECV_REQ_EXTERNAL,
+                                     result, MULTI_THREAD_WORKER);
         return result;
+    }
+
+    virtual bool is_external_request()
+    {
+        return GetParam().variant == RECV_REQ_EXTERNAL;
     }
 };
 
 UCS_TEST_P(test_ucp_tag_mt, send_recv) {
     int i;
-    uint64_t send_data[MT_TEST_NUM_THREADS] GTEST_ATTRIBUTE_UNUSED_;
-    uint64_t recv_data[MT_TEST_NUM_THREADS] GTEST_ATTRIBUTE_UNUSED_;
+    uint64_t            send_data[MT_TEST_NUM_THREADS] GTEST_ATTRIBUTE_UNUSED_;
+    uint64_t            recv_data[MT_TEST_NUM_THREADS] GTEST_ATTRIBUTE_UNUSED_;
     ucp_tag_recv_info_t info[MT_TEST_NUM_THREADS] GTEST_ATTRIBUTE_UNUSED_;
 
     for (i = 0; i < MT_TEST_NUM_THREADS; i++) {
@@ -63,8 +71,9 @@ UCS_TEST_P(test_ucp_tag_mt, send_recv) {
         ucs_status_t status;
         int worker_index = 0;
 
-        if (GetParam().thread_type == MULTI_THREAD_CONTEXT)
+        if (GetParam().thread_type == MULTI_THREAD_CONTEXT) {
             worker_index = i;
+        }
 
         send_b(&(send_data[i]), sizeof(send_data[i]), DATATYPE, 0x111337+i, i);
 

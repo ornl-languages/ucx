@@ -9,6 +9,7 @@
 
 #include "types.h"
 
+#include <ucs/stats/stats_fwd.h>
 #include <ucs/type/status.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -32,15 +33,24 @@ typedef struct {
     /* Maximal amount of packet data to print per packet */
     size_t                   log_data_size;
 
+    /* Enable ucs_print() output */
+    int                      log_print_enable;
+
     /* Enable FIFO behavior for memory pool, instead of LIFO. Useful for
      * debugging because object pointers are not recycled. */
     int                      mpool_fifo;
 
     /* Handle errors mode */
-    ucs_handle_error_t       handle_errors;
+    unsigned                 handle_errors;
 
     /* Error signals */
     UCS_CONFIG_ARRAY_FIELD(int, signals) error_signals;
+
+    /* If not empty, send mail notifications to that address in case of error */
+    char                     *error_mail_to;
+
+    /* Footer for error report mail notification */
+    char                     *error_mail_footer;
 
     /* If not NULL, attach gdb to the process in case of error */
     char                     *gdb_command;
@@ -48,14 +58,8 @@ typedef struct {
     /* Signal number which causes to enter debug mode */
     unsigned                 debug_signo;
 
-    /* File name to dump instrumentation records to */
-    char                     *instrument_file;
-
-    /* Types of instrumentation to be recorded for this run */
-    unsigned                 instrument_types;
-
-    /* Limit for instrumentation data size */
-    size_t                   instrument_max_size;
+    /* Log level to trigger error handling */
+    ucs_log_level_t          log_level_trigger;
 
     /* Max. events per context, will be removed in the future */
     unsigned                 async_max_events;
@@ -90,6 +94,12 @@ typedef struct {
     /* Limit for profiling log size */
      size_t                   profile_log_size;
 
+    /* Counters to be included in statistics summary */
+    ucs_config_names_array_t stats_filter;
+
+    /* statistics format options */
+    ucs_stats_formats_t      stats_format;
+
 } ucs_global_opts_t;
 
 
@@ -97,6 +107,8 @@ extern ucs_global_opts_t ucs_global_opts;
 
 void ucs_global_opts_init();
 ucs_status_t ucs_global_opts_set_value(const char *name, const char *value);
+ucs_status_t ucs_global_opts_get_value(const char *name, char *value,
+                                       size_t max);
 ucs_status_t ucs_global_opts_clone(void *dst);
 void ucs_global_opts_release();
 void ucs_global_opts_print(FILE *stream, ucs_config_print_flags_t print_flags);

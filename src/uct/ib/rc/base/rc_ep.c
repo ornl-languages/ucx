@@ -9,12 +9,10 @@
 #include "rc_iface.h"
 
 #include <uct/ib/base/ib_verbs.h>
-#include <ucs/debug/instrument.h>
 #include <ucs/debug/memtrack.h>
 #include <ucs/debug/log.h>
 #include <ucs/type/class.h>
-#include <infiniband/arch.h>
-
+#include <endian.h>
 
 #if ENABLE_STATS
 static ucs_stats_class_t uct_rc_fc_stats_class = {
@@ -51,10 +49,13 @@ ucs_status_t uct_rc_txqp_init(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface,
     ucs_status_t status;
 
     txqp->unsignaled = 0;
+    txqp->unsignaled_store = 0;
+    txqp->unsignaled_store_count = 0;
     txqp->available  = 0;
     ucs_queue_head_init(&txqp->outstanding);
 
-    status = uct_rc_iface_qp_create(iface, qp_type, &txqp->qp, cap);
+    status = uct_rc_iface_qp_create(iface, qp_type, &txqp->qp, cap,
+                                    iface->config.tx_qp_len);
     if (status != UCS_OK) {
         goto err;
     }
@@ -112,10 +113,8 @@ void uct_rc_fc_cleanup(uct_rc_fc_t *fc)
 
 UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface)
 {
-    struct ibv_qp_attr qp_attr;
     struct ibv_qp_cap cap;
     ucs_status_t status;
-    int ret;
 
     UCS_CLASS_CALL_SUPER_INIT(uct_base_ep_t, &iface->super.super);
 
@@ -125,23 +124,9 @@ UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface)
         goto err;
     }
 
-    memset(&qp_attr, 0, sizeof(qp_attr));
-
-    qp_attr.qp_state              = IBV_QPS_INIT;
-    qp_attr.pkey_index            = iface->super.pkey_index;
-    qp_attr.port_num              = iface->super.config.port_num;
-    qp_attr.qp_access_flags       = IBV_ACCESS_LOCAL_WRITE|
-                                    IBV_ACCESS_REMOTE_WRITE|
-                                    IBV_ACCESS_REMOTE_READ|
-                                    IBV_ACCESS_REMOTE_ATOMIC;
-    ret = ibv_modify_qp(self->txqp.qp, &qp_attr,
-                        IBV_QP_STATE      |
-                        IBV_QP_PKEY_INDEX |
-                        IBV_QP_PORT       |
-                        IBV_QP_ACCESS_FLAGS);
-    if (ret) {
-         ucs_error("error modifying QP to INIT: %m");
-         goto err_txqp_cleanup;
+    status = uct_rc_iface_qp_init(iface, self->txqp.qp);
+    if (status != UCS_OK) {
+        goto err_txqp_cleanup;
     }
 
     status = uct_rc_fc_init(&self->fc, iface->config.fc_wnd_size
@@ -159,7 +144,8 @@ UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface)
 
     ucs_arbiter_group_init(&self->arb_group);
 
-    uct_rc_iface_add_ep(iface, self);
+    uct_rc_iface_add_qp(iface, self, self->txqp.qp->qp_num);
+    ucs_list_add_head(&iface->ep_list, &self->list);
     return UCS_OK;
 
 err_txqp_cleanup:
@@ -174,7 +160,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_rc_ep_t)
                                            uct_rc_iface_t);
     ucs_debug("destroy rc ep %p", self);
 
-    uct_rc_iface_remove_ep(iface, self);
+    ucs_list_del(&self->list);
+    uct_rc_iface_remove_qp(iface, self->txqp.qp->qp_num);
     uct_rc_ep_pending_purge(&self->super.super, NULL, NULL);
     uct_rc_fc_cleanup(&self->fc);
     uct_rc_txqp_cleanup(&self->txqp);
@@ -200,75 +187,34 @@ ucs_status_t uct_rc_ep_connect_to_ep(uct_ep_h tl_ep, const uct_device_addr_t *de
     uct_rc_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_rc_iface_t);
     const uct_ib_address_t *ib_addr = (const uct_ib_address_t *)dev_addr;
     const uct_rc_ep_address_t *rc_addr = (const uct_rc_ep_address_t*)ep_addr;
-    struct ibv_qp_attr qp_attr;
-    int ret;
+    struct ibv_ah_attr ah_attr;
+    ucs_status_t status;
 
-    memset(&qp_attr, 0, sizeof(qp_attr));
+    uct_ib_iface_fill_ah_attr(&iface->super, ib_addr, ep->path_bits, &ah_attr);
 
-    qp_attr.qp_state              = IBV_QPS_RTR;
-    qp_attr.dest_qp_num           = uct_ib_unpack_uint24(rc_addr->qp_num);
-    qp_attr.rq_psn                = 0;
-    qp_attr.path_mtu              = iface->config.path_mtu;
-    qp_attr.max_dest_rd_atomic    = iface->config.max_rd_atomic;
-    qp_attr.min_rnr_timer         = iface->config.min_rnr_timer;
-    uct_ib_iface_fill_ah_attr(&iface->super, ib_addr, ep->path_bits,
-                              &qp_attr.ah_attr);
-    ret = ibv_modify_qp(ep->txqp.qp, &qp_attr,
-                        IBV_QP_STATE              |
-                        IBV_QP_AV                 |
-                        IBV_QP_PATH_MTU           |
-                        IBV_QP_DEST_QPN           |
-                        IBV_QP_RQ_PSN             |
-                        IBV_QP_MAX_DEST_RD_ATOMIC |
-                        IBV_QP_MIN_RNR_TIMER);
-    if (ret) {
-        ucs_error("error modifying QP to RTR: %m");
-        return UCS_ERR_IO_ERROR;
+    status = uct_rc_iface_qp_connect(iface, ep->txqp.qp,
+                                     uct_ib_unpack_uint24(rc_addr->qp_num),
+                                     &ah_attr);
+    if (status == UCS_OK) {
+        ep->atomic_mr_offset = uct_ib_md_atomic_offset(rc_addr->atomic_mr_id);
     }
 
-    qp_attr.qp_state              = IBV_QPS_RTS;
-    qp_attr.sq_psn                = 0;
-    qp_attr.timeout               = iface->config.timeout;
-    qp_attr.rnr_retry             = iface->config.rnr_retry;
-    qp_attr.retry_cnt             = iface->config.retry_cnt;
-    qp_attr.max_rd_atomic         = iface->config.max_rd_atomic;
-    ret = ibv_modify_qp(ep->txqp.qp, &qp_attr,
-                        IBV_QP_STATE              |
-                        IBV_QP_TIMEOUT            |
-                        IBV_QP_RETRY_CNT          |
-                        IBV_QP_RNR_RETRY          |
-                        IBV_QP_SQ_PSN             |
-                        IBV_QP_MAX_QP_RD_ATOMIC);
-    if (ret) {
-        ucs_error("error modifying QP to RTS: %m");
-        return UCS_ERR_IO_ERROR;
-    }
-
-    ep->atomic_mr_offset = uct_ib_md_atomic_offset(rc_addr->atomic_mr_id);
-
-    ucs_debug("connected rc qp 0x%x on "UCT_IB_IFACE_FMT" to lid %d(+%d) sl %d "
-              "remote_qp 0x%x mtu %zu timer %dx%d rnr %dx%d rd_atom %d "
-              "atomic_mr_offset 0x%0x", ep->txqp.qp->qp_num,
-              UCT_IB_IFACE_ARG(&iface->super), qp_attr.ah_attr.dlid,
-              ep->path_bits, qp_attr.ah_attr.sl, qp_attr.dest_qp_num,
-              uct_ib_mtu_value(qp_attr.path_mtu), qp_attr.timeout,
-              qp_attr.retry_cnt, qp_attr.min_rnr_timer, qp_attr.rnr_retry,
-              qp_attr.max_rd_atomic, ep->atomic_mr_offset);
-
-    return UCS_OK;
+    return status;
 }
 
-void uct_rc_ep_reset_qp(uct_rc_ep_t *ep)
+ucs_status_t uct_rc_modify_qp(uct_rc_txqp_t *txqp, enum ibv_qp_state state)
 {
     struct ibv_qp_attr qp_attr;
-    int ret;
 
+    ucs_debug("modify QP 0x%x to state %d", txqp->qp->qp_num, state);
     memset(&qp_attr, 0, sizeof(qp_attr));
-    qp_attr.qp_state = IBV_QPS_RESET;
-    ret = ibv_modify_qp(ep->txqp.qp, &qp_attr, IBV_QP_STATE);
-    if (ret != 0) {
-        ucs_warn("modify qp 0x%x to RESET failed: %m", ep->txqp.qp->qp_num);
+    qp_attr.qp_state = state;
+    if (ibv_modify_qp(txqp->qp, &qp_attr, IBV_QP_STATE)) {
+        ucs_warn("modify qp 0x%x to RESET failed: %m", txqp->qp->qp_num);
+        return UCS_ERR_IO_ERROR;
     }
+
+    return UCS_OK;
 }
 
 void uct_rc_ep_am_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
@@ -276,11 +222,22 @@ void uct_rc_ep_am_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
                               char *buffer, size_t max)
 {
     uct_rc_hdr_t *rch = data;
-    uint8_t am_wo_fc = rch->am_id & ~UCT_RC_EP_FC_MASK; /* mask out FC bits*/
+    uint8_t fc_hdr    = uct_rc_fc_get_fc_hdr(rch->am_id);
+    uint8_t am_wo_fc;
 
-    snprintf(buffer, max, " am %d ", am_wo_fc);
-    uct_iface_dump_am(iface, type, am_wo_fc, rch + 1, length - sizeof(*rch),
-                      buffer + strlen(buffer), max - strlen(buffer));
+    /* Do not invoke AM tracer for auxiliary pure FC_GRANT message */
+    if (fc_hdr != UCT_RC_EP_FC_PURE_GRANT) {
+        am_wo_fc = rch->am_id & ~UCT_RC_EP_FC_MASK; /* mask out FC bits*/
+        snprintf(buffer, max, " %c%c am %d ",
+                 fc_hdr & UCT_RC_EP_FC_FLAG_SOFT_REQ ? 's' :
+                 fc_hdr & UCT_RC_EP_FC_FLAG_HARD_REQ ? 'h' : '-',
+                 fc_hdr & UCT_RC_EP_FC_FLAG_GRANT    ? 'g' : '-',
+                 am_wo_fc);
+        uct_iface_dump_am(iface, type, am_wo_fc, rch + 1, length - sizeof(*rch),
+                          buffer + strlen(buffer), max - strlen(buffer));
+    } else {
+        snprintf(buffer, max, " FC pure grant am ");
+    }
 }
 
 void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp)
@@ -294,7 +251,6 @@ void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp)
     uct_invoke_completion(desc->super.user_comp, UCS_OK);
 
     ucs_mpool_put(desc);
-    UCS_INSTRUMENT_RECORD(UCS_INSTRUMENT_TYPE_IB_TX, __FUNCTION__, op);
 }
 
 void uct_rc_ep_get_bcopy_handler_no_completion(uct_rc_iface_send_op_t *op,
@@ -307,14 +263,13 @@ void uct_rc_ep_get_bcopy_handler_no_completion(uct_rc_iface_send_op_t *op,
     desc->unpack_cb(desc->super.unpack_arg, resp, desc->super.length);
 
     ucs_mpool_put(desc);
-    UCS_INSTRUMENT_RECORD(UCS_INSTRUMENT_TYPE_IB_TX, __FUNCTION__, op);
 }
 
-void uct_rc_ep_send_completion_proxy_handler(uct_rc_iface_send_op_t *op,
-                                             const void *resp)
+void uct_rc_ep_send_op_completion_handler(uct_rc_iface_send_op_t *op,
+                                          const void *resp)
 {
     uct_invoke_completion(op->user_comp, UCS_OK);
-    UCS_INSTRUMENT_RECORD(UCS_INSTRUMENT_TYPE_IB_TX, __FUNCTION__, op);
+    uct_rc_iface_put_send_op(op);
 }
 
 ucs_status_t uct_rc_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n)
@@ -376,10 +331,10 @@ static ucs_arbiter_cb_result_t uct_rc_ep_abriter_purge_cb(ucs_arbiter_t *arbiter
                                                           void *arg)
 {
     uct_rc_fc_request_t *freq;
-    uct_purge_cb_args_t  *cb_args   = arg;
+    uct_purge_cb_args_t *cb_args    = arg;
     uct_pending_purge_callback_t cb = cb_args->cb;
     uct_pending_req_t *req    = ucs_container_of(elem, uct_pending_req_t, priv);
-    uct_rc_ep_t *ep           = ucs_container_of(ucs_arbiter_elem_group(elem),
+    uct_rc_ep_t       *ep     = ucs_container_of(ucs_arbiter_elem_group(elem),
                                                  uct_rc_ep_t, arb_group);
 
     /* Invoke user's callback only if it is not internal FC message */
@@ -387,7 +342,7 @@ static ucs_arbiter_cb_result_t uct_rc_ep_abriter_purge_cb(ucs_arbiter_t *arbiter
         if (cb != NULL) {
             cb(req, cb_args->arg);
         } else {
-            ucs_warn("ep=%p cancelling user pending request %p", ep, req);
+            ucs_debug("ep=%p cancelling user pending request %p", ep, req);
         }
     } else {
         freq = ucs_derived_of(req, uct_rc_fc_request_t);
@@ -445,11 +400,37 @@ void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
                 uct_invoke_completion(op->user_comp, status);
             }
         }
-        if (op->handler != uct_rc_ep_send_completion_proxy_handler) {
+        op->flags &= ~UCT_RC_IFACE_SEND_OP_FLAG_INUSE;
+        if (op->handler == uct_rc_ep_send_op_completion_handler) {
+            uct_rc_iface_put_send_op(op);
+        } else {
             desc = ucs_derived_of(op, uct_rc_iface_send_desc_t);
             ucs_mpool_put(desc);
         }
     }
+}
+
+ucs_status_t uct_rc_ep_flush(uct_rc_ep_t *ep, int16_t max_available,
+                             unsigned flags)
+{
+    uct_rc_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_rc_iface_t);
+
+    if (ucs_unlikely(flags & UCT_FLUSH_FLAG_CANCEL)) {
+        uct_rc_txqp_purge_outstanding(&ep->txqp, UCS_ERR_CANCELED, 0);
+        uct_ep_pending_purge(&ep->super.super, NULL, 0);
+        return UCS_OK;
+    }
+
+    if (!uct_rc_iface_has_tx_resources(iface) || !uct_rc_ep_has_tx_resources(ep)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    if (uct_rc_txqp_available(&ep->txqp) == max_available) {
+        UCT_TL_EP_STAT_FLUSH(&ep->super);
+        return UCS_OK;
+    }
+
+    return UCS_INPROGRESS;
 }
 
 #define UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC(_num_bits, _is_be) \
@@ -465,14 +446,13 @@ void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
         if (_is_be && (_num_bits == 32)) { \
             *dest = ntohl(*value); /* TODO swap in-place */ \
         } else if (_is_be && (_num_bits == 64)) { \
-            *dest = ntohll(*value); \
+            *dest = be64toh(*value); \
         } else { \
             *dest = *value; \
         } \
         \
         uct_invoke_completion(desc->super.user_comp, UCS_OK); \
         ucs_mpool_put(desc); \
-        UCT_IB_INSTRUMENT_RECORD_SEND_OP(op); \
   }
 
 UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC(32, 0);
@@ -485,5 +465,4 @@ void uct_rc_ep_am_zcopy_handler(uct_rc_iface_send_op_t *op, const void *resp)
     uct_rc_iface_send_desc_t *desc = ucs_derived_of(op, uct_rc_iface_send_desc_t);
     uct_invoke_completion(desc->super.user_comp, UCS_OK);
     ucs_mpool_put(desc);
-    UCT_IB_INSTRUMENT_RECORD_SEND_OP(op);
 }

@@ -9,12 +9,15 @@
 #define UCP_WORKER_H_
 
 #include "ucp_ep.h"
+#include "ucp_thread.h"
 
 #include <ucs/datastruct/mpool.h>
 #include <ucs/datastruct/khash.h>
+#include <ucs/datastruct/queue_types.h>
 #include <ucs/async/async.h>
 
 KHASH_MAP_INIT_INT64(ucp_worker_ep_hash, ucp_ep_t *);
+KHASH_MAP_INIT_INT64(ucp_ep_errh_hash,   ucp_err_handler_cb_t);
 
 
 enum {
@@ -28,6 +31,15 @@ enum {
         UCT_IFACE_FLAG_ATOMIC_FADD64 |
         UCT_IFACE_FLAG_ATOMIC_SWAP64 |
         UCT_IFACE_FLAG_ATOMIC_CSWAP64
+};
+
+
+/**
+ * UCP worker flags
+ */
+enum {
+    UCP_WORKER_FLAG_EXTERNAL_EVENT_FD = UCS_BIT(0), /**< worker event fd is external */
+    UCP_WORKER_FLAG_EDGE_TRIGGERED    = UCS_BIT(1)  /**< events are edge-triggered */
 };
 
 
@@ -52,6 +64,17 @@ enum {
 };
 
 
+#define UCP_WORKER_UCT_RECV_EVENT_ARM_FLAGS  (UCT_EVENT_RECV_AM | \
+                                              UCT_EVENT_RECV_SIG_AM)
+#define UCP_WORKER_UCT_RECV_EVENT_CAP_FLAGS  (UCT_IFACE_FLAG_EVENT_RECV_AM | \
+                                              UCT_IFACE_FLAG_EVENT_RECV_SIG_AM)
+#define UCP_WORKER_UCT_ALL_EVENT_CAP_FLAGS   (UCT_IFACE_FLAG_EVENT_SEND_COMP | \
+                                              UCT_IFACE_FLAG_EVENT_RECV_AM | \
+                                              UCT_IFACE_FLAG_EVENT_RECV_SIG_AM)
+#define UCP_WORKER_UCT_UNSIG_EVENT_CAP_FLAGS (UCT_IFACE_FLAG_EVENT_SEND_COMP | \
+                                              UCT_IFACE_FLAG_EVENT_RECV_AM)
+
+
 #define UCP_WORKER_STAT_EAGER_MSG(_worker, _flags) \
     UCS_STATS_UPDATE_COUNTER((_worker)->stats, \
                              (_flags & UCP_RECV_DESC_FLAG_SYNC) ? \
@@ -66,15 +89,33 @@ enum {
     UCS_STATS_UPDATE_COUNTER((_worker)->stats, \
                              UCP_WORKER_STAT_TAG_RX_RNDV_##_is_exp, 1);
 
+#define ucp_worker_mpool_get(_worker) \
+    ({ \
+        ucp_mem_desc_t *rdesc = ucs_mpool_get_inline(&(_worker)->reg_mp); \
+        if (rdesc != NULL) { \
+            VALGRIND_MAKE_MEM_DEFINED(rdesc, sizeof(*rdesc)); \
+        } \
+        rdesc; \
+    })
+
 
 /**
- * UCP worker wake-up context.
+ * UCP worker iface, which encapsulates UCT iface, its attributes and
+ * some auxiliary info needed for tag matching offloads.
  */
-typedef struct ucp_worker_wakeup {
-    int                           wakeup_efd;     /* Allocated (on-demand) epoll fd for wakeup */
-    int                           wakeup_pipe[2]; /* Pipe to support signal() calls */
-    uct_wakeup_h                  *iface_wakeups; /* Array of interface wake-up handles */
-} ucp_worker_wakeup_t;
+typedef struct ucp_worker_iface {
+    uct_iface_h                   iface;         /* UCT interface */
+    uct_iface_attr_t              attr;          /* UCT interface attributes */
+    ucp_worker_h                  worker;        /* The parent worker */
+    ucs_queue_elem_t              queue;         /* Element in tm.offload_ifaces */
+    ucs_list_link_t               arm_list;      /* Element in arm_ifaces list */
+    ucp_rsc_index_t               rsc_index;     /* Resource index */
+    int                           event_fd;      /* Event FD, or -1 if undefined */
+    unsigned                      activate_count;/* How times this iface has been activated */
+    int                           on_arm_list;   /* Is the interface on arm_list */
+    int                           check_events_id;/* Callback id for check_events */
+    int                           proxy_am_count;/* Counts active messages on proxy handler */
+} ucp_worker_iface_t;
 
 
 /**
@@ -86,22 +127,31 @@ typedef struct ucp_worker {
     uint64_t                      uuid;          /* Unique ID for wireup */
     uct_worker_h                  uct;           /* UCT worker handle */
     ucs_mpool_t                   req_mp;        /* Memory pool for requests */
-    ucp_worker_wakeup_t           wakeup;        /* Wakeup-related context */
     uint64_t                      atomic_tls;    /* Which resources can be used for atomics */
 
     int                           inprogress;
     char                          name[UCP_WORKER_NAME_MAX]; /* Worker name */
 
-    unsigned                      stub_pend_count;/* Number of pending requests on stub endpoints*/
-    ucs_list_link_t               stub_ep_list;  /* List of stub endpoints to progress */
+    unsigned                      wireup_pend_count;/* Number of pending requests on wireup endpoints*/
 
+    unsigned                      flags;         /* Worker flags */
+    int                           epfd;          /* Allocated (on-demand) epoll fd for wakeup */
+    int                           eventfd;       /* Event fd to support signal() calls */
+    unsigned                      uct_events;    /* UCT arm events */
+    ucs_list_link_t               arm_ifaces;    /* List of interfaces to arm */
+
+    void                          *user_data;    /* User-defined data */
     khash_t(ucp_worker_ep_hash)   ep_hash;       /* Hash table of all endpoints */
-    uct_iface_h                   *ifaces;       /* Array of interfaces, one for each resource */
-    uct_iface_attr_t              *iface_attrs;  /* Array of interface attributes */
+    khash_t(ucp_ep_errh_hash)     ep_errh_hash;  /* Hash table of error handlers associated with endpoints */
+    ucp_worker_iface_t            *ifaces;       /* Array of interfaces, one for each resource */
+    ucs_mpool_t                   am_mp;         /* Memory pool for AM receives */
+    ucs_mpool_t                   reg_mp;        /* Registered memory pool */
+    ucp_mt_lock_t                 mt_lock;       /* Configuration of multi-threading support */
+
     UCS_STATS_NODE_DECLARE(stats);
+
     unsigned                      ep_config_max; /* Maximal number of configurations */
-    unsigned                      ep_config_count; /* Current number of configurations */
-    ucp_mt_lock_t                 mt_lock; /* All configurations about multithreading support */
+    unsigned                      ep_config_count;/* Current number of configurations */
     ucp_ep_config_t               ep_config[0];  /* Array of transport limits and thresholds */
 } ucp_worker_t;
 
@@ -113,12 +163,13 @@ ucp_request_t *ucp_worker_allocate_reply(ucp_worker_h worker, uint64_t dest_uuid
 unsigned ucp_worker_get_ep_config(ucp_worker_h worker,
                                   const ucp_ep_config_key_t *key);
 
-void ucp_worker_progress_stub_eps(void *arg);
+void ucp_worker_iface_progress_ep(ucp_worker_iface_t *wiface);
 
-void ucp_worker_stub_ep_add(ucp_worker_h worker, ucp_stub_ep_t *stub_ep);
+void ucp_worker_iface_unprogress_ep(ucp_worker_iface_t *wiface);
 
-void ucp_worker_stub_ep_remove(ucp_worker_h worker, ucp_stub_ep_t *stub_ep);
+void ucp_worker_signal_internal(ucp_worker_h worker);
 
+void ucp_worker_iface_activate(ucp_worker_iface_t *wiface);
 
 static inline const char* ucp_worker_get_name(ucp_worker_h worker)
 {
@@ -135,6 +186,14 @@ static inline ucp_ep_h ucp_worker_ep_find(ucp_worker_h worker, uint64_t dest_uui
     }
 
     return kh_value(&worker->ep_hash, hash_it);
+}
+
+static UCS_F_ALWAYS_INLINE
+uint64_t ucp_worker_is_tl_tag_offload(ucp_worker_h worker, ucp_rsc_index_t rsc_index)
+{
+    return (worker->ifaces[rsc_index].attr.cap.flags &
+            (UCT_IFACE_FLAG_TAG_EAGER_SHORT | UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+             UCT_IFACE_FLAG_TAG_EAGER_ZCOPY | UCT_IFACE_FLAG_TAG_RNDV_ZCOPY));
 }
 
 #endif

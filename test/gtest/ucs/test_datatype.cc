@@ -412,14 +412,14 @@ UCS_TEST_F(test_datatype, ptr_array_random) {
     /* Remove + insert */
     for (unsigned i = 0; i < count / 10; ++i) {
 
-        int remove_count = rand() % 10;
+        int remove_count = ucs::rand() % 10;
         for (int j = 0; j < remove_count; ++j) {
-            unsigned to_remove = rand() % map.size();
+            unsigned to_remove = ucs::rand() % map.size();
             std::map<int, void*>::iterator iter = map.begin();
             std::advance(iter, to_remove);
             unsigned index = iter->first;
 
-            void *ptr;
+            void *ptr = NULL;
             EXPECT_TRUE(ucs_ptr_array_lookup(&pa, index, ptr));
             EXPECT_EQ(ptr, map[index]);
             free(ptr);
@@ -430,7 +430,7 @@ UCS_TEST_F(test_datatype, ptr_array_random) {
             map.erase(index);
         }
 
-        int insert_count = rand() % 10;
+        int insert_count = ucs::rand() % 10;
         for (int j = 0; j < insert_count; ++j) {
             void *ptr = malloc(0);
             unsigned index = ucs_ptr_array_insert(&pa, ptr, &value);
@@ -516,7 +516,11 @@ UCS_TEST_F(test_datatype, ptr_array_perf) {
 
     EXPECT_LT(insert_ns, 1000.0);
     EXPECT_LT(remove_ns, 1000.0);
+#ifdef __x86_64__
     EXPECT_LT(lookup_ns, 15.0);
+#else
+    EXPECT_LT(lookup_ns, 100.0);
+#endif
 }
 
 UCS_TEST_F(test_datatype, ptr_status) {

@@ -11,6 +11,8 @@
 #include <ctype.h>
 #include <ucs/debug/log.h>
 #include <ucs/async/async.h>
+#include <ucs/sys/string.h>
+
 
 #define PRINT_CAP(_name, _cap_flags, _max) \
     if ((_cap_flags) & (UCT_IFACE_FLAG_##_name)) { \
@@ -94,14 +96,14 @@ static void print_iface_info(uct_worker_h worker, uct_md_h md,
     uct_iface_h iface;
     char buf[200] = {0};
     uct_iface_params_t iface_params = {
-        .tl_name     = resource->tl_name,
-        .dev_name    = resource->dev_name,
-        .stats_root  = NULL,
-        .rx_headroom = 0
+        .mode.device.tl_name   = resource->tl_name,
+        .mode.device.dev_name  = resource->dev_name,
+        .stats_root            = ucs_stats_get_root(),
+        .rx_headroom           = 0
     };
 
     UCS_CPU_ZERO(&iface_params.cpu_mask);
-    status = uct_iface_config_read(resource->tl_name, NULL, NULL, &iface_config);
+    status = uct_md_iface_config_read(md, resource->tl_name, NULL, NULL, &iface_config);
     if (status != UCS_OK) {
         return;
     }
@@ -123,7 +125,12 @@ static void print_iface_info(uct_worker_h worker, uct_md_h md,
         printf("#   < failed to query interface >\n");
     } else {
         printf("#            bandwidth: %-.2f MB/sec\n", iface_attr.bandwidth / UCS_MBYTE);
-        printf("#              latency: %-.0f nsec\n", iface_attr.latency * 1e9);
+        printf("#              latency: %-.0f nsec", iface_attr.latency.overhead * 1e9);
+        if (iface_attr.latency.growth > 0) {
+            printf(" + %.0f * N\n", iface_attr.latency.growth * 1e9);
+        } else {
+            printf("\n");
+        }
         printf("#             overhead: %-.0f nsec\n", iface_attr.overhead * 1e9);
 
         PRINT_CAP(PUT_SHORT, iface_attr.cap.flags, iface_attr.cap.put.max_short);
@@ -348,6 +355,9 @@ static void print_md_info(const char *md_name, int print_opts,
         }
         if (md_attr.cap.flags & UCT_MD_FLAG_NEED_MEMH) {
             printf("#           local memory handle is required for zcopy\n");
+        }
+        if (md_attr.cap.flags & UCT_MD_FLAG_SOCKADDR) {
+            printf("#           supports client-server connection establishment via sockaddr\n");
         }
     }
 

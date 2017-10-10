@@ -11,6 +11,7 @@ extern "C" {
 #include <ucs/arch/atomic.h>
 #include <ucs/async/async.h>
 #include <ucs/async/pipe.h>
+#include <ucs/sys/sys.h>
 }
 
 #include <sys/poll.h>
@@ -423,15 +424,15 @@ UCS_TEST_P(test_async, ctx_event) {
 UCS_TEST_P(test_async, ctx_timer) {
     local_timer lt(GetParam());
     suspend_and_poll(&lt, COUNT * 4);
-    EXPECT_GE(lt.count(), COUNT / 2);
+    EXPECT_GE(lt.count(), COUNT / 4);
 }
 
 UCS_TEST_P(test_async, two_timers) {
     local_timer lt1(GetParam());
     local_timer lt2(GetParam());
     suspend_and_poll2(&lt1, &lt2, COUNT * 4);
-    EXPECT_GE(lt1.count(), COUNT / 2);
-    EXPECT_GE(lt2.count(), COUNT / 2);
+    EXPECT_GE(lt1.count(), COUNT / 4);
+    EXPECT_GE(lt2.count(), COUNT / 4);
 }
 
 UCS_TEST_P(test_async, ctx_event_block) {
@@ -440,9 +441,9 @@ UCS_TEST_P(test_async, ctx_event_block) {
     le.block();
     le.push_event();
     suspend_and_poll(&le, COUNT);
+    EXPECT_EQ(0, le.count());
     le.unblock();
 
-    EXPECT_EQ(0, le.count());
     le.check_miss();
     EXPECT_GE(le.count(), 1);
 }
@@ -493,6 +494,35 @@ UCS_TEST_P(test_async, ctx_timer_block) {
     EXPECT_GE(lt.count(), 1); /* Timer could expire again after unblock */
 }
 
+UCS_TEST_P(test_async, modify_event) {
+    local_event le(GetParam());
+    int count;
+
+    le.push_event();
+    suspend_and_poll(&le, COUNT);
+    EXPECT_GE(le.count(), 1);
+
+    ucs_async_modify_handler(le.event_id(), 0);
+    sleep(1);
+    count = le.count();
+    le.push_event();
+    suspend_and_poll(&le, COUNT);
+    EXPECT_EQ(le.count(), count);
+
+    ucs_async_modify_handler(le.event_id(), POLLIN);
+    count = le.count();
+    le.push_event();
+    suspend_and_poll(&le, COUNT);
+    EXPECT_GT(le.count(), count);
+
+    ucs_async_modify_handler(le.event_id(), 0);
+    sleep(1);
+    count = le.count();
+    le.push_event();
+    suspend_and_poll(&le, COUNT);
+    EXPECT_EQ(le.count(), count);
+}
+
 class local_timer_remove_handler : public local_timer {
 public:
     local_timer_remove_handler(ucs_async_mode_t mode) : local_timer(mode) {
@@ -508,7 +538,11 @@ protected:
 UCS_TEST_P(test_async, timer_unset_from_handler) {
     local_timer_remove_handler lt(GetParam());
     suspend_and_poll(&lt, COUNT);
-    EXPECT_EQ(1, lt.count());
+    EXPECT_GE(lt.count(), 1);
+    EXPECT_LE(lt.count(), 5); /* timer could fire multiple times before we remove it */
+    int count = lt.count();
+    suspend_and_poll(&lt, COUNT);
+    EXPECT_EQ(count, lt.count());
 }
 
 class local_event_remove_handler : public local_event {

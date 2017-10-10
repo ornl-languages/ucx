@@ -8,14 +8,18 @@
 #ifndef UCS_TEST_HELPERS_H
 #define UCS_TEST_HELPERS_H
 
-#include <ucs/sys/preprocessor.h>
 #include "gtest.h"
+
+#include <ucs/sys/preprocessor.h>
+#include <ucs/sys/checker.h>
 #include <errno.h>
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
 #include <vector>
 #include <string>
+#include <algorithm>
+
 
 namespace ucs {
 
@@ -88,6 +92,11 @@ static std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
 
 std::ostream& operator<<(std::ostream& os, const std::vector<char>& vec);
 
+static inline int rand() {
+    /* coverity[dont_call] */
+    return ::rand();
+}
+
 template <typename OutputIterator>
 static void fill_random(OutputIterator begin, OutputIterator end) {
     for (OutputIterator iter = begin; iter != end; ++iter) {
@@ -151,6 +160,12 @@ std::string to_string(const T& value) {
 }
 
 template <typename T>
+T from_string(const std::string& str) {
+    T value;
+    return (std::stringstream(str) >> value).fail() ? 0 : value;
+}
+
+template <typename T>
 class ptr_vector_base {
 public:
     typedef std::vector<T*> vec_type;
@@ -204,7 +219,6 @@ protected:
     ptr_vector_base(const ptr_vector_base&);
     vec_type m_vec;
 
-private:
     void release(T *ptr) {
         delete ptr;
     }
@@ -221,6 +235,18 @@ public:
     T& at(size_t index) const {
         return *ptr_vector_base<T>::m_vec.at(index);
     }
+
+    size_t remove(T *value) {
+        const size_t removed = std::distance(std::remove(this->m_vec.begin(),
+                                                         this->m_vec.end(),
+                                                         value),
+                                             this->m_vec.end());
+        if (removed) {
+            this->m_vec.resize(this->m_vec.size() - removed);
+            this->release(value);
+        }
+        return removed;
+    }
 };
 
 template <>
@@ -231,20 +257,32 @@ class ptr_vector<void> : public ptr_vector_base<void> {
 /**
  * Safely wraps C handles
  */
-template <typename T>
+template <typename T, typename ArgT = void *>
 class handle {
 public:
     typedef T handle_type;
     typedef void (*dtor_t)(T handle);
+    typedef void (*dtor2_t)(T handle, ArgT arg);
 
-    handle() : m_initialized(false), m_value(NULL), m_dtor(NULL) {
+    handle() : m_initialized(false), m_value(NULL), m_dtor(NULL),
+               m_dtor_with_arg(NULL), m_dtor_arg(NULL) {
     }
 
-    handle(const T& value, dtor_t dtor) : m_initialized(true), m_value(value), m_dtor(dtor) {
-        ucs_assert(value != NULL);
+    handle(const T& value, dtor_t dtor) : m_initialized(true), m_value(value),
+                                          m_dtor(dtor), m_dtor_with_arg(NULL),
+                                          m_dtor_arg(NULL) {
+        EXPECT_TRUE(value != NULL);
     }
 
-    handle(const handle& other) : m_initialized(false), m_value(NULL), m_dtor(NULL) {
+    handle(const T& value, dtor2_t dtor, ArgT *arg) :
+        m_initialized(true), m_value(value), m_dtor(NULL),
+        m_dtor_with_arg(dtor), m_dtor_arg(arg)
+    {
+        EXPECT_TRUE(value != NULL);
+    }
+
+    handle(const handle& other) : m_initialized(false), m_value(NULL), m_dtor(NULL),
+                                  m_dtor_with_arg(NULL), m_dtor_arg(NULL) {
         *this = other;
     }
 
@@ -269,13 +307,31 @@ public:
         }
         m_value = value;
         m_dtor  = dtor;
-        m_initialized = true;
+        m_dtor_with_arg = NULL;
+        m_dtor_arg      = NULL;
+        m_initialized   = true;
+    }
+
+    void reset(const T& value, dtor2_t dtor, ArgT arg) {
+        reset();
+        if (value == NULL) {
+            throw std::invalid_argument("value cannot be NULL");
+        }
+        m_value = value;
+        m_dtor  = NULL;
+        m_dtor_with_arg = dtor;
+        m_dtor_arg      = arg;
+        m_initialized   = true;
     }
 
     const handle& operator=(const handle& other) {
         reset();
         if (other.m_initialized) {
-            reset(other.m_value, other.m_dtor);
+            if (other.m_dtor) {
+                reset(other.m_value, other.m_dtor);
+            } else {
+                reset(other.m_value, other.m_dtor_with_arg, other.m_dtor_arg);
+            }
             other.revoke();
         }
         return *this;
@@ -296,13 +352,20 @@ public:
 private:
 
     void release() {
-        m_dtor(m_value);
+        if (m_dtor) {
+            m_dtor(m_value);
+        } else {
+            m_dtor_with_arg(m_value, m_dtor_arg);
+        }
+
         m_initialized = false;
     }
 
     mutable bool   m_initialized;
     T              m_value;
     dtor_t         m_dtor;
+    dtor2_t        m_dtor_with_arg;
+    ArgT           m_dtor_arg;
 };
 
 #define UCS_TEST_CREATE_HANDLE(_t, _handle, _dtor, _ctor, ...) \
@@ -358,22 +421,44 @@ public:
     ~message_stream();
 
     template <typename T>
-    std::ostream& operator<<(const T& value) const {
-        return std::cout << value;
+    message_stream& operator<<(const T& value) {
+        msg << value;
+        return *this;
+    }
+
+    message_stream& operator<< (std::ostream&(*f)(std::ostream&)) {
+        if (f == (std::basic_ostream<char>& (*)(std::basic_ostream<char>&)) &std::flush) {
+            std::string s = msg.str();
+            if (!s.empty()) {
+                std::cout << s << std::flush;
+                msg.str("");
+            }
+            msg.clear();
+        } else {
+            msg << f;
+        }
+        return *this;
     }
 
     std::iostream::fmtflags flags() {
-        return std::cout.flags();
+        return msg.flags();
     }
 
     void flags(std::iostream::fmtflags f) {
-        std::cout.flags(f);
+        msg.flags(f);
     }
+private:
+    std::ostringstream msg;
 };
 
 } // detail
 
 } // ucs
+
+
+#ifndef UINT16_MAX
+#define UINT16_MAX (65535)
+#endif /* UINT16_MAX */
 
 
 /* Test output */
@@ -403,18 +488,25 @@ public:
 
 
 /* UCS error check */
-#define EXPECT_UCS_OK(_error)  EXPECT_EQ(UCS_OK, _error) << "Error: " << ucs_status_string(_error)
-#define ASSERT_UCS_OK(_error, ...) \
+#define EXPECT_UCS_OK(_expr) \
     do { \
-        if ((_error) != UCS_OK) { \
-            UCS_TEST_ABORT("Error: " << ucs_status_string(_error)  __VA_ARGS__); \
+        ucs_status_t _status = (_expr); \
+        EXPECT_EQ(UCS_OK, _status) << "Error: " << ucs_status_string(_status); \
+    } while (0)
+
+#define ASSERT_UCS_OK(_expr, ...) \
+    do { \
+        ucs_status_t _status = (_expr); \
+        if ((_status) != UCS_OK) { \
+            UCS_TEST_ABORT("Error: " << ucs_status_string(_status)  __VA_ARGS__); \
         } \
     } while (0)
 
-#define ASSERT_UCS_OK_OR_INPROGRESS(_error) \
+#define ASSERT_UCS_OK_OR_INPROGRESS(_expr) \
     do { \
-        if ((_error) != UCS_OK && (_error) != UCS_INPROGRESS) { \
-            UCS_TEST_ABORT("Error: " << ucs_status_string(_error)); \
+        ucs_status_t _status = (_expr); \
+        if ((status) != UCS_OK && (_status) != UCS_INPROGRESS) { \
+            UCS_TEST_ABORT("Error: " << ucs_status_string(_status)); \
         } \
     } while (0)
 
@@ -485,7 +577,7 @@ public:
         ucp_dt_iov_t _name_iov[_iovcnt]; \
         const size_t _name_iovcnt = _iovcnt; \
         const size_t _name_iov##_length = (_buffer_length > _name_iovcnt) ? \
-                                           rand() % (_buffer_length / _name_iovcnt) : 0; \
+                                           ucs::rand() % (_buffer_length / _name_iovcnt) : 0; \
         size_t _name_iov##_length_it = 0; \
         for (size_t iov_it = 0; iov_it < _name_iovcnt; ++iov_it) { \
             _name_iov[iov_it].buffer = (char *)(_buffer_ptr) + _name_iov##_length_it; \

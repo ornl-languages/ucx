@@ -10,8 +10,6 @@
 #include "uct_iface.h"
 
 #include <uct/api/uct.h>
-#include <ucs/datastruct/callbackq.h>
-#include <ucs/debug/memtrack.h>
 #include <ucs/type/component.h>
 #include <ucs/config/parser.h>
 
@@ -26,6 +24,9 @@ struct uct_md_component {
 
     ucs_status_t           (*rkey_unpack)(uct_md_component_t *mdc, const void *rkey_buffer,
                                           uct_rkey_t *rkey_p, void **handle_p);
+
+    ucs_status_t           (*rkey_ptr)(uct_md_component_t *mdc, uct_rkey_t rkey, void *handle,
+                                       uint64_t raddr, void **laddr_p);
 
     ucs_status_t           (*rkey_release)(uct_md_component_t *mdc, uct_rkey_t rkey,
                                            void *handle);
@@ -45,6 +46,9 @@ struct uct_md_component {
  * Specific MDs extend this structure.
  */
 struct uct_md_config {
+#ifdef __cplusplus
+    char __dummy;
+#endif
 };
 
 
@@ -83,6 +87,7 @@ typedef struct uct_md_registered_tl {
         .md_config_size  = sizeof(_cfg_struct), \
         .priv            = _priv, \
         .rkey_unpack     = _rkey_unpack, \
+        .rkey_ptr        = ucs_empty_function_return_unsupported, \
         .rkey_release    = _rkey_release, \
         .name            = _name, \
         .tl_list         = { &_mdc.tl_list, &_mdc.tl_list } \
@@ -119,6 +124,8 @@ struct uct_md_ops {
                               unsigned flags, uct_mem_h *memh_p UCS_MEMTRACK_ARG);
 
     ucs_status_t (*mem_free)(uct_md_h md, uct_mem_h memh);
+    ucs_status_t (*mem_advise)(uct_md_h md, uct_mem_h memh, void *addr,
+                               size_t length, unsigned advice);
 
     ucs_status_t (*mem_reg)(uct_md_h md, void *address, size_t length,
                             unsigned flags, uct_mem_h *memh_p);
@@ -126,6 +133,9 @@ struct uct_md_ops {
     ucs_status_t (*mem_dereg)(uct_md_h md, uct_mem_h memh);
 
     ucs_status_t (*mkey_pack)(uct_md_h md, uct_mem_h memh, void *rkey_buffer);
+
+    int          (*is_sockaddr_accessible)(uct_md_h md, const ucs_sock_addr_t *sockaddr,
+                                           uct_sockaddr_accessibility_t mode);
 };
 
 
@@ -138,24 +148,12 @@ struct uct_md {
 };
 
 
-/**
- * Transport-specific data on a worker
- */
-typedef struct uct_worker_tl_data {
-    ucs_list_link_t        list;
-    uint32_t               refcount;
-    uint32_t               key;
-    void                   *ptr;
-} uct_worker_tl_data_t;
-
-
-typedef struct uct_worker uct_worker_t;
-struct uct_worker {
-    ucs_async_context_t    *async;
-    ucs_callbackq_t        progress_q;
-    ucs_thread_mode_t      thread_mode;
-    ucs_list_link_t        tl_data;
-};
+static UCS_F_ALWAYS_INLINE void*
+uct_md_fill_md_name(uct_md_h md, void *buffer)
+{
+    memcpy(buffer, md->component->name, UCT_MD_COMPONENT_NAME_MAX);
+    return (char*)buffer + UCT_MD_COMPONENT_NAME_MAX;
+}
 
 
 ucs_status_t uct_single_md_resource(uct_md_component_t *mdc,
@@ -170,42 +168,6 @@ ucs_status_t uct_single_md_resource(uct_md_component_t *mdc,
 ucs_status_t uct_md_stub_rkey_unpack(uct_md_component_t *mdc,
                                      const void *rkey_buffer, uct_rkey_t *rkey_p,
                                      void **handle_p);
-
-
-#define uct_worker_tl_data_get(_worker, _key, _type, _cmp_fn, _init_fn, ...) \
-    ({ \
-        uct_worker_tl_data_t *data; \
-        \
-        ucs_list_for_each(data, &(_worker)->tl_data, list) { \
-            if ((data->key == (_key)) && _cmp_fn(ucs_derived_of(data, _type), \
-                                                 ## __VA_ARGS__)) \
-            { \
-                ++data->refcount; \
-                break; \
-            } \
-        } \
-        \
-        if (&data->list == &(_worker)->tl_data) { \
-            data = ucs_malloc(sizeof(_type), UCS_PP_QUOTE(_type)); \
-            if (data != NULL) { \
-                data->key      = (_key); \
-                data->refcount = 1; \
-                _init_fn(ucs_derived_of(data, _type), ## __VA_ARGS__); \
-                ucs_list_add_tail(&(_worker)->tl_data, &data->list); \
-            } \
-        } \
-        ucs_derived_of(data, _type); \
-    })
-
-#define uct_worker_tl_data_put(_data, _cleanup_fn, ...) \
-    { \
-        uct_worker_tl_data_t *data = (uct_worker_tl_data_t*)(_data); \
-        if (--data->refcount == 0) { \
-            ucs_list_del(&data->list); \
-            _cleanup_fn((_data), ## __VA_ARGS__); \
-            ucs_free(data); \
-        } \
-    }
 
 
 extern ucs_list_link_t uct_md_components_list;

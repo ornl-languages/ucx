@@ -8,7 +8,7 @@
 #ifndef UCS_ARCH_CPU_H
 #define UCS_ARCH_CPU_H
 
-#include <ucs/sys/math.h>
+#include <ucs/sys/compiler_def.h>
 
 
 /* CPU models */
@@ -21,6 +21,7 @@ typedef enum ucs_cpu_model {
     UCS_CPU_MODEL_ARM_AARCH64,
     UCS_CPU_MODEL_LAST
 } ucs_cpu_model_t;
+
 
 /* CPU flags */
 typedef enum ucs_cpu_flag {
@@ -38,9 +39,11 @@ typedef enum ucs_cpu_flag {
     UCS_CPU_FLAG_AVX2       = UCS_BIT(10)
 } ucs_cpu_flag_t;
 
+
 /* System constants */
 #define UCS_SYS_POINTER_SIZE       (sizeof(void*))
 #define UCS_SYS_PARAGRAPH_SIZE     16
+#define UCS_SYS_PCI_MAX_PAYLOAD    512
 
 
 #if defined(__x86_64__)

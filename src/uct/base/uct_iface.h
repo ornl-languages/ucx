@@ -7,8 +7,9 @@
 #ifndef UCT_IFACE_H_
 #define UCT_IFACE_H_
 
+#include "uct_worker.h"
+
 #include <uct/api/uct.h>
-#include <uct/base/addr.h>
 #include <ucs/config/parser.h>
 #include <ucs/datastruct/mpool.h>
 #include <ucs/datastruct/queue.h>
@@ -90,6 +91,16 @@ enum {
 
 
 /**
+ * Check the condition and return status as a pointer if not true.
+ */
+#define UCT_CHECK_PARAM_PTR(_condition, _err_message, ...) \
+    if (ENABLE_PARAMS_CHECK && !(_condition)) { \
+        ucs_error(_err_message, ## __VA_ARGS__); \
+        return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM); \
+    }
+
+
+/**
  * Check the size of the IOV array
  */
 #define UCT_CHECK_IOV_SIZE(_iovcnt, _max_iov, _name) \
@@ -101,10 +112,16 @@ enum {
 /**
  * In debug mode, if _condition is not true, generate 'Invalid length' error.
  */
-#define UCT_CHECK_LENGTH(_length, _max_length, _name) \
-    UCT_CHECK_PARAM((_length) <= (_max_length), \
-                    "Invalid %s length: %zu (expected: <= %zu)", \
-                    _name, (size_t)(_length), (size_t)(_max_length))
+#define UCT_CHECK_LENGTH(_length, _min_length, _max_length, _name) \
+    { \
+        typeof(_length) __length = _length; \
+        UCT_CHECK_PARAM((_length) <= (_max_length), \
+                        "Invalid %s length: %zu (expected: <= %zu)", \
+                        _name, (size_t)(__length), (size_t)(_max_length)); \
+        UCT_CHECK_PARAM((ssize_t)(_length) >= (_min_length), \
+                        "Invalid %s length: %zu (expected: >= %zu)", \
+                        _name, (size_t)(__length), (size_t)(_min_length)); \
+    }
 
 /**
  * Skip if this is a zero-length operation.
@@ -146,27 +163,21 @@ typedef struct uct_am_handler {
 
 
 /**
- * Wakeup event handle item
- */
-typedef struct uct_wakeup {
-    uct_iface_h                 iface;
-    enum uct_wakeup_event_types events;
-    int                         fd;
-} uct_wakeup_t;
-
-
-/**
  * Base structure of all interfaces.
  * Includes the AM table which we don't want to expose.
  */
 typedef struct uct_base_iface {
-    uct_iface_t       super;
-    uct_md_h          md;                    /* MD this interface is using */
-    uct_worker_h      worker;                /* Worker this interface is on */
-    UCS_STATS_NODE_DECLARE(stats);           /* Statistics */
-    uct_am_handler_t  am[UCT_AM_ID_MAX];     /* Active message table */
-    uct_am_tracer_t   am_tracer;             /* Active message tracer */
-    void              *am_tracer_arg;        /* Tracer argument */
+    uct_iface_t             super;
+    uct_md_h                md;               /* MD this interface is using */
+    uct_priv_worker_t       *worker;          /* Worker this interface is on */
+    uct_am_handler_t        am[UCT_AM_ID_MAX];/* Active message table */
+    uct_am_tracer_t         am_tracer;        /* Active message tracer */
+    void                    *am_tracer_arg;   /* Tracer argument */
+    uct_error_handler_t     err_handler;      /* Error handler */
+    void                    *err_handler_arg; /* Error handler argument */
+    uct_worker_progress_t   prog;             /* Will be removed once all transports
+                                                 support progress control */
+    unsigned                progress_flags;   /* Which progress is currently enabled */
 
     struct {
         unsigned            num_alloc_methods;
@@ -174,10 +185,12 @@ typedef struct uct_base_iface {
         ucs_log_level_t     failure_level;
     } config;
 
+    UCS_STATS_NODE_DECLARE(stats);           /* Statistics */
 } uct_base_iface_t;
+
 UCS_CLASS_DECLARE(uct_base_iface_t, uct_iface_ops_t*,  uct_md_h, uct_worker_h,
-                  const uct_iface_config_t* UCS_STATS_ARG(ucs_stats_node_t*)
-                  UCS_STATS_ARG(const char*));
+                  const uct_iface_params_t*, const uct_iface_config_t*
+                  UCS_STATS_ARG(ucs_stats_node_t*) UCS_STATS_ARG(const char*));
 
 
 /**
@@ -461,24 +474,43 @@ void uct_iface_mpool_empty_warn(uct_base_iface_t *iface, ucs_mpool_t *mp);
 
 void uct_set_ep_failed(ucs_class_t* cls, uct_ep_h tl_ep, uct_iface_h tl_iface);
 
-/**
+ucs_status_t uct_base_iface_flush(uct_iface_h tl_iface, unsigned flags,
+                                  uct_completion_t *comp);
+
+ucs_status_t uct_base_iface_fence(uct_iface_h tl_iface, unsigned flags);
+
+void uct_base_iface_progress_enable(uct_iface_h tl_iface, unsigned flags);
+
+void uct_base_iface_progress_disable(uct_iface_h tl_iface, unsigned flags);
+
+ucs_status_t uct_base_ep_flush(uct_ep_h tl_ep, unsigned flags,
+                               uct_completion_t *comp);
+
+ucs_status_t uct_base_ep_fence(uct_ep_h tl_ep, unsigned flags);
+
+/*
  * Invoke active message handler.
  *
  * @param iface    Interface to invoke the handler for.
  * @param id       Active message ID.
  * @param data     Received data.
  * @param length   Length of received data.
- * @param desc     Receive descriptor, as passed to user callback.
+ * @param flags    Mask with @ref uct_cb_param_flags
  */
 static inline ucs_status_t
 uct_iface_invoke_am(uct_base_iface_t *iface, uint8_t id, void *data,
-                    unsigned length, void *desc)
+                    unsigned length, unsigned flags)
 {
+    ucs_status_t     status;
     uct_am_handler_t *handler = &iface->am[id];
+
     ucs_assert(id < UCT_AM_ID_MAX);
     UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_IFACE_STAT_RX_AM, 1);
     UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_IFACE_STAT_RX_AM_BYTES, length);
-    return handler->cb(handler->arg, data, length, desc);
+    status = handler->cb(handler->arg, data, length, flags);
+    ucs_assert((status == UCS_OK) ||
+               ((status == UCS_INPROGRESS) && (flags & UCT_CB_PARAM_FLAG_DESC)));
+    return status;
 }
 
 
@@ -522,6 +554,5 @@ size_t uct_iov_total_length(const uct_iov_t *iov, size_t iovcnt)
 
     return total_length;
 }
-
 
 #endif

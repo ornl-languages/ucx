@@ -1,6 +1,6 @@
 #
 # Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-# Copyright (c) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
+# Copyright (c) UT-Battelle, LLC. 2014-2017. ALL RIGHTS RESERVED.
 # Copyright (c) The University of Tennesse and the University of Tennessee
 #               Research Foundation. 2016.  ALL RIGHTS RESERVED.
 # See file LICENSE for terms.
@@ -8,9 +8,9 @@
 
 lib_LTLIBRARIES     = libuct.la
 
-libuct_la_CFLAGS   =
+libuct_la_CFLAGS   = $(BASE_CFLAGS)
 libuct_la_LIBS     =
-libuct_la_CPPFLAGS = -I$(abs_top_srcdir)/src -I$(abs_top_builddir)/src 
+libuct_la_CPPFLAGS = $(BASE_CPPFLAGS) -I$(abs_top_srcdir)/src -I$(abs_top_builddir)/src 
 libuct_la_LDFLAGS  = -ldl -version-info $(SOVERSION)
 libuct_la_LIBADD   = $(LIBM) ../ucs/libucs.la
 libuct_ladir       = $(includedir)/uct
@@ -22,20 +22,22 @@ nobase_dist_libuct_la_HEADERS = \
 	api/version.h
 
 noinst_HEADERS = \
-	base/addr.h \
 	base/uct_md.h \
 	base/uct_iface.h \
 	base/uct_log.h \
+	base/uct_worker.h \
 	tcp/tcp.h
 
 libuct_la_SOURCES = \
 	base/uct_md.c \
 	base/uct_mem.c \
 	base/uct_iface.c \
+	base/uct_worker.c \
 	tcp/tcp_ep.c \
 	tcp/tcp_iface.c \
 	tcp/tcp_md.c \
-	tcp/tcp_net.c
+	tcp/tcp_net.c \
+	tcp/tcp_recv.c
 
 if HAVE_IB
 libuct_la_CPPFLAGS += $(IBVERBS_CPPFLAGS)
@@ -43,7 +45,6 @@ libuct_la_LDFLAGS +=  $(IBVERBS_LDFLAGS) $(NUMA_LIBS) -lpthread
 noinst_HEADERS += \
 	ib/base/ib_device.h \
 	ib/base/ib_iface.h \
-	ib/base/ib_instr.h \
 	ib/base/ib_log.h \
 	ib/base/ib_md.h \
 	ib/base/ib_verbs.h
@@ -58,7 +59,7 @@ if HAVE_MLX5_HW
 libuct_la_SOURCES += \
 	ib/mlx5/ib_mlx5_log.c \
 	ib/mlx5/ib_mlx5.c
-	
+
 noinst_HEADERS += \
 	ib/mlx5/ib_mlx5_log.h \
 	ib/mlx5/ib_mlx5.h \
@@ -112,7 +113,7 @@ libuct_la_SOURCES += \
 	ib/dc/accel/dc_mlx5.c
 endif
 endif
-				  
+
 if HAVE_TL_UD
 libuct_la_SOURCES += \
 	ib/ud/base/ud_iface.c \
@@ -148,6 +149,16 @@ noinst_HEADERS += \
 	ib/cm/cm.h
 endif
 
+if HAVE_RDMACM
+libuct_la_CPPFLAGS += $(RDMACM_CPPFLAGS)
+libuct_la_LDFLAGS  += $(RDMACM_LDFLAGS) $(RDMACM_LIBS)
+libuct_la_SOURCES  += \
+	ib/rdmacm/rdmacm_md.c
+
+noinst_HEADERS += \
+	ib/rdmacm/rdmacm_md.h
+endif
+
 endif
 
 if HAVE_CRAY_UGNI 
@@ -156,6 +167,8 @@ libuct_la_LDFLAGS  += $(CRAY_UGNI_LIBS)
 libuct_la_LIBS     += $(CRAY_UGNI_LIBS)
 
 noinst_HEADERS += \
+    ugni/base/ugni_def.h \
+    ugni/base/ugni_types.h \
     ugni/base/ugni_md.h \
     ugni/base/ugni_device.h \
     ugni/base/ugni_iface.h \
@@ -190,6 +203,20 @@ libuct_la_SOURCES += \
     cuda/cuda_md.c \
     cuda/cuda_iface.c \
     cuda/cuda_ep.c
+endif
+
+if HAVE_ROCM
+noinst_HEADERS += \
+    rocm/rocm_cma_md.h \
+    rocm/rocm_cma_iface.h \
+    rocm/rocm_cma_ep.h \
+    rocm/rocm_common.h
+
+libuct_la_SOURCES += \
+    rocm/rocm_cma_md.c \
+    rocm/rocm_cma_iface.c \
+    rocm/rocm_cma_ep.c \
+    rocm/rocm_common.c
 endif
 
 # FIXME these should be done conditionally
@@ -243,6 +270,7 @@ libuct_la_SOURCES += \
 	sm/knem/knem_iface.c \
 	sm/knem/knem_ep.c \
 	sm/knem/knem_md.c
+endif
 
 #Loopback interface (self)
 noinst_HEADERS += \
@@ -254,5 +282,3 @@ libuct_la_SOURCES += \
 	sm/self/self_md.c \
 	sm/self/self_iface.c \
 	sm/self/self_ep.c
-
-endif

@@ -8,6 +8,7 @@
 
 extern "C" {
 #include <ucs/stats/stats.h>
+#include <ucs/sys/string.h>
 }
 #include <common/test_helpers.h>
 #include <algorithm>
@@ -27,12 +28,19 @@ std::string resource::name() const {
 
 uct_test::uct_test() {
     ucs_status_t status;
-    status = uct_iface_config_read(GetParam()->tl_name.c_str(), NULL, NULL,
-                                   &m_iface_config);
-    ASSERT_UCS_OK(status);
+    uct_md_h pd;
+
     status = uct_md_config_read(GetParam()->md_name.c_str(), NULL, NULL,
                                 &m_md_config);
     ASSERT_UCS_OK(status);
+
+    status = uct_md_open(GetParam()->md_name.c_str(), m_md_config, &pd);
+    ASSERT_UCS_OK(status);
+
+    status = uct_md_iface_config_read(pd, GetParam()->tl_name.c_str(), NULL,
+                                      NULL, &m_iface_config);
+    ASSERT_UCS_OK(status);
+    uct_md_close(pd);
 }
 
 uct_test::~uct_test() {
@@ -102,26 +110,31 @@ void uct_test::cleanup() {
     m_entities.clear();
 }
 
+bool uct_test::is_caps_supported(uint64_t required_flags) {
+    bool ret = true;
+
+    FOR_EACH_ENTITY(iter) {
+        ret &= (*iter)->is_caps_supported(required_flags);
+    }
+
+    return ret;
+}
+
 void uct_test::check_caps(uint64_t required_flags, uint64_t invalid_flags) {
     FOR_EACH_ENTITY(iter) {
-        uint64_t iface_flags = (*iter)->iface_attr().cap.flags;
-        if (!ucs_test_all_flags(iface_flags, required_flags)) {
-            UCS_TEST_SKIP_R("unsupported");
-        }
-        if (iface_flags & invalid_flags) {
-            UCS_TEST_SKIP_R("unsupported");
-        }
+        (*iter)->check_caps(required_flags, invalid_flags);
     }
 }
 
-void uct_test::modify_config(const std::string& name, const std::string& value) {
+void uct_test::modify_config(const std::string& name, const std::string& value,
+                             bool optional) {
     ucs_status_t status;
-    status = uct_config_modify(m_iface_config, name.c_str(), value.c_str());
 
+    status = uct_config_modify(m_iface_config, name.c_str(), value.c_str());
     if (status == UCS_ERR_NO_ELEM) {
         status = uct_config_modify(m_md_config, name.c_str(), value.c_str());
         if (status == UCS_ERR_NO_ELEM) {
-            test_base::modify_config(name, value);
+            test_base::modify_config(name, value, optional);
         } else if (status != UCS_OK) {
             UCS_TEST_ABORT("Couldn't modify pd config parameter: " << name.c_str() <<
                            " to " << value.c_str() << ": " << ucs_status_string(status));
@@ -131,6 +144,23 @@ void uct_test::modify_config(const std::string& name, const std::string& value) 
         UCS_TEST_ABORT("Couldn't modify iface config parameter: " << name.c_str() <<
                        " to " << value.c_str() << ": " << ucs_status_string(status));
     }
+}
+
+bool uct_test::get_config(const std::string& name, std::string& value) const
+{
+    ucs_status_t status;
+    const size_t max = 1024;
+
+    value.resize(max);
+    status = uct_config_get(m_iface_config, name.c_str(),
+                            const_cast<char *>(value.c_str()), max);
+
+    if (status == UCS_ERR_NO_ELEM) {
+        status = uct_config_get(m_md_config, name.c_str(),
+                                const_cast<char *>(value.c_str()), max);
+    }
+
+    return (status == UCS_OK);
 }
 
 void uct_test::stats_activate()
@@ -151,7 +181,17 @@ void uct_test::stats_restore()
 }
 
 uct_test::entity* uct_test::create_entity(size_t rx_headroom) {
-    entity *new_ent = new entity(*GetParam(), m_iface_config, rx_headroom,
+    uct_iface_params_t iface_params;
+
+    memset(&iface_params, 0, sizeof(iface_params));
+    iface_params.rx_headroom = rx_headroom;
+    entity *new_ent = new entity(*GetParam(), m_iface_config, &iface_params,
+                                 m_md_config);
+    return new_ent;
+}
+
+uct_test::entity* uct_test::create_entity(uct_iface_params_t &params) {
+    entity *new_ent = new entity(*GetParam(), m_iface_config, &params,
                                  m_md_config);
     return new_ent;
 }
@@ -160,13 +200,15 @@ const uct_test::entity& uct_test::ent(unsigned index) const {
     return m_entities.at(index);
 }
 
-void uct_test::progress() const {
+unsigned uct_test::progress() const {
+    unsigned count = 0;
     FOR_EACH_ENTITY(iter) {
-        (*iter)->progress();
+        count += (*iter)->progress();
     }
+    return count;
 }
 
-void uct_test::flush() const {
+void uct_test::flush(ucs_time_t deadline) const {
 
     bool flushed;
     do {
@@ -180,7 +222,9 @@ void uct_test::flush() const {
                 ASSERT_UCS_OK(status);
             }
         }
-    } while (!flushed);
+    } while (!flushed && (ucs_get_time() < deadline));
+
+    EXPECT_TRUE(flushed) << "Timed out";
 }
 
 void uct_test::short_progress_loop(double delay_ms) const {
@@ -190,18 +234,7 @@ void uct_test::short_progress_loop(double delay_ms) const {
     }
 }
 
-void uct_test::wait_for_flag(volatile unsigned *flag, double timeout)
-{
-    ucs_time_t loop_end_limit;
-
-    loop_end_limit = ucs_get_time() + ucs_time_from_sec(timeout);
-
-    while ((ucs_get_time() < loop_end_limit) && (!(*flag))) {
-        short_progress_loop();
-    }
-}
-
-void uct_test::twait(int delta_ms) {
+void uct_test::twait(int delta_ms) const {
     ucs_time_t now, t1, t2;
     int left;
 
@@ -216,16 +249,14 @@ void uct_test::twait(int delta_ms) {
 }
 
 uct_test::entity::entity(const resource& resource, uct_iface_config_t *iface_config,
-                         size_t rx_headroom, uct_md_config_t *md_config) {
+                         uct_iface_params_t *params, uct_md_config_t *md_config) {
+
     ucs_status_t status;
 
-    uct_iface_params_t iface_params;
-
-    iface_params.tl_name     = const_cast<char*>(resource.tl_name.c_str());
-    iface_params.dev_name    = const_cast<char*>(resource.dev_name.c_str());
-    iface_params.stats_root  = NULL;
-    iface_params.rx_headroom = rx_headroom;
-    UCS_CPU_ZERO(&iface_params.cpu_mask);
+    params->mode.device.tl_name    = const_cast<char*>(resource.tl_name.c_str());
+    params->mode.device.dev_name   = const_cast<char*>(resource.dev_name.c_str());
+    params->stats_root = ucs_stats_get_root();
+    UCS_CPU_ZERO(&params->cpu_mask);
 
     UCS_TEST_CREATE_HANDLE(uct_worker_h, m_worker, uct_worker_destroy,
                            uct_worker_create, &m_async.m_async, UCS_THREAD_MODE_MULTI /* TODO */);
@@ -237,7 +268,7 @@ uct_test::entity::entity(const resource& resource, uct_iface_config_t *iface_con
     ASSERT_UCS_OK(status);
 
     UCS_TEST_CREATE_HANDLE(uct_iface_h, m_iface, uct_iface_close,
-                           uct_iface_open, m_md, m_worker, &iface_params, iface_config);
+                           uct_iface_open, m_md, m_worker, params, iface_config);
 
     status = uct_iface_query(m_iface, &m_iface_attr);
     ASSERT_UCS_OK(status);
@@ -251,7 +282,8 @@ void uct_test::entity::mem_alloc(size_t length, uct_allocated_memory_t *mem,
     void *rkey_buffer;
 
     if (md_attr().cap.flags & (UCT_MD_FLAG_ALLOC|UCT_MD_FLAG_REG)) {
-        status = uct_iface_mem_alloc(m_iface, length, 0, alloc_name, mem);
+        status = uct_iface_mem_alloc(m_iface, length, UCT_MD_MEM_ACCESS_ALL,
+                                     alloc_name, mem);
         ASSERT_UCS_OK(status);
 
         rkey_buffer = malloc(md_attr().rkey_packed_size);
@@ -265,10 +297,12 @@ void uct_test::entity::mem_alloc(size_t length, uct_allocated_memory_t *mem,
         free(rkey_buffer);
     } else {
         uct_alloc_method_t method = UCT_ALLOC_METHOD_MMAP;
-        status = uct_mem_alloc(length, 0, &method, 1, NULL, 0, alloc_name, mem);
+        status = uct_mem_alloc(NULL, length, UCT_MD_MEM_ACCESS_ALL,
+                               &method, 1, NULL, 0, alloc_name,
+                               mem);
         ASSERT_UCS_OK(status);
 
-        ucs_assert(mem->memh == UCT_INVALID_MEM_HANDLE);
+        ucs_assert(mem->memh == UCT_MEM_HANDLE_NULL);
 
         rkey_bundle->rkey   = UCT_INVALID_RKEY;
         rkey_bundle->handle = NULL;
@@ -289,9 +323,27 @@ void uct_test::entity::mem_free(const uct_allocated_memory_t *mem,
     }
 }
 
-void uct_test::entity::progress() const {
-    uct_worker_progress(m_worker);
+unsigned uct_test::entity::progress() const {
+    unsigned count = uct_worker_progress(m_worker);
     m_async.check_miss();
+    return count;
+}
+
+bool uct_test::entity::is_caps_supported(uint64_t required_flags) {
+    uint64_t iface_flags = iface_attr().cap.flags;
+    return ucs_test_all_flags(iface_flags, required_flags);
+}
+
+void uct_test::entity::check_caps(uint64_t required_flags,
+                                  uint64_t invalid_flags)
+{
+    uint64_t iface_flags = iface_attr().cap.flags;
+    if (!ucs_test_all_flags(iface_flags, required_flags)) {
+        UCS_TEST_SKIP_R("unsupported");
+    }
+    if (iface_flags & invalid_flags) {
+        UCS_TEST_SKIP_R("unsupported");
+    }
 }
 
 uct_md_h uct_test::entity::md() const {
@@ -455,7 +507,7 @@ void uct_test::entity::connect(unsigned index, entity& other,
 void uct_test::entity::flush() const {
     ucs_status_t status;
     do {
-        uct_worker_progress(m_worker);
+        progress();
         status = uct_iface_flush(m_iface, 0, NULL);
     } while (status == UCS_INPROGRESS);
     ASSERT_UCS_OK(status);
@@ -479,7 +531,7 @@ uct_test::mapped_buffer::mapped_buffer(size_t size, uint64_t seed,
         m_mem.method  = UCT_ALLOC_METHOD_LAST;
         m_mem.address = NULL;
         m_mem.md      = NULL;
-        m_mem.memh    = UCT_INVALID_MEM_HANDLE;
+        m_mem.memh    = UCT_MEM_HANDLE_NULL;
         m_mem.length  = 0;
         m_buf         = NULL;
         m_end         = NULL;
@@ -487,6 +539,11 @@ uct_test::mapped_buffer::mapped_buffer(size_t size, uint64_t seed,
         m_rkey.handle = NULL;
         m_rkey.type   = NULL;
     }
+    m_iov.buffer = ptr();
+    m_iov.length = length();
+    m_iov.count  = 1;
+    m_iov.stride = 0;
+    m_iov.memh   = memh();
 }
 
 uct_test::mapped_buffer::~mapped_buffer() {
@@ -578,6 +635,10 @@ uct_rkey_t uct_test::mapped_buffer::rkey() const {
     return m_rkey.rkey;
 }
 
+const uct_iov_t*  uct_test::mapped_buffer::iov() const {
+    return &m_iov;
+}
+
 size_t uct_test::mapped_buffer::pack(void *dest, void *arg) {
     const mapped_buffer* buf = (const mapped_buffer*)arg;
     memcpy(dest, buf->ptr(), buf->length());
@@ -609,4 +670,3 @@ void uct_test::entity::async_wrapper::check_miss()
 {
     ucs_async_check_miss(&m_async);
 }
-

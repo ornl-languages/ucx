@@ -8,16 +8,16 @@
 
 
 # Set default configuration for running tests
-UCX_HANDLE_ERRORS ?= freeze
+UCX_HANDLE_ERRORS        ?= freeze
+UCX_LOG_LEVEL            ?= info
+UCX_LOG_PRINT_ENABLE     ?= y
+GTEST_FILTER             ?= *
+GTEST_EXTRA_ARGS         ?=
+LAUNCHER                 ?=
+VALGRIND_EXTRA_ARGS      ?=
+
 export UCX_HANDLE_ERRORS
-UCX_LOG_LEVEL ?= info
 export UCX_LOG_LEVEL
-
-
-GTEST_FILTER        ?= *
-GTEST_EXTRA_ARGS    =
-LAUNCHER            =
-VALGRIND_EXTRA_ARGS =
 
 GTEST_ARGS = \
 	--gtest_filter=$(GTEST_FILTER) \
@@ -28,6 +28,7 @@ VALGRIND_ARGS = \
 	--leak-check=full \
 	--track-origins=yes \
 	--fair-sched=try \
+	--num-callers=25 \
 	--suppressions=$(top_srcdir)/contrib/valgrind.supp \
 	$(VALGRIND_EXTRA_ARGS)
 
@@ -43,6 +44,7 @@ gtest_LDADD = \
 	$(GTEST_LIBS)
 
 gtest_CPPFLAGS = \
+        $(BASE_CPPFLAGS) \
 	-I$(top_srcdir)/src \
 	-I$(top_srcdir)/test \
 	-I$(top_builddir)/src \
@@ -51,7 +53,8 @@ gtest_CPPFLAGS = \
 	$(OPENMP_CFLAGS)
 
 gtest_LDFLAGS  = $(GTEST_LDFLAGS) -no-install
-gtest_CXXFLAGS = $(GTEST_CXXFLAGS) -g -O3 -fno-tree-vectorize
+gtest_CFLAGS   = $(BASE_CFLAGS)
+gtest_CXXFLAGS = $(BASE_CXXFLAGS) $(GTEST_CXXFLAGS) -g -fno-tree-vectorize
 
 gtest_SOURCES = \
 	common/gtest-all.cc \
@@ -67,25 +70,31 @@ gtest_SOURCES = \
 	uct/test_amo_cswap.cc \
 	uct/test_amo_fadd.cc \
 	uct/test_amo_swap.cc \
+	uct/test_event.cc \
 	uct/test_fence.cc \
 	uct/test_flush.cc \
 	uct/test_many2one_am.cc \
+	uct/test_md.cc \
 	uct/test_mm.cc \
 	uct/test_mem.cc \
 	uct/test_p2p_am.cc \
 	uct/test_p2p_err.cc \
 	uct/test_p2p_mix.cc \
 	uct/test_p2p_rma.cc \
-	uct/test_pd.cc \
 	uct/test_pending.cc \
+	uct/test_progress.cc \
 	uct/test_uct_ep.cc \
 	uct/test_uct_perf.cc \
+	uct/test_zcopy_comp.cc \
 	uct/uct_p2p_test.cc \
 	uct/uct_test.cc \
 	uct/test_stats.cc \
-	uct/test_wakeup.cc \
-	uct/test_error_handling.cc \
+	ucs/test_stats_filter.cc \
+	uct/test_peer_failure.cc \
+	uct/test_tag.cc \
 	\
+	ucp/test_ucp_stream.cc \
+	ucp/test_ucp_peer_failure.cc \
 	ucp/test_ucp_atomic.cc \
 	ucp/test_ucp_memheap.cc \
 	ucp/test_ucp_mmap.cc \
@@ -95,6 +104,7 @@ gtest_SOURCES = \
 	ucp/test_ucp_tag_cancel.cc \
 	ucp/test_ucp_tag_match.cc \
 	ucp/test_ucp_tag_mt.cc \
+	ucp/test_ucp_tag_perf.cc \
 	ucp/test_ucp_tag_probe.cc \
 	ucp/test_ucp_tag_xfer.cc \
 	ucp/test_ucp_tag.cc \
@@ -114,7 +124,6 @@ gtest_SOURCES = \
 	ucs/test_datatype.cc \
 	ucs/test_debug.cc \
 	ucs/test_memtrack.cc \
-	ucs/test_instr.cc \
 	ucs/test_math.cc \
 	ucs/test_mpmc.cc \
 	ucs/test_mpool.cc \
@@ -127,28 +136,31 @@ gtest_SOURCES = \
 	ucs/test_twheel.cc \
 	ucs/test_frag_list.cc \
 	ucs/test_hash_perf.cc \
-	ucs/test_type.cc
+	ucs/test_type.cc \
+	ucs/test_log.cc
 
 if HAVE_IB
 gtest_SOURCES += \
-    uct/test_ib.cc
+	uct/ib/test_ib.cc \
+	uct/ib/test_ib_md.cc \
+	uct/ib/test_cq_moderation.cc
 gtest_CPPFLAGS += \
     $(IBVERBS_CPPFLAGS)
 if HAVE_TL_UD
 gtest_SOURCES += \
-	uct/ud_base.cc \
-	uct/test_ud.cc \
-	uct/test_ud_slow_timer.cc \
-	uct/test_ud_pending.cc \
-	uct/test_ud_ds.cc
+	uct/ib/ud_base.cc \
+	uct/ib/test_ud.cc \
+	uct/ib/test_ud_slow_timer.cc \
+	uct/ib/test_ud_pending.cc \
+	uct/ib/test_ud_ds.cc
 endif
 if HAVE_TL_RC
 gtest_SOURCES += \
-	uct/test_rc.cc
+	uct/ib/test_rc.cc
 endif	
 if HAVE_TL_DC
 gtest_SOURCES += \
-	uct/test_dc.cc
+	uct/ib/test_dc.cc
 endif
 endif
 
@@ -159,11 +171,14 @@ noinst_HEADERS = \
 	common/test_perf.h \
 	common/tap.h \
 	\
+	uct/ib/test_rc.h \
+	uct/ib/ud_base.h \
 	uct/test_amo.h \
+	uct/test_p2p_mix.h \
+	uct/test_p2p_rma.h \
 	uct/uct_p2p_test.h \
 	uct/uct_test.h \
-	uct/test_rc.h \
-	uct/ud_base.h \
+	uct/test_md.h \
 	\
 	ucp/test_ucp_atomic.h \
 	ucp/test_ucp_memheap.h \
@@ -206,7 +221,7 @@ list: gtest
 test: ucx gtest
 	@rm -f core.*
 	$(LAUNCHER) $(abs_builddir)/gtest $(GTEST_ARGS)
-	
+
 #
 # Run unit tests with GDB
 #

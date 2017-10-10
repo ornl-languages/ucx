@@ -11,8 +11,9 @@
 
 #include <uct/api/uct.h>
 #include <ucs/stats/stats.h>
-#include <infiniband/arch.h>
 #include <ucs/debug/log.h>
+
+#include <endian.h>
 
 
 #define UCT_IB_QPN_ORDER            24  /* How many bits can be an IB QP number */
@@ -37,9 +38,9 @@
 #define UCT_IB_DEV_MAX_PORTS        2
 #define UCT_IB_INVALID_RKEY         0xffffffffu
 #define UCT_IB_KEY                  0x1ee7a330
-#define UCT_IB_LINK_LOCAL_PREFIX    ntohll(0xfe80000000000000ul) /* IBTA 4.1.1 12a */
-#define UCT_IB_SITE_LOCAL_PREFIX    ntohll(0xfec0000000000000ul) /* IBTA 4.1.1 12b */
-#define UCT_IB_SITE_LOCAL_MASK      ntohll(0xffffffffffff0000ul) /* IBTA 4.1.1 12b */
+#define UCT_IB_LINK_LOCAL_PREFIX    be64toh(0xfe80000000000000ul) /* IBTA 4.1.1 12a */
+#define UCT_IB_SITE_LOCAL_PREFIX    be64toh(0xfec0000000000000ul) /* IBTA 4.1.1 12b */
+#define UCT_IB_SITE_LOCAL_MASK      be64toh(0xffffffffffff0000ul) /* IBTA 4.1.1 12b */
 
 
 enum {
@@ -97,6 +98,18 @@ typedef struct uct_ib_address {
 
 
 /**
+ * IB device specification.
+ */
+typedef struct uct_ib_device_spec {
+    uint16_t                    vendor_id;
+    uint16_t                    part_id;
+    const char                  *name;
+    unsigned                    flags;
+    uint8_t                     priority;
+} uct_ib_device_spec_t;
+
+
+/**
  * IB device (corresponds to HCA)
  */
 typedef struct uct_ib_device {
@@ -136,6 +149,12 @@ ucs_status_t uct_ib_device_init(uct_ib_device_t *dev, struct ibv_device *ibv_dev
                                 UCS_STATS_ARG(ucs_stats_node_t *stats_parent));
 
 void uct_ib_device_cleanup(uct_ib_device_t *dev);
+
+
+/**
+ * @return device specification.
+ */
+const uct_ib_device_spec_t* uct_ib_device_spec(uct_ib_device_t *dev);
 
 
 /**
@@ -250,7 +269,7 @@ static inline ucs_status_t uct_ib_poll_cq(struct ibv_cq *cq, unsigned *count, st
         if (ucs_likely(ret == 0)) {
             return UCS_ERR_NO_PROGRESS;
         }
-        ucs_fatal("Failed to poll receive CQ");
+        ucs_fatal("Failed to poll receive CQ %d", ret);
     }
 
     *count = ret;

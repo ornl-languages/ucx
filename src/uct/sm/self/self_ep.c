@@ -35,7 +35,7 @@ UCS_CLASS_DEFINE_DELETE_FUNC(uct_self_ep_t, uct_ep_t);
 static void UCS_F_ALWAYS_INLINE uct_self_ep_am_reserve_buffer(uct_self_iface_t *self_iface,
                                                               void *desc)
 {
-    uct_recv_desc_iface(desc) = &self_iface->super.super;
+    uct_recv_desc(desc)      = &self_iface->release_desc;
     self_iface->msg_cur_desc = NULL;
 }
 
@@ -54,7 +54,7 @@ ucs_status_t uct_self_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header,
 
     /* Send part */
     UCT_CHECK_AM_ID(id);
-    UCT_CHECK_LENGTH(total_length, self_iface->data_length, "am_short");
+    UCT_CHECK_LENGTH(total_length, 0, self_iface->data_length, "am_short");
     if (ucs_unlikely(NULL == self_iface->msg_cur_desc)) {
         UCT_TL_IFACE_GET_TX_DESC(&self_iface->super, &self_iface->msg_desc_mp,
                                  self_iface->msg_cur_desc, return UCS_ERR_NO_MEMORY);
@@ -72,7 +72,9 @@ ucs_status_t uct_self_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header,
     /* Receive part */
     uct_iface_trace_am(&self_iface->super, UCT_AM_TRACE_TYPE_RECV, id, p_data,
                        total_length, "RX: AM_SHORT");
-    status = uct_iface_invoke_am(&self_iface->super, id, p_data, total_length, desc);
+    status = uct_iface_invoke_am(&self_iface->super, id, p_data, total_length,
+                                 UCT_CB_PARAM_FLAG_DESC);
+
     if (ucs_unlikely(UCS_INPROGRESS == status)) {
         uct_self_ep_am_reserve_buffer(self_iface, desc);
         /**
@@ -88,7 +90,8 @@ ucs_status_t uct_self_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header,
 }
 
 ssize_t uct_self_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
-                             uct_pack_callback_t pack_cb, void *arg)
+                             uct_pack_callback_t pack_cb, void *arg,
+                             unsigned flags)
 {
     ucs_status_t status;
     uct_self_iface_t *self_iface = 0;
@@ -110,7 +113,7 @@ ssize_t uct_self_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     payload = desc + self_iface->rx_headroom;
     length = pack_cb(payload, arg);
 
-    UCT_CHECK_LENGTH(length, self_iface->data_length, "am_bcopy");
+    UCT_CHECK_LENGTH(length, 0, self_iface->data_length, "am_bcopy");
     UCT_TL_EP_STAT_OP(&self_ep->super, AM, BCOPY, length);
     uct_iface_trace_am(&self_iface->super, UCT_AM_TRACE_TYPE_SEND, id, payload,
                        length, "TX: AM_BCOPY");
@@ -118,12 +121,14 @@ ssize_t uct_self_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     /* Receive part */
     uct_iface_trace_am(&self_iface->super, UCT_AM_TRACE_TYPE_RECV, id, payload,
                        length, "RX: AM_BCOPY");
-    status = uct_iface_invoke_am(&self_iface->super, id, payload, length, desc);
+    status = uct_iface_invoke_am(&self_iface->super, id, payload, length,
+                                 UCT_CB_PARAM_FLAG_DESC);
+
     if (ucs_unlikely(UCS_INPROGRESS == status)) {
         uct_self_ep_am_reserve_buffer(self_iface, desc);
         /**
          * Try to get new buffer from memory pool and
-         * ignore UCS_ERR_NO_MEMORY to resolve it later
+         * ignore UCS_ERR_NO_RESOURCE to resolve it later
          */
         UCT_TL_IFACE_GET_RX_DESC(&self_iface->super, &self_iface->msg_desc_mp,
                                  self_iface->msg_cur_desc, );

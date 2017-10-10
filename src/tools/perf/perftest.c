@@ -15,6 +15,7 @@
 #include "libperf.h"
 #include "libperf_int.h"
 
+#include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 #include <ucs/debug/log.h>
 #include <sys/socket.h>
@@ -77,7 +78,7 @@ struct perftest_context {
     sock_rte_group_t             sock_rte_group;
 };
 
-#define TEST_PARAMS_ARGS   "t:n:s:W:O:w:D:i:H:oqM:T:d:x:A:B"
+#define TEST_PARAMS_ARGS   "t:n:s:W:O:w:D:i:H:oSCqM:T:d:x:A:B"
 
 
 test_type_t tests[] = {
@@ -112,10 +113,10 @@ test_type_t tests[] = {
      "atomic add message rate"},
 
     {"tag_lat", UCX_PERF_API_UCP, UCX_PERF_CMD_TAG, UCX_PERF_TEST_TYPE_PINGPONG,
-     "tag match latency"},
+     "UCP tag match latency"},
 
     {"tag_bw", UCX_PERF_API_UCP, UCX_PERF_CMD_TAG, UCX_PERF_TEST_TYPE_STREAM_UNI,
-     "tag match bandwidth"},
+     "UCP tag match bandwidth"},
 
     {"ucp_put_lat", UCX_PERF_API_UCP, UCX_PERF_CMD_PUT, UCX_PERF_TEST_TYPE_PINGPONG,
      "UCP put latency"},
@@ -316,10 +317,15 @@ static void usage(struct perftest_context *ctx, const char *program)
         printf("                   %11s : %s.\n", test->name, test->desc);
     }
     printf("\n");
-    printf("     -D <layout>    Data layout.\n");
-    printf("                        short : Use short messages API (cannot used for get).\n");
-    printf("                        bcopy : Use copy-out API (cannot used for atomics).\n");
-    printf("                        zcopy : Use zero-copy API (cannot used for atomics).\n");
+    printf("     -D <layout>[,<layout>]    Data layout. Default is \"short\" in UCT,"
+                                         " \"contig\" in UCP and previous one "
+                                         "in batch mode. Second parameter is for "
+                                         "receive side in UCP only.\n");
+    printf("                                 short : Use short messages API (cannot used for get).\n");
+    printf("                                 bcopy : Use copy-out API (cannot used for atomics).\n");
+    printf("                                 zcopy : Use zero-copy API (cannot used for atomics).\n");
+    printf("                                contig : Use continuous datatype in UCP tests.\n");
+    printf("                                   iov : Use IOV datatype in UCP tests.\n");
     printf("\n");
     printf("     -d <device>    Device to use for testing.\n");
     printf("     -x <tl>        Transport to use for testing.\n");
@@ -358,13 +364,12 @@ static void usage(struct perftest_context *ctx, const char *program)
     printf("                        thread     : Use separate progress thread.\n");
     printf("                        signal     : Use signal based timer.\n"); 
     printf("     -B             Register memory with NONBLOCK flag.\n");
+    printf("     -C             Use wildcard for tag tests.\n");
+    printf("     -S             Use synchronous mode for tag sends.\n");
 #if HAVE_MPI
     printf("     -P <0|1>       Disable/enable MPI mode (%d)\n", ctx->mpi);
 #endif
     printf("     -h             Show this help message.\n");
-    printf("\n");
-    printf("  Server options:\n");
-    printf("     -l             Accept clients in an infinite loop\n");
     printf("\n");
 }
 
@@ -372,6 +377,25 @@ static const char *__basename(const char *path)
 {
     const char *p = strrchr(path, '/');
     return (p == NULL) ? path : p;
+}
+
+static ucs_status_t parse_ucp_datatype_params(const char *optarg,
+                                              ucp_perf_datatype_t *datatype)
+{
+    const char  *iov_type         = "iov";
+    const size_t iov_type_size    = strlen("iov");
+    const char  *contig_type      = "contig";
+    const size_t contig_type_size = strlen("contig");
+
+    if (0 == strncmp(optarg, iov_type, iov_type_size)) {
+        *datatype = UCP_PERF_DATATYPE_IOV;
+    } else if (0 == strncmp(optarg, contig_type, contig_type_size)) {
+        *datatype = UCP_PERF_DATATYPE_CONTIG;
+    } else {
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    return UCS_OK;
 }
 
 static ucs_status_t parse_message_sizes_params(const char *optarg,
@@ -405,6 +429,7 @@ static ucs_status_t parse_message_sizes_params(const char *optarg,
             (optarg_ptr == optarg_ptr2)) {
             free(params->msg_size_list);
             params->msg_size_list = NULL; /* prevent double free */
+            ucs_error("Invalid option substring argument at position %lu", token_it);
             return UCS_ERR_INVALID_PARAM;
         }
         optarg_ptr = optarg_ptr2 + 1;
@@ -435,6 +460,8 @@ static void init_test_params(ucx_perf_params_t *params)
     params->uct.data_layout = UCT_PERF_DATA_LAYOUT_SHORT;
     params->msg_size_cnt    = 1;
     params->iov_stride      = 0;
+    params->ucp.send_datatype = UCP_PERF_DATATYPE_CONTIG;
+    params->ucp.recv_datatype = UCP_PERF_DATATYPE_CONTIG;
     strcpy(params->uct.dev_name, "<none>");
     strcpy(params->uct.tl_name, "<none>");
 
@@ -446,6 +473,7 @@ static void init_test_params(ucx_perf_params_t *params)
 static ucs_status_t parse_test_params(ucx_perf_params_t *params, char opt, const char *optarg)
 {
     test_type_t *test;
+    char *optarg2 = NULL;
 
     switch (opt) {
     case 'd':
@@ -477,6 +505,15 @@ static ucs_status_t parse_test_params(ucx_perf_params_t *params, char opt, const
             params->uct.data_layout   = UCT_PERF_DATA_LAYOUT_BCOPY;
         } else if (0 == strcmp(optarg, "zcopy")) {
             params->uct.data_layout   = UCT_PERF_DATA_LAYOUT_ZCOPY;
+        } else if (UCS_OK == parse_ucp_datatype_params(optarg,
+                                                       &params->ucp.send_datatype)) {
+            optarg2 = strchr(optarg, ',');
+            if (optarg2) {
+                if (UCS_OK != parse_ucp_datatype_params(optarg2 + 1,
+                                                       &params->ucp.recv_datatype)) {
+                    return -1;
+                }
+            }
         } else {
             ucs_error("Invalid option argument for -D");
             return -1;
@@ -510,6 +547,12 @@ static ucs_status_t parse_test_params(ucx_perf_params_t *params, char opt, const
         return UCS_OK;
     case 'q':
         params->flags &= ~UCX_PERF_TEST_FLAG_VERBOSE;
+        return UCS_OK;
+    case 'C':
+        params->flags |= UCX_PERF_TEST_FLAG_TAG_WILDCARD;
+        return UCS_OK;
+    case 'S':
+        params->flags |= UCX_PERF_TEST_FLAG_TAG_SYNC;
         return UCS_OK;
     case 'M':
         if (0 == strcmp(optarg, "single")) {
@@ -549,8 +592,9 @@ static ucs_status_t read_batch_file(FILE *batch_file, ucx_perf_params_t *params,
                                     char** test_name_p)
 {
 #define MAX_SIZE 256
+#define MAX_ARG_SIZE 2048
     ucs_status_t status;
-    char buf[MAX_SIZE];
+    char buf[MAX_ARG_SIZE];
     int argc;
     char *argv[MAX_SIZE + 1];
     int c;
@@ -575,7 +619,8 @@ static ucs_status_t read_batch_file(FILE *batch_file, ucx_perf_params_t *params,
     while ((c = getopt (argc, argv, TEST_PARAMS_ARGS)) != -1) {
         status = parse_test_params(params, c, optarg);
         if (status != UCS_OK) {
-            ucs_error("Invalid argument in batch file: -%c", c);
+            ucs_error("Invalid argument in batch file: -%c, status(%d):\"%s\"",
+                      c, status, ucs_status_string(status));
             return status;
         }
     }
@@ -1091,7 +1136,7 @@ static ucs_status_t setup_mpi_rte(struct perftest_context *ctx)
     rte_group_t group;
 
     rte_init(NULL, NULL, &group);
-    if (0 == rte_group_rank(group)) {
+    if (1 == rte_group_rank(group)) {
         ctx->flags |= TEST_FLAG_PRINT_RESULTS;
     }
 
@@ -1231,6 +1276,7 @@ int main(int argc, char **argv)
     }
 
 #ifdef __COVERITY__
+    /* coverity[dont_call] */
     rte = rand(); /* Shut up deadcode error */
 #endif
 

@@ -13,7 +13,8 @@ extern "C" {
 class test_many2one_am : public uct_test {
 public:
     static const uint8_t  AM_ID = 15;
-    static const uint64_t MAGIC = 0xdeadbeef12345678ul;
+    static const uint64_t MAGIC_DESC  = 0xdeadbeef12345678ul;
+    static const uint64_t MAGIC_ALLOC = 0xbaadf00d12345678ul;
 
     typedef struct {
         uint64_t magic;
@@ -23,22 +24,30 @@ public:
     test_many2one_am() : m_am_count(0) {
     }
 
-    static ucs_status_t am_handler(void *arg, void *data, size_t length, void *desc) {
+    static ucs_status_t am_handler(void *arg, void *data, size_t length,
+                                   unsigned flags) {
         test_many2one_am *self = reinterpret_cast<test_many2one_am*>(arg);
-        return self->am_handler(data, length, desc);
+        return self->am_handler(data, length, flags);
     }
 
-    ucs_status_t am_handler(void *data, size_t length, void *desc) {
-        if (rand() % 4 == 0) {
-            receive_desc_t *my_desc = (receive_desc_t *)desc;
-            my_desc->magic  = MAGIC;
+    ucs_status_t am_handler(void *data, size_t length, unsigned flags) {
+        if (ucs::rand() % 4 == 0) {
+            receive_desc_t *my_desc;
+            if (flags & UCT_CB_PARAM_FLAG_DESC) {
+                my_desc = (receive_desc_t *)data - 1;
+                my_desc->magic  = MAGIC_DESC;
+            } else {
+                my_desc = (receive_desc_t *)ucs_malloc(sizeof(*my_desc) + length,
+                                                       "TODO: remove allocation");
+                my_desc->magic  = MAGIC_ALLOC;
+            }
             my_desc->length = length;
             if (data != my_desc + 1) {
                 memcpy(my_desc + 1, data, length);
             }
             m_backlog.push_back(my_desc);
             ucs_atomic_add32(&m_am_count, 1);
-            return UCS_INPROGRESS;
+            return (flags & UCT_CB_PARAM_FLAG_DESC) ? UCS_INPROGRESS : UCS_OK;
         }
         mapped_buffer::pattern_check(data, length);
         ucs_atomic_add32(&m_am_count, 1);
@@ -49,9 +58,13 @@ public:
         while (!m_backlog.empty()) {
             receive_desc_t *my_desc = m_backlog.back();
             m_backlog.pop_back();
-            EXPECT_EQ(uint64_t(MAGIC), my_desc->magic);
             mapped_buffer::pattern_check(my_desc + 1, my_desc->length);
-            uct_iface_release_am_desc(my_desc);
+            if (my_desc->magic == MAGIC_DESC) {
+                uct_iface_release_desc(my_desc);
+            } else {
+                EXPECT_EQ(uint64_t(MAGIC_ALLOC), my_desc->magic);
+                ucs_free(my_desc);
+            }
         }
     }
 
@@ -72,7 +85,7 @@ UCS_TEST_P(test_many2one_am, am_bcopy, "MAX_BCOPY=16384")
     m_entities.push_back(receiver);
 
     check_caps(UCT_IFACE_FLAG_AM_BCOPY);
-    check_caps(UCT_IFACE_FLAG_AM_CB_SYNC);
+    check_caps(UCT_IFACE_FLAG_CB_SYNC);
 
     ucs::ptr_vector<entity> senders;
     ucs::ptr_vector<mapped_buffer> buffers;
@@ -88,11 +101,11 @@ UCS_TEST_P(test_many2one_am, am_bcopy, "MAX_BCOPY=16384")
     m_am_count = 0;
 
     status = uct_iface_set_am_handler(receiver->iface(), AM_ID, am_handler,
-                                      (void*)this, UCT_AM_CB_FLAG_SYNC);
+                                      (void*)this, UCT_CB_FLAG_SYNC);
     ASSERT_UCS_OK(status);
 
     for (unsigned i = 0; i < num_sends; ++i) {
-        unsigned sender_num = rand() % NUM_SENDERS;
+        unsigned sender_num = ucs::rand() % NUM_SENDERS;
 
         mapped_buffer& buffer = buffers.at(sender_num);
         buffer.pattern_fill(i);
@@ -101,7 +114,7 @@ UCS_TEST_P(test_many2one_am, am_bcopy, "MAX_BCOPY=16384")
         for (;;) {
             entity& sender = senders.at(sender_num);
             packed_len = uct_ep_am_bcopy(sender.ep(0), AM_ID, mapped_buffer::pack,
-                                         (void*)&buffer);
+                                         (void*)&buffer, 0);
             if (packed_len != UCS_ERR_NO_RESOURCE) {
                 break;
             }
@@ -118,7 +131,7 @@ UCS_TEST_P(test_many2one_am, am_bcopy, "MAX_BCOPY=16384")
     }
 
     status = uct_iface_set_am_handler(receiver->iface(), AM_ID, NULL, NULL,
-                                      UCT_AM_CB_FLAG_SYNC);
+                                      UCT_CB_FLAG_SYNC);
     ASSERT_UCS_OK(status);
 
     check_backlog();

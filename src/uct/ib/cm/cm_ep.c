@@ -11,7 +11,6 @@
 #include <ucs/arch/atomic.h>
 #include <ucs/async/async.h>
 #include <uct/base/uct_log.h>
-#include <infiniband/arch.h>
 
 
 typedef struct uct_cm_iov {
@@ -100,8 +99,8 @@ static void uct_cm_dump_path(struct ibv_sa_path_rec *path)
                    path->preference);
 }
 
-ssize_t uct_cm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t am_id,
-                           uct_pack_callback_t pack_cb, void *arg)
+ssize_t uct_cm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t am_id, uct_pack_callback_t pack_cb,
+                           void *arg, unsigned flags)
 {
     uct_cm_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_cm_iface_t);
     uct_cm_ep_t *ep = ucs_derived_of(tl_ep, uct_cm_ep_t);
@@ -118,7 +117,7 @@ ssize_t uct_cm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t am_id,
 
     uct_cm_enter(iface);
 
-    if (iface->num_outstanding >= iface->config.max_outstanding) {
+    if (!uct_cm_iface_has_tx_resources(iface)) {
         status = UCS_ERR_NO_RESOURCE;
         goto err;
     }
@@ -182,9 +181,10 @@ ssize_t uct_cm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t am_id,
     uct_cm_iface_trace_data(iface, UCT_AM_TRACE_TYPE_SEND, hdr,
                             "TX: SIDR_REQ [id %p{%u} dlid %d svc 0x%"PRIx64"]",
                             op->id, op->id->handle, ntohs(path.dlid),
-                            req.service_id);
+                            (uint64_t)req.service_id);
     uct_cm_leave(iface);
     ucs_free(hdr);
+    /* coverity[missing_unlock] */
     return payload_len;
 
 err_destroy_id:
@@ -223,19 +223,29 @@ void uct_cm_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
     uct_cm_ep_t *ep = ucs_derived_of(tl_ep, uct_cm_ep_t);
     uct_cm_pending_req_priv_t *priv;
 
+    uct_cm_enter(iface);
     uct_pending_queue_purge(priv, &iface->notify_q, priv->ep == ep, cb, arg);
+    uct_cm_leave(iface);
 }
 
 ucs_status_t uct_cm_ep_flush(uct_ep_h tl_ep, unsigned flags,
                              uct_completion_t *comp)
 {
+    uct_cm_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_cm_iface_t);
     ucs_status_t status;
 
-    status = uct_cm_iface_flush_do(tl_ep->iface, comp);
-    if (status == UCS_OK) {
-        UCT_TL_EP_STAT_FLUSH(ucs_derived_of(tl_ep, uct_base_ep_t));
-    } else if (status == UCS_INPROGRESS) {
-        UCT_TL_EP_STAT_FLUSH_WAIT(ucs_derived_of(tl_ep, uct_base_ep_t));
+    uct_cm_enter(iface);
+    if (!uct_cm_iface_has_tx_resources(iface)) {
+        status = UCS_ERR_NO_RESOURCE;
+    } else {
+        status = uct_cm_iface_flush_do(iface, comp);
+        if (status == UCS_OK) {
+            UCT_TL_EP_STAT_FLUSH(ucs_derived_of(tl_ep, uct_base_ep_t));
+        } else if (status == UCS_INPROGRESS) {
+            UCT_TL_EP_STAT_FLUSH_WAIT(ucs_derived_of(tl_ep, uct_base_ep_t));
+        }
     }
+    uct_cm_leave(iface);
+
     return status;
 }

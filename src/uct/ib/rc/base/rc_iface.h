@@ -25,14 +25,16 @@
 
 #define UCT_RC_CHECK_AM_SHORT(_am_id, _length, _max_inline) \
      UCT_CHECK_AM_ID(_am_id); \
-     UCT_CHECK_LENGTH(sizeof(uct_rc_am_short_hdr_t) + _length, _max_inline, "am_short");
+     UCT_CHECK_LENGTH(sizeof(uct_rc_am_short_hdr_t) + _length, 0, _max_inline, "am_short");
 
+#define UCT_RC_CHECK_ZCOPY_DATA(_header_length, _length, _seg_size) \
+    UCT_CHECK_LENGTH(_header_length + _length, 0, _seg_size, "am_zcopy payload"); \
+    UCT_CHECK_LENGTH(_header_length + _length, 0, UCT_IB_MAX_MESSAGE_SIZE, "am_zcopy ib max message");
 
 #define UCT_RC_CHECK_AM_ZCOPY(_id, _header_length, _length, _desc_size, _seg_size) \
     UCT_CHECK_AM_ID(_id); \
-    UCT_CHECK_LENGTH(sizeof(uct_rc_hdr_t) + _header_length, _desc_size, "am_zcopy header"); \
-    UCT_CHECK_LENGTH(_header_length + _length, _seg_size, "am_zcopy payload"); \
-    UCT_CHECK_LENGTH(_header_length + _length, UCT_IB_MAX_MESSAGE_SIZE, "am_zcopy ib max message");
+    UCT_RC_CHECK_ZCOPY_DATA(_header_length, _length, _seg_size) \
+    UCT_CHECK_LENGTH(sizeof(uct_rc_hdr_t) + _header_length, 0, _desc_size, "am_zcopy header");
 
 
 #define UCT_RC_IFACE_GET_TX_DESC(_iface, _mp, _desc) \
@@ -41,13 +43,14 @@
 
 #define UCT_RC_IFACE_GET_TX_AM_BCOPY_DESC(_iface, _mp, _desc, _id, _pack_cb, _arg, _length) \
     UCT_RC_IFACE_GET_TX_DESC(_iface, _mp, _desc) \
-    uct_rc_bcopy_desc_fill(_desc, _id, _pack_cb, _arg, _length);
+    (_desc)->super.handler = (uct_rc_send_handler_t)ucs_mpool_put; \
+    uct_rc_bcopy_desc_fill((uct_rc_hdr_t*)(_desc + 1), _id, _pack_cb, _arg, _length);
 
 #define UCT_RC_IFACE_GET_TX_AM_ZCOPY_DESC(_iface, _mp, _desc, \
                                           _id, _header, _header_length, _comp, _send_flags) \
     UCT_RC_IFACE_GET_TX_DESC(_iface, _mp, _desc); \
     uct_rc_zcopy_desc_set_comp(_desc, _comp, _send_flags); \
-    uct_rc_zcopy_desc_set_header(_desc, _id, _header, _header_length);
+    uct_rc_zcopy_desc_set_header((uct_rc_hdr_t*)(_desc + 1), _id, _header, _header_length);
 
 #define UCT_RC_IFACE_GET_TX_PUT_BCOPY_DESC(_iface, _mp, _desc, _pack_cb, _arg, _length) \
     UCT_RC_IFACE_GET_TX_DESC(_iface, _mp, _desc) \
@@ -87,6 +90,18 @@ enum {
 };
 
 
+/* flags for uct_rc_iface_send_op_t */
+enum {
+#if ENABLE_ASSERT
+    UCT_RC_IFACE_SEND_OP_FLAG_IFACE = UCS_BIT(14), /* belongs to iface ops buffer */
+    UCT_RC_IFACE_SEND_OP_FLAG_INUSE = UCS_BIT(15)  /* queued on a txqp */
+#else
+    UCT_RC_IFACE_SEND_OP_FLAG_IFACE = 0,
+    UCT_RC_IFACE_SEND_OP_FLAG_INUSE = 0
+#endif
+};
+
+
 typedef void (*uct_rc_send_handler_t)(uct_rc_iface_send_op_t *op, const void *resp);
 
 
@@ -113,6 +128,7 @@ struct uct_rc_iface_config {
     uct_ib_iface_config_t    super;
     uct_ib_mtu_t             path_mtu;
     unsigned                 max_rd_atomic;
+    int                      ooo_rw; /* Enable out-of-order RDMA data placement */
 
     struct {
         double               timeout;
@@ -137,33 +153,43 @@ typedef struct uct_rc_iface_ops {
     ucs_status_t         (*fc_handler)(uct_rc_iface_t *iface, unsigned qp_num,
                                        uct_rc_hdr_t *hdr, unsigned length,
                                        uint32_t imm_data, uint16_t lid,
-                                       void *desc);
+                                       unsigned flags);
 } uct_rc_iface_ops_t;
 
 
+typedef struct uct_rc_srq {
+    struct ibv_srq           *srq;
+    unsigned                 available;
+} uct_rc_srq_t;
+
+
 struct uct_rc_iface {
-    uct_ib_iface_t           super;
+    uct_ib_iface_t             super;
 
     struct {
-        ucs_mpool_t          mp;
-        ucs_mpool_t          fc_mp; /* pool for FC grant pending reguests */
-        uct_rc_iface_send_op_t *ops;
-        unsigned             cq_available;
-        unsigned             next_op;
-        ucs_arbiter_t        arbiter;
+        ucs_mpool_t             mp;      /* pool for send descriptors */
+        ucs_mpool_t             fc_mp;   /* pool for FC grant pending requests */
+        /* Credits for completions.
+         * May be negative in case mlx5 because we take "num_bb" credits per
+         * post to be able to calculate credits of outstanding ops on failure.
+         * In case of verbs TL we use QWE number, so 1 post always takes 1
+         * credit */
+        signed                  cq_available;
+        uct_rc_iface_send_op_t  *free_ops; /* stack of free send operations */
+        ucs_arbiter_t           arbiter;
+        uct_rc_iface_send_op_t  *ops_buffer;
     } tx;
 
     struct {
         ucs_mpool_t          mp;
-        struct ibv_srq       *srq;
-        unsigned             available;
+        uct_rc_srq_t         srq;
     } rx;
 
     struct {
         unsigned             tx_qp_len;
         unsigned             tx_min_sge;
         unsigned             tx_min_inline;
-        unsigned             tx_ops_mask;
+        unsigned             tx_ops_count;
         unsigned             rx_inline;
         uint16_t             tx_moderation;
 
@@ -184,6 +210,8 @@ struct uct_rc_iface {
         uint8_t              retry_cnt;
         uint8_t              max_rd_atomic;
         enum ibv_mtu         path_mtu;
+        /* Enable out-of-order RDMA data placement */
+        uint8_t              ooo_rw;
 
         /* Atomic callbacks */
         uct_rc_send_handler_t  atomic64_handler;      /* 64bit ib-spec */
@@ -197,18 +225,24 @@ struct uct_rc_iface {
     ucs_list_link_t          ep_list;
 };
 UCS_CLASS_DECLARE(uct_rc_iface_t, uct_rc_iface_ops_t*, uct_md_h,
-                  uct_worker_h, const uct_iface_params_t*, unsigned,
-                  const uct_rc_iface_config_t*, unsigned)
+                  uct_worker_h, const uct_iface_params_t*,
+                  const uct_rc_iface_config_t*, unsigned, unsigned,
+                  unsigned, unsigned, int)
 
 
 struct uct_rc_iface_send_op {
-    ucs_queue_elem_t              queue;
+    union {
+        ucs_queue_elem_t          queue;  /* used when enqueued on a txqp */
+        uct_rc_iface_send_op_t    *next;  /* used when on free list */
+    };
     uct_rc_send_handler_t         handler;
     uint16_t                      sn;
+    uint16_t                      flags;
     unsigned                      length;
     union {
-        void                      *buffer;
-        void                      *unpack_arg;
+        void                      *buffer;        /* atomics / desc */
+        void                      *unpack_arg;    /* get_bcopy / desc */
+        uct_rc_iface_t            *iface;         /* zcopy / op */
     };
     uct_completion_t              *user_comp;
 };
@@ -233,10 +267,13 @@ typedef struct uct_rc_am_short_hdr {
 extern ucs_config_field_t uct_rc_iface_config_table[];
 extern ucs_config_field_t uct_rc_fc_config_table[];
 
-void uct_rc_iface_query(uct_rc_iface_t *iface, uct_iface_attr_t *iface_attr);
+ucs_status_t uct_rc_iface_query(uct_rc_iface_t *iface,
+                                uct_iface_attr_t *iface_attr);
 
-void uct_rc_iface_add_ep(uct_rc_iface_t *iface, uct_rc_ep_t *ep);
-void uct_rc_iface_remove_ep(uct_rc_iface_t *iface, uct_rc_ep_t *ep);
+void uct_rc_iface_add_qp(uct_rc_iface_t *iface, uct_rc_ep_t *ep,
+                         unsigned qp_num);
+
+void uct_rc_iface_remove_qp(uct_rc_iface_t *iface, unsigned qp_num);
 
 ucs_status_t uct_rc_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                 uct_completion_t *comp);
@@ -248,16 +285,29 @@ void uct_rc_ep_am_zcopy_handler(uct_rc_iface_send_op_t *op, const void *resp);
 /**
  * Creates an RC or DCI QP and fills 'cap' with QP capabilities;
  */
-ucs_status_t uct_rc_iface_qp_create(uct_rc_iface_t *iface, int qp_type, struct ibv_qp **qp_p,
-                                    struct ibv_qp_cap *cap);
+ucs_status_t uct_rc_iface_qp_create(uct_rc_iface_t *iface, int qp_type,
+                                    struct ibv_qp **qp_p, struct ibv_qp_cap *cap,
+                                    unsigned max_send_wr);
+
+ucs_status_t uct_rc_iface_qp_init(uct_rc_iface_t *iface, struct ibv_qp *qp);
+
+ucs_status_t uct_rc_iface_qp_connect(uct_rc_iface_t *iface, struct ibv_qp *qp,
+                                     const uint32_t qp_num,
+                                     struct ibv_ah_attr *ah_attr);
 
 ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
                                      uct_rc_hdr_t *hdr, unsigned length,
-                                     uint32_t imm_data, uint16_t lid, void *desc);
+                                     uint32_t imm_data, uint16_t lid, unsigned flags);
 
 ucs_status_t uct_rc_init_fc_thresh(uct_rc_fc_config_t *fc_cfg,
                                    uct_rc_iface_config_t *rc_cfg,
                                    uct_rc_iface_t *iface);
+
+ucs_status_t uct_rc_iface_event_arm(uct_iface_h tl_iface, unsigned events);
+
+ucs_status_t uct_rc_iface_common_event_arm(uct_iface_h tl_iface,
+                                           unsigned events, int force_rx_all);
+
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_rc_fc_ctrl(uct_ep_t *ep, unsigned op, uct_rc_fc_request_t *req)
@@ -286,25 +336,32 @@ uct_rc_iface_have_tx_cqe_avail(uct_rc_iface_t* iface)
 static UCS_F_ALWAYS_INLINE uct_rc_iface_send_op_t*
 uct_rc_iface_get_send_op(uct_rc_iface_t *iface)
 {
-    return &iface->tx.ops[(iface->tx.next_op++) & iface->config.tx_ops_mask];
+    uct_rc_iface_send_op_t *op;
+    op = iface->tx.free_ops;
+    iface->tx.free_ops = op->next;
+    return op;
 }
 
+static UCS_F_ALWAYS_INLINE void
+uct_rc_iface_put_send_op(uct_rc_iface_send_op_t *op)
+{
+    uct_rc_iface_t *iface = op->iface;
+    ucs_assert(op->flags == UCT_RC_IFACE_SEND_OP_FLAG_IFACE);
+    op->next = iface->tx.free_ops;
+    iface->tx.free_ops = op;
+}
 
 static inline void
-uct_rc_bcopy_desc_fill(uct_rc_iface_send_desc_t *desc, uint8_t id,
+uct_rc_bcopy_desc_fill(uct_rc_hdr_t *rch, uint8_t id,
                        uct_pack_callback_t pack_cb, void *arg, size_t *length)
 {
-    uct_rc_hdr_t *rch;
-
-    desc->super.handler = (uct_rc_send_handler_t)ucs_mpool_put;
-    rch = (uct_rc_hdr_t *)(desc + 1);
     rch->am_id = id;
     *length = pack_cb(rch + 1, arg);
 }
 
 static inline void uct_rc_zcopy_desc_set_comp(uct_rc_iface_send_desc_t *desc,
-                                                    uct_completion_t *comp,
-                                                    int *send_flags)
+                                              uct_completion_t *comp,
+                                              int *send_flags)
 {
     if (comp == NULL) {
         desc->super.handler   = (uct_rc_send_handler_t)ucs_mpool_put;
@@ -316,18 +373,13 @@ static inline void uct_rc_zcopy_desc_set_comp(uct_rc_iface_send_desc_t *desc,
     }
 }
 
-static inline void uct_rc_zcopy_desc_set_header(uct_rc_iface_send_desc_t *desc,
+static inline void uct_rc_zcopy_desc_set_header(uct_rc_hdr_t *rch,
                                                 uint8_t id, const void *header,
                                                 unsigned header_length)
 {
-     uct_rc_hdr_t *rch;
-
-    /* Header buffer: active message ID + user header */
-    rch = (uct_rc_hdr_t *)(desc + 1);
     rch->am_id = id;
     memcpy(rch + 1, header, header_length);
 }
-
 
 static inline int uct_rc_iface_has_tx_resources(uct_rc_iface_t *iface)
 {

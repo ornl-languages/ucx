@@ -1,12 +1,13 @@
 #
 # Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-# Copyright (C) 2014 Copyright (C) UT-Battelle, LLC. 2014. ALL RIGHTS RESERVED.
-# Copyright (C) ARM Ltd. 2016.  ALL RIGHTS RESERVED.
+# Copyright (C) UT-Battelle, LLC. 2014-2017. ALL RIGHTS RESERVED.
+# Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
 # See file LICENSE for terms.
 #
 
 AUTOMAKE_OPTIONS    = nostdinc # avoid collision with built-in debug.h
-AM_CPPFLAGS         = -I$(top_builddir) -I$(abs_top_srcdir)/src
+AM_CPPFLAGS         = $(BASE_CPPFLAGS) -I$(top_builddir) -I$(abs_top_srcdir)/src
+libucs_la_CFLAGS    = $(BASE_CFLAGS)
 lib_LTLIBRARIES     = libucs.la
 bin_PROGRAMS        =
 
@@ -32,45 +33,23 @@ nobase_dist_libucs_la_HEADERS = \
 	arch/bitops.h \
 	arch/cpu.h \
 	async/async_fwd.h \
-	async/async.h \
-	async/pipe.h \
-	async/signal.h \
-	async/thread.h \
 	config/global_opts.h \
 	config/parser.h \
 	config/types.h \
-	datastruct/arbiter.h \
 	datastruct/callbackq.h \
-	datastruct/frag_list.h \
-	datastruct/hash.h \
-	datastruct/list.h \
-	datastruct/mpmc.h \
+	datastruct/list_types.h \
 	datastruct/mpool.h \
-	datastruct/mpool.inl \
-	datastruct/pgtable.h \
-	datastruct/ptr_array.h \
-	datastruct/queue_types.h \
-	datastruct/queue.h \
-	datastruct/sglib.h \
-	datastruct/sglib_wrapper.h \
-	datastruct/khash.h \
 	debug/check.h \
 	debug/debug.h \
-	debug/instrument.h \
 	debug/log.h \
 	debug/memtrack.h \
 	debug/profile.h \
-	stats/stats_fd.h \
+	stats/stats_fwd.h \
 	stats/libstats.h \
 	stats/stats.h \
-	sys/compiler.h \
-	sys/math.h \
-	sys/preprocessor.h \
-	sys/rcache.h \
-	sys/sys.h \
-	time/time.h \
-	time/timerq.h \
-	time/timer_wheel.h \
+	sys/compiler_def.h\
+	sys/string.h \
+	time/time_def.h \
 	type/class.h \
 	type/component.h \
 	type/spinlock.h \
@@ -79,6 +58,32 @@ nobase_dist_libucs_la_HEADERS = \
 	type/cpu_set.h
 
 noinst_HEADERS = \
+	datastruct/arbiter.h \
+	datastruct/frag_list.h \
+	datastruct/hash.h \
+	datastruct/list.h \
+	datastruct/mpmc.h \
+	datastruct/mpool.inl \
+	datastruct/pgtable.h \
+	datastruct/ptr_array.h \
+	datastruct/queue_types.h \
+	datastruct/queue.h \
+	datastruct/sglib.h \
+	datastruct/sglib_wrapper.h \
+	datastruct/khash.h \
+	sys/checker.h \
+	sys/compiler.h \
+	sys/math.h \
+	sys/preprocessor.h \
+	sys/rcache.h \
+	sys/sys.h \
+	time/time.h \
+	time/timerq.h \
+	time/timer_wheel.h \
+	async/async.h \
+	async/pipe.h \
+	async/signal.h \
+	async/thread.h \
 	async/async_int.h
 
 libucs_la_SOURCES = \
@@ -100,7 +105,6 @@ libucs_la_SOURCES = \
 	datastruct/pgtable.c \
 	datastruct/ptr_array.c \
 	debug/debug.c \
-	debug/instrument.c \
 	debug/log.c \
 	debug/memtrack.c \
 	debug/profile.c \
@@ -108,6 +112,7 @@ libucs_la_SOURCES = \
 	sys/init.c \
 	sys/math.c \
 	sys/rcache.c \
+	sys/string.c \
 	sys/sys.c \
 	time/time.c \
 	time/timer_wheel.c \
@@ -115,7 +120,7 @@ libucs_la_SOURCES = \
 	type/class.c \
 	type/component.c \
 	type/status.c
-	
+
 if HAVE_STATS
 libucs_la_SOURCES += \
 	stats/client_server.c \

@@ -7,6 +7,7 @@
 extern "C" {
 #include <uct/api/uct.h>
 #include <ucs/time/time.h>
+#include <ucs/arch/atomic.h>
 }
 #include <common/test.h>
 #include "uct_test.h"
@@ -36,14 +37,14 @@ public:
     } pending_send_request_t;
 
     static ucs_status_t am_handler(void *arg, void *data, size_t length,
-                                   void *desc) {
+                                   unsigned flags) {
 
-        unsigned *counter = (unsigned *) arg;
+        volatile unsigned *counter = (volatile unsigned*) arg;
         uint64_t test_hdr = *(uint64_t *) data;
         uint64_t actual_data = *(unsigned*)((char*)data + sizeof(test_hdr));
 
         if ((test_hdr == 0xabcd) && (actual_data == (0xdeadbeef + *counter))) {
-            (*counter)++;
+            ucs_atomic_add32(counter, 1);
         } else {
             UCS_TEST_ABORT("Error in comparison in pending_am_handler. Counter: " << counter);
         }
@@ -52,7 +53,7 @@ public:
     }
 
     static ucs_status_t am_handler_simple(void *arg, void *data, size_t length,
-                                          void *desc) {
+                                          unsigned flags) {
         return UCS_OK;
     }
 
@@ -127,10 +128,10 @@ void install_handler_sync_or_async(uct_iface_t *iface, uint8_t id, uct_am_callba
     status = uct_iface_query(iface, &attr);
     ASSERT_UCS_OK(status);
 
-    if (attr.cap.flags & UCT_IFACE_FLAG_AM_CB_SYNC) {
-        uct_iface_set_am_handler(iface, id, cb, arg, UCT_AM_CB_FLAG_SYNC);
+    if (attr.cap.flags & UCT_IFACE_FLAG_CB_SYNC) {
+        uct_iface_set_am_handler(iface, id, cb, arg, UCT_CB_FLAG_SYNC);
     } else {
-        uct_iface_set_am_handler(iface, id, cb, arg, UCT_AM_CB_FLAG_ASYNC);
+        uct_iface_set_am_handler(iface, id, cb, arg, UCT_CB_FLAG_ASYNC);
     }
 }
 
@@ -162,7 +163,7 @@ UCS_TEST_P(test_uct_pending, pending_op)
                 if (status != UCS_OK) {
                     /* the request wasn't added to the pending data structure
                      * since resources became available. retry sending this message */
-                    free(req);
+                    delete req;
                 } else {
                     /* the request was added to the pending data structure */
                     send_data += 1;
@@ -210,13 +211,15 @@ UCS_TEST_P(test_uct_pending, send_ooo_with_pending)
 
             status_pend = uct_ep_pending_add(m_e1->ep(0), &req->uct);
             if (status_pend == UCS_ERR_BUSY) {
-                free(req);
+                delete req;
             } else {
                 /* coverity[leaked_storage] */
+                ++send_data;
                 break;
             }
         } else {
-            send_data += 1;
+            ASSERT_UCS_OK(status_send);
+            ++send_data;
         }
     } while (ucs_get_time() < loop_end_limit);
 
@@ -236,16 +239,19 @@ UCS_TEST_P(test_uct_pending, send_ooo_with_pending)
 
     /* send a new message. the transport should make sure that this new message
      * isn't sent before the one in pending, thus preventing out-of-order in sending. */
-    send_data += 1;
     do {
         status_send = uct_ep_am_short(m_e1->ep(0), 0, test_pending_hdr,
                                       &send_data, sizeof(send_data));
         short_progress_loop();
     } while (status_send == UCS_ERR_NO_RESOURCE);
+    ASSERT_UCS_OK(status_send);
+    ++send_data;
 
     /* the receive side checks that the messages were received in order.
      * check the last message here. (counter was raised by one for next iteration) */
-    EXPECT_EQ(send_data, 0xdeadbeef + counter - 1);
+    unsigned exp_counter = send_data - 0xdeadbeefUL;
+    wait_for_value(&counter, exp_counter, true);
+    EXPECT_EQ(exp_counter, counter);
 }
 
 UCS_TEST_P(test_uct_pending, pending_fairness)

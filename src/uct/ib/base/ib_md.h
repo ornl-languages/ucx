@@ -38,17 +38,31 @@ typedef enum {
 
 
 enum {
-    UCT_IB_MEM_FLAG_ODP       = UCS_BIT(0),
-    UCT_IB_MEM_FLAG_ATOMIC_MR = UCS_BIT(1)
+    UCT_IB_MEM_FLAG_ODP             = UCS_BIT(0), /**< The memory region has on
+                                                       demand paging enabled */
+    UCT_IB_MEM_FLAG_ATOMIC_MR       = UCS_BIT(1), /**< The memory region has UMR
+                                                       for the atomic access */
+    UCT_IB_MEM_ACCESS_REMOTE_ATOMIC = UCS_BIT(2)  /**< An atomic access was 
+                                                       requested for the memory
+                                                       region */
 };
 
 
-typedef struct uct_ib_odp_config {
-    uct_ib_numa_policy_t numa_policy;/**< NUMA policy flags for ODP */
-    int                  prefetch;   /**< Auto-prefetch non-blocking memory
-                                          registrations / allocations */
-    size_t               max_size;   /**< Maximal memory region size for ODP */
-} uct_ib_odp_config_t;
+typedef struct uct_ib_md_ext_config {
+    int                      eth_pause;    /**< Whether or not Pause Frame is
+                                                enabled on the Ethernet network */
+    int                      prefer_nearest_device; /**< Give priority for near
+                                                         device */
+    int                      enable_contig_pages; /** Enable contiguous pages */
+
+    struct {
+        uct_ib_numa_policy_t numa_policy;  /**< NUMA policy flags for ODP */
+        int                  prefetch;     /**< Auto-prefetch non-blocking memory
+                                                registrations / allocations */
+        size_t               max_size;     /**< Maximal memory region size for ODP */
+    } odp;
+
+} uct_ib_md_ext_config_t;
 
 
 typedef struct uct_ib_mem {
@@ -67,12 +81,15 @@ typedef struct uct_ib_md {
     struct ibv_pd            *pd;       /**< IB memory domain */
     uct_ib_device_t          dev;       /**< IB device */
     uct_linear_growth_t      reg_cost;  /**< Memory registration cost */
-    int                      eth_pause; /**< Pause Frame on an Ethernet network */
-    uct_ib_odp_config_t      odp;       /**< ODP configuration */
     /* keep it in md because pd is needed to create umr_qp/cq */
     struct ibv_qp            *umr_qp;   /* special QP for creating UMR */
     struct ibv_cq            *umr_cq;   /* special CQ for creating UMR */
     UCS_STATS_NODE_DECLARE(stats);
+    uct_ib_md_ext_config_t   config;    /* IB external configuration */
+    struct {
+        uct_ib_device_spec_t *specs;    /* Custom device specifications */
+        unsigned             count;     /* Number of custom devices */
+    } custom_devices;
 } uct_ib_md_t;
 
 
@@ -91,11 +108,12 @@ typedef struct uct_ib_md_config {
 
     uct_linear_growth_t      uc_reg_cost;  /**< Memory registration cost estimation
                                                 without using the cache */
+    unsigned                 fork_init;    /**< Use ibv_fork_init() */
 
-    unsigned                fork_init;     /**< Use ibv_fork_init() */
-    int                     eth_pause;     /**< Whether or not Pause Frame is
-                                                enabled on the Ethernet network */
-    uct_ib_odp_config_t      odp;          /**< ODP configuration */
+    uct_ib_md_ext_config_t   ext;          /**< External configuration */
+
+    UCS_CONFIG_STRING_ARRAY_FIELD(spec) custom_devices; /**< Custom device specifications */
+
 } uct_ib_md_config_t;
 
 
@@ -126,6 +144,15 @@ static inline uint32_t uct_ib_md_direct_rkey(uct_rkey_t uct_rkey)
 static uint32_t uct_ib_md_indirect_rkey(uct_rkey_t uct_rkey)
 {
     return uct_rkey >> 32;
+}
+
+
+static UCS_F_ALWAYS_INLINE void
+uct_ib_md_pack_rkey(uint32_t rkey, uint32_t atomic_rkey, void *rkey_buffer)
+{
+    uint64_t *rkey_p = (uint64_t*)rkey_buffer;
+    *rkey_p = (((uint64_t)atomic_rkey) << 32) | rkey;
+     ucs_trace("packed rkey: direct 0x%x indirect 0x%x", rkey, atomic_rkey);
 }
 
 

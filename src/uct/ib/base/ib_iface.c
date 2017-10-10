@@ -13,6 +13,7 @@
 #include <ucs/type/class.h>
 #include <ucs/type/cpu_set.h>
 #include <ucs/debug/log.h>
+#include <ucs/time/time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <poll.h>
@@ -81,7 +82,25 @@ ucs_config_field_t uct_ib_iface_config_table[] = {
    "Number of send WQEs for which completion is requested.",
    ucs_offsetof(uct_ib_iface_config_t, tx.cq_moderation), UCS_CONFIG_TYPE_UINT},
 
-  UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_", 65536, 1024, "send",
+#if HAVE_DECL_IBV_EXP_CQ_MODERATION
+  {"TX_EVENT_MOD_COUNT", "0",
+   "Number of send completions for which an event would be generated (0 - disabled).",
+   ucs_offsetof(uct_ib_iface_config_t, tx.cq_moderation_count), UCS_CONFIG_TYPE_UINT},
+
+  {"TX_EVENT_MOD_PERIOD", "0us",
+   "Time period to generate send event (0 - disabled).",
+   ucs_offsetof(uct_ib_iface_config_t, tx.cq_moderation_period), UCS_CONFIG_TYPE_TIME},
+
+  {"RX_EVENT_MOD_COUNT", "0",
+   "Number of received messages for which an event would be generated (0 - disabled).",
+   ucs_offsetof(uct_ib_iface_config_t, rx.cq_moderation_count), UCS_CONFIG_TYPE_UINT},
+
+  {"RX_EVENT_MOD_PERIOD", "0us",
+   "Time period to generate receive event (0 - disabled).",
+   ucs_offsetof(uct_ib_iface_config_t, rx.cq_moderation_period), UCS_CONFIG_TYPE_TIME},
+#endif /* HAVE_DECL_IBV_EXP_CQ_MODERATION */
+
+  UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_", -1, 1024, "send",
                                 ucs_offsetof(uct_ib_iface_config_t, tx.mp),
       "\nAttention: Setting this param with value != -1 is a dangerous thing\n"
       "in RC/DC and could cause deadlock or performance degradation."),
@@ -134,15 +153,6 @@ ucs_config_field_t uct_ib_iface_config_table[] = {
   {NULL}
 };
 
-uct_ib_device_info_t uct_ib_device_info_table[] = {
-  {4099, "ConnectX-3", 0, 10},
-  {4103, "ConnectX-3 Pro", 0, 11},
-  {4113, "Connect-IB", UCT_IB_DEVICE_FLAG_MLX5_PRM, 20},
-  {4115, "ConnectX-4", UCT_IB_DEVICE_FLAG_MLX5_PRM, 30},
-  {4117, "ConnectX-4 LX", UCT_IB_DEVICE_FLAG_MLX5_PRM, 28},
-  {0, "", 0, 0}
-};
-
 static void uct_ib_iface_recv_desc_init(uct_iface_h tl_iface, void *obj, uct_mem_h memh)
 {
     uct_ib_iface_recv_desc_t *desc = obj;
@@ -174,9 +184,9 @@ ucs_status_t uct_ib_iface_recv_mpool_init(uct_ib_iface_t *iface,
                                 name);
 }
 
-void uct_ib_iface_release_am_desc(uct_iface_t *tl_iface, void *desc)
+void uct_ib_iface_release_desc(uct_recv_desc_t *self, void *desc)
 {
-    uct_ib_iface_t *iface = ucs_derived_of(tl_iface, uct_ib_iface_t);
+    uct_ib_iface_t *iface = ucs_container_of(self, uct_ib_iface_t, release_desc);
     void *ib_desc;
 
     ib_desc = desc - iface->config.rx_headroom_offset;
@@ -201,24 +211,35 @@ int uct_ib_iface_is_reachable(const uct_iface_h tl_iface, const uct_device_addr_
     union ibv_gid gid;
     uint8_t is_global;
     uint16_t lid;
+    int is_local_ib;
 
     uct_ib_address_unpack(ib_addr, &lid, &is_global, &gid);
 
+    ucs_assert(iface->addr_type < UCT_IB_ADDRESS_TYPE_LAST);
     switch (iface->addr_type) {
     case UCT_IB_ADDRESS_TYPE_LINK_LOCAL:
-        /* IB */
-        return ib_addr->flags & UCT_IB_ADDRESS_FLAG_LINK_LAYER_IB;
     case UCT_IB_ADDRESS_TYPE_SITE_LOCAL:
     case UCT_IB_ADDRESS_TYPE_GLOBAL:
-        /* IB + same subnet prefix */
-        return (ib_addr->flags & UCT_IB_ADDRESS_FLAG_LINK_LAYER_IB) &&
-               (gid.global.subnet_prefix == iface->gid.global.subnet_prefix);
+         is_local_ib = 1;
+         break;
     case UCT_IB_ADDRESS_TYPE_ETH:
-        /* there shouldn't be a lid and the gid flag should be on */
-        return (ib_addr->flags & UCT_IB_ADDRESS_FLAG_LINK_LAYER_ETH) &&
-               (ib_addr->flags & UCT_IB_ADDRESS_FLAG_GID) &&
-               !(ib_addr->flags & UCT_IB_ADDRESS_FLAG_LID);
+         is_local_ib = 0;
+         break;
     default:
+         ucs_fatal("Unknown address type %d", iface->addr_type);
+         break;
+    }
+
+    if (is_local_ib && (ib_addr->flags & UCT_IB_ADDRESS_FLAG_LINK_LAYER_IB)) {
+        /* same subnet prefix */
+        return gid.global.subnet_prefix == iface->gid.global.subnet_prefix;
+    } else if (!is_local_ib && (ib_addr->flags & UCT_IB_ADDRESS_FLAG_LINK_LAYER_ETH)) {
+        /* there shouldn't be a lid and the gid flag should be on */
+        ucs_assert(ib_addr->flags & UCT_IB_ADDRESS_FLAG_GID);
+        ucs_assert(!(ib_addr->flags & UCT_IB_ADDRESS_FLAG_LID));
+        return 1;
+    } else {
+        /* local and remote have different link layers and therefore are unreachable */
         return 0;
     }
 }
@@ -241,6 +262,7 @@ void uct_ib_iface_fill_ah_attr(uct_ib_iface_t *iface, const uct_ib_address_t *ib
      */
     if (is_global &&
         ((iface->addr_type == UCT_IB_ADDRESS_TYPE_ETH) ||
+         (iface->addr_type == UCT_IB_ADDRESS_TYPE_GLOBAL) ||
          (iface->gid.global.subnet_prefix != ah_attr->grh.dgid.global.subnet_prefix)))
     {
         ah_attr->is_global      = 1;
@@ -350,8 +372,8 @@ static ucs_status_t uct_ib_iface_init_lmc(uct_ib_iface_t *iface,
     /* count the number of lid_path_bits */
     num_path_bits = 0;
     for (i = 0; i < config->lid_path_bits.count; i++) {
-        num_path_bits += 1 + abs(config->lid_path_bits.ranges[i].first -
-                                 config->lid_path_bits.ranges[i].last);
+        num_path_bits += 1 + abs((int)(config->lid_path_bits.ranges[i].first -
+                                       config->lid_path_bits.ranges[i].last));
     }
 
     iface->path_bits = ucs_calloc(1, num_path_bits * sizeof(*iface->path_bits),
@@ -467,6 +489,48 @@ out:
     return status;
 }
 
+
+static ucs_status_t uct_ib_iface_set_moderation(struct ibv_cq *cq,
+                                                unsigned count, double period_usec)
+{
+#if HAVE_DECL_IBV_EXP_CQ_MODERATION
+    unsigned period = (unsigned)(period_usec * UCS_USEC_PER_SEC);
+
+    if (count > UINT16_MAX) {
+        ucs_error("CQ moderation count is too high: %u, max value: %u", count, UINT16_MAX);
+        return UCS_ERR_INVALID_PARAM;
+    } else if (count == 0) {
+        /* in case if count value is 0 (unchanged default value) - set it to maximum
+         * possible value */
+        count = UINT16_MAX;
+    }
+
+    if (period > UINT16_MAX) {
+        ucs_error("CQ moderation period is too high: %u, max value: %uus", period, UINT16_MAX);
+        return UCS_ERR_INVALID_PARAM;
+    } else if (period == 0) {
+        /* in case if count value is 0 (unchanged default value) - set it to maximum
+         * possible value, the same behavior as counter */
+        period = UINT16_MAX;
+    }
+
+    if ((count < UINT16_MAX) || (period < UINT16_MAX)) {
+        struct ibv_exp_cq_attr cq_attr = {
+            .comp_mask            = IBV_EXP_CQ_ATTR_MODERATION,
+            .moderation.cq_count  = (uint16_t)(count),
+            .moderation.cq_period = (uint16_t)(period),
+            .cq_cap_flags         = 0
+        };
+        if (ibv_exp_modify_cq(cq, &cq_attr, IBV_EXP_CQ_MODERATION)) {
+            ucs_error("ibv_exp_modify_cq(count=%d, period=%d) failed: %m", count, period);
+            return UCS_ERR_IO_ERROR;
+        }
+    }
+#endif /* HAVE_DECL_IBV_EXP_CQ_MODERATION */
+
+    return UCS_OK;
+}
+
 /**
  * @param rx_headroom   Headroom requested by the user.
  * @param rx_priv_len   Length of transport private data to reserve (0 if unused)
@@ -475,8 +539,9 @@ out:
  */
 UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
                     uct_worker_h worker, const uct_iface_params_t *params,
-                    unsigned rx_priv_len, unsigned rx_hdr_len, unsigned tx_cq_len,
-                    size_t mss, const uct_ib_iface_config_t *config)
+                    unsigned rx_priv_len, unsigned rx_hdr_len,
+                    unsigned tx_cq_len, unsigned rx_cq_len, size_t mss,
+                    const uct_ib_iface_config_t *config)
 {
     uct_ib_device_t *dev = &ucs_derived_of(md, uct_ib_md_t)->dev;
     int preferred_cpu = ucs_cpu_set_find_lcs(&params->cpu_mask);
@@ -486,15 +551,17 @@ UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
 
     if (params->stats_root == NULL) {
         UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &ops->super, md, worker,
-                                  &config->super UCS_STATS_ARG(dev->stats)
-                                  UCS_STATS_ARG(params->dev_name));
+                                  params, &config->super
+                                  UCS_STATS_ARG(dev->stats)
+                                  UCS_STATS_ARG(params->mode.device.dev_name));
     } else {
         UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &ops->super, md, worker,
-                                  &config->super UCS_STATS_ARG(params->stats_root)
-                                  UCS_STATS_ARG(params->dev_name));
+                                  params, &config->super
+                                  UCS_STATS_ARG(params->stats_root)
+                                  UCS_STATS_ARG(params->mode.device.dev_name));
     }
 
-    status = uct_ib_device_find_port(dev, params->dev_name, &port_num);
+    status = uct_ib_device_find_port(dev, params->mode.device.dev_name, &port_num);
     if (status != UCS_OK) {
         goto err;
     }
@@ -502,7 +569,7 @@ UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
     self->ops                      = ops;
 
     self->config.rx_payload_offset = sizeof(uct_ib_iface_recv_desc_t) +
-                                     ucs_max(sizeof(uct_am_recv_desc_t) +
+                                     ucs_max(sizeof(uct_recv_desc_t) +
                                              params->rx_headroom,
                                              rx_priv_len + rx_hdr_len);
     self->config.rx_hdr_offset     = self->config.rx_payload_offset - rx_hdr_len;
@@ -516,6 +583,7 @@ UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
     self->config.port_num          = port_num;
     self->config.sl                = config->sl;
     self->config.gid_index         = config->gid_index;
+    self->release_desc.cb          = uct_ib_iface_release_desc;
 
     status = uct_ib_iface_init_pkey(self, config);
     if (status != UCS_OK) {
@@ -554,11 +622,25 @@ UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
     ucs_assert_always(inl <= UINT8_MAX);
     self->config.max_inl_resp = inl;
 
+    status = uct_ib_iface_set_moderation(self->send_cq,
+                                         config->tx.cq_moderation_count,
+                                         config->tx.cq_moderation_period);
+    if (status != UCS_OK) {
+        goto err_destroy_send_cq;
+    }
+
     inl = config->rx.inl;
-    status = uct_ib_iface_create_cq(self, config->rx.queue_len, &inl,
+    status = uct_ib_iface_create_cq(self, rx_cq_len, &inl,
                                     preferred_cpu, &self->recv_cq);
     if (status != UCS_OK) {
         goto err_destroy_send_cq;
+    }
+
+    status = uct_ib_iface_set_moderation(self->recv_cq,
+                                         config->rx.cq_moderation_count,
+                                         config->rx.cq_moderation_period);
+    if (status != UCS_OK) {
+        goto err_destroy_recv_cq;
     }
 
     /* Address scope and size */
@@ -581,6 +663,8 @@ UCS_CLASS_INIT_FUNC(uct_ib_iface_t, uct_ib_iface_ops_t *ops, uct_md_h md,
 
     return UCS_OK;
 
+err_destroy_recv_cq:
+    ibv_destroy_cq(self->recv_cq);
 err_destroy_send_cq:
     ibv_destroy_cq(self->send_cq);
 err_destroy_comp_channel:
@@ -654,8 +738,10 @@ ucs_status_t uct_ib_iface_query(uct_ib_iface_t *iface, size_t xport_hdr_len,
     uint8_t active_width, active_speed, active_mtu;
     double encoding, signal_rate, wire_speed;
     size_t mtu, width, extra_pkt_len;
-    int i = 0;
-
+    cpu_set_t temp_cpu_mask, process_affinity;
+    int ret;
+    uct_ib_md_t *md = uct_ib_iface_md(iface);
+    
     active_width = uct_ib_iface_port_attr(iface)->active_width;
     active_speed = uct_ib_iface_port_attr(iface)->active_speed;
     active_mtu   = uct_ib_iface_port_attr(iface)->active_mtu;
@@ -675,40 +761,68 @@ ucs_status_t uct_ib_iface_query(uct_ib_iface_t *iface, size_t xport_hdr_len,
 
     switch (active_speed) {
     case 1: /* SDR */
-        iface_attr->latency = 5000e-9;
-        signal_rate         = 2.5e9;
-        encoding            = 8.0/10.0;
+        iface_attr->latency.overhead = 5000e-9;
+        signal_rate                  = 2.5e9;
+        encoding                     = 8.0/10.0;
         break;
     case 2: /* DDR */
-        iface_attr->latency = 2500e-9;
-        signal_rate         = 5.0e9;
-        encoding            = 8.0/10.0;
+        iface_attr->latency.overhead = 2500e-9;
+        signal_rate                  = 5.0e9;
+        encoding                     = 8.0/10.0;
         break;
-    case 4: /* QDR */
-        iface_attr->latency = 1300e-9;
-        signal_rate         = 10.0e9;
-        encoding            = 8.0/10.0;
+    case 4:
+        iface_attr->latency.overhead = 1300e-9;
+        if (IBV_PORT_IS_LINK_LAYER_ETHERNET(uct_ib_iface_port_attr(iface))) {
+            /* 10/40g Eth  */
+            signal_rate              = 10.3125e9;
+            encoding                 = 64.0/66.0;
+        } else {
+            /* QDR */
+            signal_rate              = 10.0e9;
+            encoding                 = 8.0/10.0;
+        }
         break;
     case 8: /* FDR10 */
-        iface_attr->latency = 700e-9;
-        signal_rate         = 10.3125e9;
-        encoding            = 64.0/66.0;
+        iface_attr->latency.overhead = 700e-9;
+        signal_rate                  = 10.3125e9;
+        encoding                     = 64.0/66.0;
         break;
     case 16: /* FDR */
-        iface_attr->latency = 700e-9;
-        signal_rate         = 14.0625e9;
-        encoding            = 64.0/66.0;
+        iface_attr->latency.overhead = 700e-9;
+        signal_rate                  = 14.0625e9;
+        encoding                     = 64.0/66.0;
         break;
-    case 32: /* EDR */
-        iface_attr->latency = 600e-9;
-        signal_rate         = 25.78125e9;
-        encoding            = 64.0/66.0;
+    case 32: /* EDR / 100g Eth */
+        iface_attr->latency.overhead = 600e-9;
+        signal_rate                  = 25.78125e9;
+        encoding                     = 64.0/66.0;
+        break;
+    case 64: /* 50g Eth */
+        iface_attr->latency.overhead = 600e-9;
+        signal_rate                  = 25.78125e9 * 2;
+        encoding                     = 64.0/66.0;
         break;
     default:
         ucs_error("Invalid active_speed on %s:%d: %d",
                   UCT_IB_IFACE_ARG(iface), active_speed);
         return UCS_ERR_IO_ERROR;
     }
+
+    if (md->config.prefer_nearest_device) {
+        ret = sched_getaffinity(0, sizeof(process_affinity), &process_affinity);
+        if (ret) {
+            ucs_error("sched_getaffinity() failed: %m");
+            return UCS_ERR_INVALID_PARAM;
+        }
+
+        /* update latency for remote device */
+        CPU_AND(&temp_cpu_mask, &dev->local_cpus, &process_affinity);
+        if (!CPU_EQUAL(&process_affinity, &temp_cpu_mask)) {
+            iface_attr->latency.overhead += 200e-9;
+        }
+    }
+    
+    iface_attr->latency.growth = 0;
 
     /* Wire speed calculation: Width * SignalRate * Encoding */
     width                 = ib_port_widths[ucs_ilog2(active_width)];
@@ -728,28 +842,26 @@ ucs_status_t uct_ib_iface_query(uct_ib_iface_t *iface, size_t xport_hdr_len,
     }
 
     iface_attr->bandwidth = (wire_speed * mtu) / (mtu + extra_pkt_len);
-
-    /* Set priority of current device */
-    iface_attr->priority = 0;
-    while (uct_ib_device_info_table[i].vendor_part_id != 0) {
-        if (uct_ib_device_info_table[i].vendor_part_id == dev->dev_attr.vendor_part_id) {
-            iface_attr->priority = uct_ib_device_info_table[i].priority;
-            break;
-        }
-        i++;
-    }
+    iface_attr->priority  = uct_ib_device_spec(dev)->priority;
 
     return UCS_OK;
 }
 
-ucs_status_t uct_ib_iface_wakeup_arm(uct_wakeup_h wakeup)
+ucs_status_t uct_ib_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p)
 {
-    int res, send_cq_count = 0, recv_cq_count = 0;
-    ucs_status_t status;
+    uct_ib_iface_t *iface = ucs_derived_of(tl_iface, uct_ib_iface_t);
+    *fd_p  = iface->comp_channel->fd;
+    return UCS_OK;
+}
+
+ucs_status_t uct_ib_iface_pre_arm(uct_ib_iface_t *iface)
+{
+    int res, send_cq_count, recv_cq_count;
     struct ibv_cq *cq;
     void *cq_context;
-    uct_ib_iface_t *iface = ucs_derived_of(wakeup->iface, uct_ib_iface_t);
 
+    send_cq_count = 0;
+    recv_cq_count = 0;
     do {
         res = ibv_get_cq_event(iface->comp_channel, &cq, &cq_context);
         if (0 == res) {
@@ -776,82 +888,23 @@ ucs_status_t uct_ib_iface_wakeup_arm(uct_wakeup_h wakeup)
 
     /* avoid re-arming the interface if any events exists */
     if ((send_cq_count > 0) || (recv_cq_count > 0)) {
+        ucs_trace("arm_cq: got %d send and %d recv events, returning BUSY",
+                  send_cq_count, recv_cq_count);
         return UCS_ERR_BUSY;
     }
 
-    if (wakeup->events & UCT_WAKEUP_TX_COMPLETION) {
-        status = iface->ops->arm_tx_cq(iface);
-        if (status != UCS_OK) {
-            return status;
-        }
-    }
-
-    if (wakeup->events & (UCT_WAKEUP_RX_AM | UCT_WAKEUP_RX_SIGNALED_AM)) {
-        status = iface->ops->arm_rx_cq(iface, 0);
-        if (status != UCS_OK) {
-            return status;
-        }
-    }
-
     return UCS_OK;
-}
-
-ucs_status_t uct_ib_iface_wakeup_get_fd(uct_wakeup_h wakeup, int *fd_p)
-{
-    *fd_p = wakeup->fd;
-    return UCS_OK;
-}
-
-ucs_status_t uct_ib_iface_wakeup_wait(uct_wakeup_h wakeup)
-{
-    ucs_status_t status;
-    int res;
-    struct pollfd polled = { .fd = wakeup->fd, .events = POLLIN };
-
-    status = wakeup->iface->ops.iface_wakeup_arm(wakeup);
-    if (UCS_ERR_BUSY == status) { /* if UCS_ERR_BUSY returned - no poll() must called */
-        return UCS_OK;
-    } else if (status != UCS_OK) {
-        return status;
-    }
-
-    do {
-        res = poll(&polled, 1, -1);
-    } while ((res == -1) && (errno == EINTR));
-
-    if ((res != 1) || (polled.revents != POLLIN)) {
-        return UCS_ERR_IO_ERROR;
-    }
-
-    return status;
-}
-
-ucs_status_t uct_ib_iface_wakeup_open(uct_iface_h iface, unsigned events,
-                                      uct_wakeup_h wakeup)
-{
-    uct_ib_iface_t *ib_iface = ucs_derived_of(iface, uct_ib_iface_t);
-    wakeup->fd = ib_iface->comp_channel->fd;
-    return UCS_OK;
-}
-
-ucs_status_t uct_ib_iface_wakeup_signal(uct_wakeup_h wakeup)
-{
-    return UCS_ERR_UNSUPPORTED;
-}
-
-void uct_ib_iface_wakeup_close(uct_wakeup_h wakeup)
-{
 }
 
 static ucs_status_t uct_ib_iface_arm_cq(uct_ib_iface_t *iface, struct ibv_cq *cq,
-                                        int solicited)
+                                        int solicited_only)
 {
     int ret;
 
-    ret = ibv_req_notify_cq(cq, solicited);
+    ret = ibv_req_notify_cq(cq, solicited_only);
     if (ret != 0) {
-        ucs_error("ibv_req_notify_cq("UCT_IB_IFACE_FMT", cq) failed: %m",
-                  UCT_IB_IFACE_ARG(iface));
+        ucs_error("ibv_req_notify_cq("UCT_IB_IFACE_FMT", cq, sol=%d) failed: %m",
+                  UCT_IB_IFACE_ARG(iface), solicited_only);
         return UCS_ERR_IO_ERROR;
     }
     return UCS_OK;
@@ -862,7 +915,7 @@ ucs_status_t uct_ib_iface_arm_tx_cq(uct_ib_iface_t *iface)
     return uct_ib_iface_arm_cq(iface, iface->send_cq, 0);
 }
 
-ucs_status_t uct_ib_iface_arm_rx_cq(uct_ib_iface_t *iface, int solicited)
+ucs_status_t uct_ib_iface_arm_rx_cq(uct_ib_iface_t *iface, int solicited_only)
 {
-    return uct_ib_iface_arm_cq(iface, iface->recv_cq, solicited);
+    return uct_ib_iface_arm_cq(iface, iface->recv_cq, solicited_only);
 }

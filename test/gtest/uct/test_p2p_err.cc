@@ -26,36 +26,6 @@ public:
     };
 
     uct_p2p_err_test() : uct_p2p_test(0) {
-        errors.clear();
-    }
-
-    ~uct_p2p_err_test() {
-        errors.clear();
-    }
-
-    static ucs_log_func_rc_t
-    log_handler(const char *file, unsigned line, const char *function,
-                ucs_log_level_t level, const char *prefix, const char *message,
-                va_list ap)
-    {
-        char buf[200] = {0};
-
-        if (level > UCS_LOG_LEVEL_WARN) {
-            /* debug messages are ignored */
-            return UCS_LOG_FUNC_RC_CONTINUE;
-        }
-
-        va_list ap_copy;
-        va_copy(ap_copy, ap); /* Create a copy of arglist, to use it 2nd time */
-
-        ucs_log_default_handler(file, line, function, UCS_LOG_LEVEL_DEBUG,
-                                prefix, message, ap);
-        vsnprintf(buf, sizeof(buf), message, ap_copy);
-        va_end(ap_copy);
-
-        UCS_TEST_MESSAGE << "   < " << buf << " >";
-        errors.push_back(buf);
-        return UCS_LOG_FUNC_RC_STOP;
     }
 
     static size_t pack_cb(void *dest, void *arg)
@@ -72,10 +42,9 @@ public:
     {
         pack_arg arg;
 
-        errors.clear();
+        wrap_errors();
 
-        ucs_log_push_handler(log_handler);
-        UCS_TEST_SCOPE_EXIT() { ucs_log_pop_handler(); } UCS_TEST_SCOPE_EXIT_END
+        UCS_TEST_SCOPE_EXIT() { restore_errors(); } UCS_TEST_SCOPE_EXIT_END
 
         ucs_status_t status = UCS_OK;
         ssize_t packed_len;
@@ -106,14 +75,14 @@ public:
             case OP_AM_BCOPY:
                 arg.buffer = buffer;
                 arg.length = length;
-                packed_len = uct_ep_am_bcopy(sender_ep(), am_id, pack_cb, &arg);
+                packed_len = uct_ep_am_bcopy(sender_ep(), am_id, pack_cb, &arg, 0);
                 status = (packed_len >= 0) ? UCS_OK : (ucs_status_t)packed_len;
                 break;
             case OP_AM_ZCOPY:
             {
                 UCS_TEST_GET_BUFFER_IOV(iov, iovcnt, buffer, 1, memh, 1);
                 status = uct_ep_am_zcopy(sender_ep(), am_id, buffer, length,
-                                         iov, iovcnt, NULL);
+                                         iov, iovcnt, 0, NULL);
             }
                 break;
             }
@@ -130,8 +99,8 @@ public:
         /* Count how many error messages match/don't match the given pattern */
         size_t num_matched   = 0;
         size_t num_unmatched = 0;
-        for (std::vector<std::string>::iterator iter = errors.begin();
-                        iter != errors.end(); ++iter) {
+        for (std::vector<std::string>::iterator iter = m_errors.begin();
+                        iter != m_errors.end(); ++iter) {
             if (iter->find(error_pattern) != iter->npos) {
                 ++num_matched;
             } else {
@@ -144,15 +113,24 @@ public:
                         "' has occurred during the test";
         EXPECT_EQ(0ul, num_unmatched) <<
                         "Unexpected error(s) occurred during the test";
-        errors.clear();
     }
 
-    static std::vector<std::string> errors;
+    static void* get_unused_address(size_t length)
+    {
+        void *address = NULL;
+        ucs_status_t status = ucs_mmap_alloc(&length, &address, 0
+                                             UCS_MEMTRACK_NAME("test_dummy"));
+        ASSERT_UCS_OK(status, << "length = " << length);
+        status = ucs_mmap_free(address, length);
+        ASSERT_UCS_OK(status);
+        /* coverity[use_after_free] */
+        return address;
+    }
+
     static ucs_status_t last_error;
 
 };
 
-std::vector<std::string> uct_p2p_err_test::errors;
 ucs_status_t uct_p2p_err_test::last_error = UCS_OK;
 
 
@@ -161,9 +139,8 @@ UCS_TEST_P(uct_p2p_err_test, local_access_error) {
     mapped_buffer sendbuf(16, 1, sender());
     mapped_buffer recvbuf(16, 2, receiver());
 
-    const size_t offset = 4 * 1024 * 1024;
     test_error_run(OP_PUT_ZCOPY, 0,
-                   (char*)sendbuf.ptr() + offset, sendbuf.length() + offset,
+                   get_unused_address(sendbuf.length()), sendbuf.length(),
                    sendbuf.memh(), recvbuf.addr(), recvbuf.rkey(),
                    "");
 
@@ -175,10 +152,9 @@ UCS_TEST_P(uct_p2p_err_test, remote_access_error) {
     mapped_buffer sendbuf(16, 1, sender());
     mapped_buffer recvbuf(16, 2, receiver());
 
-    const size_t offset = 4 * 1024 * 1024;
     test_error_run(OP_PUT_ZCOPY, 0,
-                   (char*)sendbuf.ptr() + offset, sendbuf.length() + offset,
-                   sendbuf.memh(), recvbuf.addr() + 4, recvbuf.rkey(),
+                   sendbuf.ptr(), sendbuf.length(), sendbuf.memh(),
+                   (uintptr_t)get_unused_address(recvbuf.length()), recvbuf.rkey(),
                    "");
 
     recvbuf.pattern_check(2);
@@ -196,7 +172,7 @@ UCS_TEST_P(uct_p2p_err_test, invalid_put_short_length) {
     mapped_buffer recvbuf(max_short + 1, 2, receiver());
 
     test_error_run(OP_PUT_SHORT, 0, sendbuf.ptr(), sendbuf.length(),
-                   UCT_INVALID_MEM_HANDLE, recvbuf.addr(), recvbuf.rkey(),
+                   UCT_MEM_HANDLE_NULL, recvbuf.addr(), recvbuf.rkey(),
                    "length");
 
     recvbuf.pattern_check(2);
@@ -213,7 +189,7 @@ UCS_TEST_P(uct_p2p_err_test, invalid_put_bcopy_length) {
     mapped_buffer recvbuf(max_bcopy + 1, 2, receiver());
 
     test_error_run(OP_PUT_BCOPY, 0, sendbuf.ptr(), sendbuf.length(),
-                   UCT_INVALID_MEM_HANDLE, recvbuf.addr(), recvbuf.rkey(),
+                   UCT_MEM_HANDLE_NULL, recvbuf.addr(), recvbuf.rkey(),
                    "length");
 
     recvbuf.pattern_check(2);
@@ -230,7 +206,7 @@ UCS_TEST_P(uct_p2p_err_test, invalid_am_short_length) {
     mapped_buffer recvbuf(max_short + 1,                    2, receiver());
 
     test_error_run(OP_AM_SHORT, 0, sendbuf.ptr(), sendbuf.length(),
-                   UCT_INVALID_MEM_HANDLE, recvbuf.addr(), recvbuf.rkey(),
+                   UCT_MEM_HANDLE_NULL, recvbuf.addr(), recvbuf.rkey(),
                    "length");
 
     recvbuf.pattern_check(2);
@@ -247,7 +223,7 @@ UCS_TEST_P(uct_p2p_err_test, invalid_am_bcopy_length) {
     mapped_buffer recvbuf(max_bcopy + 1, 2, receiver());
 
     test_error_run(OP_AM_BCOPY, 0, sendbuf.ptr(), sendbuf.length(),
-                   UCT_INVALID_MEM_HANDLE, recvbuf.addr(), recvbuf.rkey(),
+                   UCT_MEM_HANDLE_NULL, recvbuf.addr(), recvbuf.rkey(),
                    "length");
 
     recvbuf.pattern_check(2);
@@ -280,7 +256,7 @@ UCS_TEST_P(uct_p2p_err_test, invalid_am_id) {
     mapped_buffer sendbuf(4, 2, sender());
 
     test_error_run(OP_AM_SHORT, UCT_AM_ID_MAX, sendbuf.ptr(), sendbuf.length(),
-                   UCT_INVALID_MEM_HANDLE, 0, UCT_INVALID_RKEY,
+                   UCT_MEM_HANDLE_NULL, 0, UCT_INVALID_RKEY,
                    "active message id");
 }
 #endif

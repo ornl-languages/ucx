@@ -13,6 +13,8 @@
 #include "profile.h"
 
 #include <ucs/datastruct/khash.h>
+#include <ucs/sys/checker.h>
+#include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 #include <sys/wait.h>
 #include <execinfo.h>
@@ -111,13 +113,27 @@ const char *ucs_signal_names[] = {
     [SIGSYS + 1] = NULL
 };
 
-static void *ucs_debug_signal_restorer = &ucs_debug_signal_restorer;
+static void    *ucs_debug_signal_restorer = &ucs_debug_signal_restorer;
+static stack_t  ucs_debug_signal_stack    = {NULL, 0, 0};
 
 khash_t(ucs_debug_symbol) ucs_debug_symbols_cache;
 
 
 static int ucs_debug_backtrace_is_excluded(void *address, const char *symbol);
 
+
+static char *ucs_debug_strdup(const char *str)
+{
+    size_t length;
+    char *newstr;
+
+    length = strlen(str) + 1;
+    newstr = ucs_sys_realloc(NULL, 0, length);
+    if (newstr != NULL) {
+        strncpy(newstr, str, length);
+    }
+    return newstr;
+}
 
 static int dl_match_address(struct dl_phdr_info *info, size_t size, void *data)
 {
@@ -292,7 +308,7 @@ static backtrace_h ucs_debug_backtrace_create(void)
     int i, num_addresses;
     backtrace_h bckt;
 
-    bckt = malloc(sizeof *bckt);
+    bckt = ucs_sys_realloc(NULL, 0, sizeof *bckt);
     if (!bckt) {
         return NULL;
     }
@@ -326,7 +342,7 @@ static void ucs_debug_backtrace_destroy(backtrace_h bckt)
         free(bckt->lines[i].function);
         free(bckt->lines[i].file);
     }
-    free(bckt);
+    ucs_sys_free(bckt, sizeof(*bckt));
 }
 
 static ucs_status_t
@@ -351,12 +367,12 @@ ucs_debug_get_line_info(const char *filename, unsigned long base,
     }
 
     if (line.function) {
-        strncpy(info->function, line.function, sizeof(info->function));
+        ucs_strncpy_zero(info->function, line.function, sizeof(info->function));
     } else {
         strcpy(info->function, UCS_DEBUG_UNKNOWN_SYM);
     }
     if (line.file) {
-        strncpy(info->source_file, line.file, sizeof(info->source_file));
+        ucs_strncpy_zero(info->source_file, line.file, sizeof(info->source_file));
     } else {
         strcpy(info->function, UCS_DEBUG_UNKNOWN_SYM);
     }
@@ -495,7 +511,7 @@ static void ucs_debug_show_innermost_source_file(FILE *stream)
     bckt = ucs_debug_backtrace_create();
     while (backtrace_next(bckt, &address, &file, &function, &line)) {
         if (!ucs_debug_backtrace_is_excluded((void*)address, function)) {
-            ucs_debug_print_source_file(file, line, function, stderr);
+            ucs_debug_print_source_file(file, line, function, stream);
             break;
         }
     }
@@ -597,41 +613,13 @@ out:
     return sym ? sym : UCS_DEBUG_UNKNOWN_SYM;
 }
 
-static void *ucs_debug_alloc_mem(size_t length)
+static void ucs_debugger_attach()
 {
-    void *ptr;
-
-    ptr = mmap(NULL, ucs_align_up_pow2(length, ucs_get_page_size()),
-               PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
-        ucs_log_fatal_error("failed to allocate %zu bytes with mmap: %m", length);
-        return NULL;
-    }
-
-    return ptr;
-}
-
-static char *ucs_debug_strdup(const char *str)
-{
-    size_t length;
-    char *newstr;
-
-    length = strlen(str) + 1;
-    newstr = ucs_debug_alloc_mem(length);
-    if (newstr != NULL) {
-        strncpy(newstr, str, length);
-    }
-    return newstr;
-}
-
-static ucs_status_t ucs_debugger_attach()
-{
-    static const char *gdb_commands    = "bt\n";
-    static const char *gdb_vg_commands = "file %s\n"
-                                         "target remote | vgdb\n"
-                                         "bt\n";
+    static const char *vg_cmds_fmt = "file %s\n"
+                                     "target remote | vgdb\n";
+    static const char *bt_cmds     = "bt\n"
+                                     "list\n";
     static char pid_str[16];
-    const char *cmds;
     char *vg_cmds;
     char *gdb_cmdline;
     char gdb_commands_file[256];
@@ -650,7 +638,7 @@ static ucs_status_t ucs_debugger_attach()
     pid = fork();
     if (pid < 0) {
         ucs_log_fatal_error("fork returned %d: %m", pid);
-        return UCS_ERR_IO_ERROR;
+        return;
     }
 
     /* retrieve values from original process, before forking */
@@ -680,20 +668,22 @@ static ucs_status_t ucs_debugger_attach()
         fd = open(gdb_commands_file, O_WRONLY|O_TRUNC|O_CREAT, 0600);
         if (fd >= 0) {
             if (RUNNING_ON_VALGRIND) {
-                vg_cmds = ucs_debug_alloc_mem(strlen(gdb_vg_commands) + strlen(self_exe));
-                sprintf(vg_cmds, gdb_vg_commands, self_exe);
-                cmds = vg_cmds;
-           } else {
-                cmds = gdb_commands;
+                vg_cmds = ucs_sys_realloc(NULL, 0, strlen(vg_cmds_fmt) + strlen(self_exe));
+                sprintf(vg_cmds, vg_cmds_fmt, self_exe);
+                if (write(fd, vg_cmds, strlen(vg_cmds)) != strlen(vg_cmds)) {
+                    ucs_log_fatal_error("Unable to write to command file: %m");
+                }
             }
 
-            if (write(fd, cmds, strlen(cmds)) == strlen(cmds)) {
-                argv[narg++] = "-x";
-                argv[narg++] = gdb_commands_file;
-            } else {
-                ucs_log_fatal_error("Unable to write to command file: %m");
+            if (ucs_global_opts.handle_errors & UCS_BIT(UCS_HANDLE_ERROR_BACKTRACE)) {
+                if (write(fd, bt_cmds, strlen(bt_cmds)) != strlen(bt_cmds)) {
+                    ucs_log_fatal_error("Unable to write to command file: %m");
+                }
             }
             close(fd);
+
+            argv[narg++] = "-x";
+            argv[narg++] = gdb_commands_file;
         } else {
             ucs_log_fatal_error("Unable to open '%s' for writing: %m",
                                 gdb_commands_file);
@@ -710,7 +700,6 @@ static ucs_status_t ucs_debugger_attach()
     }
 
     waitpid(pid, &ret, 0);
-    return UCS_OK;
 }
 
 static void UCS_F_NOINLINE ucs_debug_freeze()
@@ -770,14 +759,57 @@ static void ucs_debug_stop_other_threads()
     closedir(dir);
 }
 
-static ucs_status_t ucs_error_freeze()
+static void ucs_debug_send_mail(const char *error_type, const char *message)
+{
+    FILE *stream;
+
+    if (!strlen(ucs_global_opts.error_mail_to)) {
+        return;
+    }
+
+    stream = popen("/usr/lib/sendmail -t", "w");
+    if (stream == NULL) {
+        return;
+    }
+
+    fprintf(stdout, "Sending notification to %s\n", ucs_global_opts.error_mail_to);
+    fflush(stdout);
+
+    fprintf(stream, "To:           %s\n", ucs_global_opts.error_mail_to);
+    fprintf(stream, "From:         %s\n", "ucx@openucx.org");
+    fprintf(stream, "Subject:      ucx error report - %s on %s\n",
+            error_type, ucs_get_host_name());
+    fprintf(stream, "Content-Type: text/plain\n");
+    fprintf(stream, "\n");
+
+    fprintf(stream, "program: %s\n", ucs_get_exe());
+    fprintf(stream, "hostname: %s\n", ucs_get_host_name());
+    fprintf(stream, "process id: %d\n", getpid());
+    fprintf(stream, "\n");
+
+    fprintf(stream, "\n");
+    fprintf(stream, "%s\n", message);
+    fprintf(stream, "\n");
+
+    ucs_debug_show_innermost_source_file(stream);
+    ucs_debug_print_backtrace(stream, 2);
+
+    if (strlen(ucs_global_opts.error_mail_footer)) {
+        fprintf(stream, "\n");
+        fprintf(stream, "%s\n", ucs_global_opts.error_mail_footer);
+    }
+    fprintf(stream, "\n");
+
+    pclose(stream);
+}
+
+static void ucs_error_freeze(const char *error_type, const char *message)
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     char response;
     int ret;
 
     ucs_debug_stop_other_threads();
-    ucs_debug_show_innermost_source_file(stderr);
 
     if (pthread_mutex_trylock(&lock) == 0) {
         if (strlen(ucs_global_opts.gdb_command) && isatty(fileno(stdout)) &&
@@ -791,6 +823,7 @@ static ucs_status_t ucs_error_freeze()
                 ucs_debug_freeze();
             }
         } else {
+            ucs_debug_send_mail(error_type, message);
             ucs_log_fatal_error("Process frozen...");
             ucs_debug_freeze();
         }
@@ -799,8 +832,6 @@ static ucs_status_t ucs_error_freeze()
     } else {
         ucs_debug_freeze();
     }
-
-    return UCS_OK;
 }
 
 static const char *ucs_signal_cause_common(int si_code)
@@ -888,7 +919,8 @@ static const char *ucs_signal_cause_cld(int si_code)
     }
 }
 
-static void ucs_debug_log_signal(int signo, const char *cause, const char *fmt, ...)
+static void ucs_debug_handle_error_signal(int signo, const char *cause,
+                                          const char *fmt, ...)
 {
     char buf[256];
     va_list ap;
@@ -897,8 +929,8 @@ static void ucs_debug_log_signal(int signo, const char *cause, const char *fmt, 
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    ucs_log_fatal_error("Caught signal %d (%s: %s%s)", signo, strsignal(signo),
-                        cause, buf);
+    ucs_handle_error(cause, "Caught signal %d (%s: %s%s)", signo,
+                     strsignal(signo), cause, buf);
 }
 
 static void ucs_error_signal_handler(int signo, siginfo_t *info, void *context)
@@ -908,62 +940,122 @@ static void ucs_error_signal_handler(int signo, siginfo_t *info, void *context)
 
     switch (signo) {
     case SIGILL:
-        ucs_debug_log_signal(signo, ucs_signal_cause_ill(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_ill(info->si_code), "");
         break;
     case SIGTRAP:
-        ucs_debug_log_signal(signo, ucs_signal_cause_trap(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_trap(info->si_code), "");
         break;
     case SIGBUS:
-        ucs_debug_log_signal(signo, ucs_signal_cause_bus(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_bus(info->si_code), "");
         break;
     case SIGFPE:
-        ucs_debug_log_signal(signo, ucs_signal_cause_fpe(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_fpe(info->si_code), "");
         break;
     case SIGSEGV:
-        ucs_debug_log_signal(signo, ucs_signal_cause_segv(info->si_code),
-                             " at address %p", info->si_addr);
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_segv(info->si_code),
+                                      " at address %p", info->si_addr);
         break;
     case SIGCHLD:
-        ucs_debug_log_signal(signo, ucs_signal_cause_cld(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_cld(info->si_code), "");
+        break;
+    case SIGINT:
+    case SIGTERM:
         break;
     default:
-        ucs_debug_log_signal(signo, ucs_signal_cause_common(info->si_code), "");
+        ucs_debug_handle_error_signal(signo, ucs_signal_cause_common(info->si_code), "");
         break;
     }
 
-    if (signo != SIGINT && signo != SIGTERM) {
-        ucs_handle_error();
-    }
     raise(signo);
 }
 
-void ucs_handle_error()
+void ucs_handle_error(const char *error_type, const char *message, ...)
 {
-    ucs_status_t status;
+    size_t buffer_size = ucs_global_opts.log_buffer_size;
+    char *buffer;
+    va_list ap;
 
-    switch (ucs_global_opts.handle_errors) {
-    case UCS_HANDLE_ERROR_DEBUG:
-        status = ucs_debugger_attach();
-        if (status == UCS_OK) {
-            break;
+    buffer = ucs_alloca(buffer_size + 1);
+    va_start(ap, message);
+    vsnprintf(buffer, buffer_size, message, ap);
+    va_end(ap);
+    ucs_log_fatal_error("%s", buffer);
+
+    if (ucs_global_opts.handle_errors & UCS_BIT(UCS_HANDLE_ERROR_DEBUG)) {
+        ucs_debugger_attach();
+    } else {
+        if (ucs_global_opts.handle_errors & UCS_BIT(UCS_HANDLE_ERROR_BACKTRACE)) {
+            ucs_debug_show_innermost_source_file(stderr);
+            ucs_debug_print_backtrace(stderr, 2);
         }
-        /* Fall thru */
-
-    case UCS_HANDLE_ERROR_FREEZE:
-        status = ucs_error_freeze();
-        if (status == UCS_OK) {
-            break;
+        if (ucs_global_opts.handle_errors & UCS_BIT(UCS_HANDLE_ERROR_FREEZE)) {
+            ucs_error_freeze(error_type, buffer);
         }
-        /* Fall thru */
-
-    case UCS_HANDLE_ERROR_BACKTRACE:
-        ucs_debug_show_innermost_source_file(stderr);
-        ucs_debug_print_backtrace(stderr, 2);
-        break;
-
-    default:
-        break;
     }
+}
+
+static int ucs_debug_is_error_signal(int signum)
+{
+    int i;
+
+    if (!ucs_global_opts.handle_errors) {
+        return 0;
+    }
+
+    for (i = 0; i < ucs_global_opts.error_signals.count; ++i) {
+        if (signum == ucs_global_opts.error_signals.signals[i]) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void* ucs_debug_get_orig_func(const char *symbol, void *replacement)
+{
+    void *func_ptr;
+
+    func_ptr = dlsym(RTLD_NEXT, symbol);
+    if (func_ptr == NULL) {
+        func_ptr = dlsym(RTLD_DEFAULT, symbol);
+    }
+    return func_ptr;
+}
+
+sighandler_t signal(int signum, sighandler_t handler)
+{
+    static sighandler_t (*orig)(int, sighandler_t) = NULL;
+
+    if (ucs_debug_is_error_signal(signum)) {
+        return SIG_DFL;
+    }
+
+    if (orig == NULL) {
+        orig = ucs_debug_get_orig_func("signal", signal);
+    }
+
+    return orig(signum, handler);
+}
+
+static int orig_sigaction(int signum, const struct sigaction *act,
+                          struct sigaction *oact)
+{
+    static int (*orig)(int, const struct sigaction*, struct sigaction*) = NULL;
+
+    if (orig == NULL) {
+        orig = ucs_debug_get_orig_func("sigaction", sigaction);
+    }
+
+    return orig(signum, act, oact);
+}
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oact)
+{
+    if (ucs_debug_is_error_signal(signum)) {
+        return orig_sigaction(signum, NULL, oact); /* Return old, do not set new */
+    }
+
+    return orig_sigaction(signum, act, oact);
 }
 
 static void ucs_debug_signal_handler(int signo)
@@ -971,6 +1063,35 @@ static void ucs_debug_signal_handler(int signo)
     ucs_log_flush();
     ucs_global_opts.log_level = UCS_LOG_LEVEL_TRACE_DATA;
     ucs_profile_dump();
+}
+
+static void ucs_debug_set_signal_alt_stack()
+{
+    int ret;
+
+    ucs_debug_signal_stack.ss_size = SIGSTKSZ +
+                                     (2 * ucs_global_opts.log_buffer_size) +
+                                     (sizeof(void*) * BACKTRACE_MAX) +
+                                     (128 * UCS_KBYTE);
+    ucs_debug_signal_stack.ss_sp =
+                    ucs_sys_realloc(NULL, 0, ucs_debug_signal_stack.ss_size);
+    if (ucs_debug_signal_stack.ss_sp == NULL) {
+        return;
+    }
+
+    ucs_debug_signal_stack.ss_flags = 0;
+    ret = sigaltstack(&ucs_debug_signal_stack, NULL);
+    if (ret) {
+        ucs_warn("sigaltstack(ss_sp=%p, ss_size=%zu) failed: %m",
+                 ucs_debug_signal_stack.ss_sp, ucs_debug_signal_stack.ss_size);
+        ucs_sys_free(ucs_debug_signal_stack.ss_sp,
+                     ucs_debug_signal_stack.ss_size);
+        ucs_debug_signal_stack.ss_sp = NULL;
+        return;
+    }
+
+    ucs_debug("using signal stack %p size %zu", ucs_debug_signal_stack.ss_sp,
+              ucs_debug_signal_stack.ss_size);
 }
 
 static void ucs_set_signal_handler(void (*handler)(int, siginfo_t*, void *))
@@ -985,11 +1106,15 @@ static void ucs_set_signal_handler(void (*handler)(int, siginfo_t*, void *))
     } else {
         sigact.sa_sigaction = handler;
         sigact.sa_flags     = SA_SIGINFO;
+        if (ucs_debug_signal_stack.ss_sp != NULL) {
+            sigact.sa_flags |= SA_ONSTACK;
+        }
     }
     sigemptyset(&sigact.sa_mask);
 
     for (i = 0; i < ucs_global_opts.error_signals.count; ++i) {
-        ret = sigaction(ucs_global_opts.error_signals.signals[i], &sigact, &old_action);
+        ret = orig_sigaction(ucs_global_opts.error_signals.signals[i], &sigact,
+                             &old_action);
         if (ret < 0) {
             ucs_warn("failed to set signal handler for sig %d : %m",
                      ucs_global_opts.error_signals.signals[i]);
@@ -1003,11 +1128,14 @@ static int ucs_debug_backtrace_is_excluded(void *address, const char *symbol)
     return !strcmp(symbol, "ucs_handle_error") ||
            !strcmp(symbol, "ucs_error_freeze") ||
            !strcmp(symbol, "ucs_error_signal_handler") ||
+           !strcmp(symbol, "ucs_debug_handle_error_signal") ||
            !strcmp(symbol, "ucs_debug_backtrace_create") ||
            !strcmp(symbol, "ucs_debug_show_innermost_source_file") ||
            !strcmp(symbol, "ucs_log_default_handler") ||
            !strcmp(symbol, "__ucs_abort") ||
            !strcmp(symbol, "__ucs_log") ||
+           !strcmp(symbol, "ucs_debug_send_mail") ||
+           (strstr(symbol, "_L_unlock_") == symbol) ||
            (address == ucs_debug_signal_restorer);
 }
 
@@ -1051,7 +1179,8 @@ unsigned long ucs_debug_get_lib_base_addr()
 void ucs_debug_init()
 {
     kh_init_inplace(ucs_debug_symbol, &ucs_debug_symbols_cache);
-    if (ucs_global_opts.handle_errors > UCS_HANDLE_ERROR_NONE) {
+    if (ucs_global_opts.handle_errors) {
+        ucs_debug_set_signal_alt_stack();
         ucs_set_signal_handler(ucs_error_signal_handler);
     }
     if (ucs_global_opts.debug_signo > 0) {
@@ -1067,7 +1196,7 @@ void ucs_debug_cleanup()
 {
     char *sym;
 
-    if (ucs_global_opts.handle_errors > UCS_HANDLE_ERROR_NONE) {
+    if (ucs_global_opts.handle_errors) {
         ucs_set_signal_handler(NULL);
     }
     if (ucs_global_opts.debug_signo > 0) {

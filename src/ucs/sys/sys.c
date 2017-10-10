@@ -10,11 +10,14 @@
 #  include "config.h"
 #endif
 
-#include <ucs/sys/sys.h>
-#include <ucs/sys/math.h>
+#include "sys.h"
+#include "checker.h"
+#include "string.h"
+#include "math.h"
+
 #include <ucs/debug/log.h>
 #include <ucs/time/time.h>
-
+#include <ucm/util/sys.h>
 #include <sys/ioctl.h>
 #include <sys/shm.h>
 #include <sys/mman.h>
@@ -23,8 +26,10 @@
 #include <dirent.h>
 #include <sched.h>
 
+
 /* Default huge page size is 2 MBytes */
 #define UCS_DEFAULT_HUGEPAGE_SIZE  (2 * UCS_MBYTE)
+#define UCS_DEFAULT_MEM_FREE       640000
 #define UCS_PROCESS_MAPS_FILE      "/proc/self/maps"
 
 
@@ -221,74 +226,9 @@ uint64_t ucs_generate_uuid(uint64_t seed)
            __sumup_host_name(5);
 }
 
-void ucs_fill_filename_template(const char *tmpl, char *buf, size_t max)
-{
-    char *p, *end;
-    const char *pf, *pp;
-    size_t length;
-    time_t t;
-
-    p = buf;
-    end = buf + max - 1;
-    *end = 0;
-    pf = tmpl;
-    while (*pf != 0 && p < end) {
-        pp = strchr(pf, '%');
-        if (pp == NULL) {
-            strncpy(p, pf, end - p);
-            p = end;
-            break;
-        }
-
-        length = ucs_min(pp - pf, end - p);
-        strncpy(p, pf, length);
-        p += length;
-
-        switch (*(pp + 1)) {
-        case 'p':
-            snprintf(p, end - p, "%d", getpid());
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        case 'h':
-            snprintf(p, end - p, "%s", ucs_get_host_name());
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        case 'c':
-            snprintf(p, end - p, "%02d", ucs_get_first_cpu());
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        case 't':
-            t = time(NULL);
-            strftime(p, end - p, "%Y-%m-%d-%H:%M:%S", localtime(&t));
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        case 'u':
-            snprintf(p, end - p, "%s", basename(ucs_get_user_name()));
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        case 'e':
-            snprintf(p, end - p, "%s", basename(ucs_get_exe()));
-            pf = pp + 2;
-            p += strlen(p);
-            break;
-        default:
-            *(p++) = *pp;
-            pf = pp + 1;
-            break;
-        }
-
-        p += strlen(p);
-    }
-    *p = 0;
-}
-
 ucs_status_t
-ucs_open_output_stream(const char *config_str, FILE **p_fstream, int *p_need_close,
+ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
+                       FILE **p_fstream, int *p_need_close,
                        const char **p_next_token)
 {
     FILE *output_stream;
@@ -297,16 +237,16 @@ ucs_open_output_stream(const char *config_str, FILE **p_fstream, int *p_need_clo
     const char *p;
     size_t len;
 
-    *p_need_close = 0;
-    *p_fstream    = NULL;
     *p_next_token = config_str;
 
     len = strcspn(config_str, ":");
     if (!strncmp(config_str, "stdout", len)) {
         *p_fstream    = stdout;
+        *p_need_close = 0;
         *p_next_token = config_str + len;
     } else if (!strncmp(config_str, "stderr", len)) {
         *p_fstream    = stderr;
+        *p_need_close = 0;
         *p_next_token = config_str + len;
     } else {
         if (!strncmp(config_str, "file:", 5)) {
@@ -322,7 +262,8 @@ ucs_open_output_stream(const char *config_str, FILE **p_fstream, int *p_need_clo
 
         output_stream = fopen(filename, "w");
         if (output_stream == NULL) {
-            ucs_error("failed to open '%s' for writing: %m", filename);
+            ucs_log(err_log_level, "failed to open '%s' for writing: %m",
+                    filename);
             return UCS_ERR_IO_ERROR;
         }
 
@@ -332,41 +273,6 @@ ucs_open_output_stream(const char *config_str, FILE **p_fstream, int *p_need_clo
     }
 
     return UCS_OK;
-}
-
-uint64_t ucs_string_to_id(const char* str)
-{
-    uint64_t id = 0;
-    strncpy((char*)&id, str, sizeof(id) - 1); /* Last character will be \0 */
-    return id;
-}
-
-void ucs_snprintf_zero(char *buf, size_t size, const char *fmt, ...)
-{
-    va_list ap;
-
-    memset(buf, 0, size);
-    va_start(ap, fmt);
-    vsnprintf(buf, size, fmt, ap);
-    va_end(ap);
-}
-
-void ucs_memunits_to_str(size_t value, char *buf, size_t max)
-{
-    static const char * suffixes[] = {"", "k", "m", "g", "t"};
-
-    const char **suffix;
-
-    if (value == SIZE_MAX) {
-        strncpy(buf, "(inf)", max);
-    } else {
-        suffix = &suffixes[0];
-        while ((value >= 1024) && ((value % 1024) == 0)) {
-            value /= 1024;
-            ++suffix;
-        }
-        snprintf(buf, max, "%zu%s", value, *suffix);
-    }
 }
 
 ssize_t ucs_read_file(char *buffer, size_t max, int silent,
@@ -408,12 +314,22 @@ out:
     return read_bytes;
 }
 
+static unsigned long ucs_sysconf(int name)
+{
+    long rc;
+
+    rc = sysconf(name);
+    ucs_assert_always(rc >= 0);
+
+    return (unsigned long)rc;
+}
+
 size_t ucs_get_max_iov()
 {
     static size_t max_iov = 1;
 
     if (1 == max_iov) {
-        max_iov = ucs_max(sysconf(_SC_IOV_MAX), 1); /* max_iov shouldn't be zero */
+        max_iov = ucs_max(ucs_sysconf(_SC_IOV_MAX), 1); /* max_iov shouldn't be zero */
     }
     return max_iov;
 }
@@ -423,31 +339,56 @@ size_t ucs_get_page_size()
     static size_t page_size = 0;
 
     if (page_size == 0) {
-        page_size = sysconf(_SC_PAGESIZE);
+        page_size = ucs_sysconf(_SC_PAGESIZE);
     }
     return page_size;
+}
+
+size_t ucs_get_meminfo_entry(const char* pattern)
+{
+    char buf[256];
+    char final_pattern[80];
+    int val = 0;
+    size_t val_b = 0;
+    FILE *f;
+
+    f = fopen("/proc/meminfo", "r");
+    if (f != NULL) {
+        snprintf(final_pattern, sizeof(final_pattern), "%s: %s", pattern,
+                 "%d kB");
+        while (fgets(buf, sizeof(buf), f)) {
+            if (sscanf(buf, final_pattern, &val) == 1) {
+                val_b = val * 1024ull;
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    return val_b;
+}
+
+size_t ucs_get_memfree_size()
+{
+    size_t mem_free;
+
+    mem_free = ucs_get_meminfo_entry("MemFree");
+    if (mem_free == 0) {
+        mem_free = UCS_DEFAULT_MEM_FREE;
+        ucs_info("cannot determine free mem size, using default: %zu",
+                  mem_free);
+    }
+
+    return mem_free;
 }
 
 size_t ucs_get_huge_page_size()
 {
     static size_t huge_page_size = 0;
-    char buf[256];
-    int size_kb;
-    FILE *f;
 
     /* Cache the huge page size value */
     if (huge_page_size == 0) {
-        f = fopen("/proc/meminfo", "r");
-        if (f != NULL) {
-            while (fgets(buf, sizeof(buf), f)) {
-                if (sscanf(buf, "Hugepagesize:       %d kB", &size_kb) == 1) {
-                    huge_page_size = size_kb * 1024;
-                    break;
-                }
-            }
-            fclose(f);
-        }
-
+        huge_page_size = ucs_get_meminfo_entry("Hugepagesize");
         if (huge_page_size == 0) {
             huge_page_size = UCS_DEFAULT_HUGEPAGE_SIZE;
             ucs_warn("cannot determine huge page size, using default: %zu",
@@ -465,9 +406,25 @@ size_t ucs_get_phys_mem_size()
     static size_t phys_pages = 0;
 
     if (phys_pages == 0) {
-        phys_pages = sysconf(_SC_PHYS_PAGES);
+        phys_pages = ucs_sysconf(_SC_PHYS_PAGES);
     }
     return phys_pages * ucs_get_page_size();
+}
+
+#define UCS_SYS_THP_ENABLED_FILE "/sys/kernel/mm/transparent_hugepage/enabled"
+int ucs_is_thp_enabled()
+{
+    char buf[256];
+    int rc;
+
+    rc = ucs_read_file(buf, sizeof(buf) - 1, 1, UCS_SYS_THP_ENABLED_FILE);
+    if (rc < 0) {
+        ucs_debug("failed to read %s:%m", UCS_SYS_THP_ENABLED_FILE);
+        return 0;
+    }
+
+    buf[rc] = 0;
+    return (strstr(buf, "[never]") == NULL);
 }
 
 #define UCS_PROC_SYS_SHMMAX_FILE "/proc/sys/kernel/shmmax"
@@ -498,7 +455,7 @@ ucs_status_t ucs_sysv_alloc(size_t *size, void **address_p, int flags, int *shmi
     struct shminfo shminfo, *shminfo_ptr;
     size_t alloc_size;
     void *ptr;
-    int ret;
+    int ret, err;
 
     alloc_size = ucs_memtrack_adjust_alloc_size(*size);
 
@@ -517,11 +474,12 @@ ucs_status_t ucs_sysv_alloc(size_t *size, void **address_p, int flags, int *shmi
         case ENOSPC:
         case EPERM:
             if (!(flags & SHM_HUGETLB)) {
+                err = errno;
                 shminfo_ptr = &shminfo;
                 if ((shmctl(0, IPC_INFO, (struct shmid_ds *) shminfo_ptr)) > -1) {
-                    ucs_error("shmget failed: %m. (size=%zu). The max number of shared memory segments in the system is = %ld. "
+                    ucs_error("shmget failed: %s. (size=%zu). The max number of shared memory segments in the system is = %ld. "
                               "Please try to increase this value through /proc/sys/kernel/shmmni",
-                              alloc_size, shminfo.shmmni);
+                              strerror(err), alloc_size, shminfo.shmmni);
                 }
             }
 
@@ -541,7 +499,11 @@ ucs_status_t ucs_sysv_alloc(size_t *size, void **address_p, int flags, int *shmi
     }
 
     /* Attach segment */
-    ptr = shmat(*shmid, NULL, 0);
+    if (*address_p) {
+        ptr = shmat(*shmid, *address_p, SHM_REMAP);
+    } else {
+        ptr = shmat(*shmid, NULL, 0);
+    }
 
     /* Remove segment, the attachment keeps a reference to the mapping */
     /* FIXME having additional attaches to a removed segment is not portable
@@ -584,93 +546,123 @@ ucs_status_t ucs_sysv_free(void *address)
     return UCS_OK;
 }
 
-int ucs_get_mem_prot(unsigned long start, unsigned long end)
+ucs_status_t ucs_tcpip_socket_create(int *fd_p)
 {
-    static int maps_fd = -1;
-    char buffer[1024];
-    unsigned long start_addr, end_addr;
-    unsigned prot_flags;
-    char read_c, write_c, exec_c, priv_c;
-    char *ptr, *newline;
-    ssize_t read_size;
-    size_t read_offset;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        ucs_error("socket create failed: %m");
+        return UCS_ERR_IO_ERROR;
+    }
+
+    *fd_p = fd;
+    return UCS_OK;
+}
+
+ucs_status_t ucs_netif_ioctl(const char *if_name, unsigned long request,
+                             struct ifreq *if_req)
+{
+    ucs_status_t status;
+    int fd, ret;
+
+    ucs_strncpy_zero(if_req->ifr_name, if_name, sizeof(if_req->ifr_name));
+
+    status = ucs_tcpip_socket_create(&fd);
+    if (status != UCS_OK) {
+        goto out;
+    }
+
+    ret = ioctl(fd, request, if_req);
+    if (ret < 0) {
+        ucs_debug("ioctl(req=%lu, ifr_name=%s) failed: %m", request, if_name);
+        status = UCS_ERR_IO_ERROR;
+        goto out_close_fd;
+    }
+
+    status = UCS_OK;
+
+out_close_fd:
+    close(fd);
+out:
+    return status;
+}
+
+ucs_status_t ucs_mmap_alloc(size_t *size, void **address_p,
+                            int flags UCS_MEMTRACK_ARG)
+{
+    size_t alloc_length;
+    void *addr;
+
+    alloc_length = ucs_align_up_pow2(*size, ucs_get_page_size());
+
+    addr = ucs_mmap(*address_p, alloc_length, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON | flags, -1, 0 UCS_MEMTRACK_VAL);
+    if (addr == MAP_FAILED) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    *size      = alloc_length;
+    *address_p = addr;
+    return UCS_OK;
+}
+
+ucs_status_t ucs_mmap_free(void *address, size_t length)
+{
     int ret;
 
-    if (maps_fd == -1) {
-        maps_fd = open(UCS_PROCESS_MAPS_FILE, O_RDONLY);
-        if (maps_fd < 0) {
-            ucs_fatal("cannot open %s for reading: %m", UCS_PROCESS_MAPS_FILE);
-        }
+    ret = ucs_munmap(address, length);
+    if (ret != 0) {
+        ucs_warn("munmap(address=%p, length=%zu) failed: %m", address, length);
+        return UCS_ERR_INVALID_PARAM;
     }
+    return UCS_OK;
+}
 
-    ret = lseek(maps_fd, 0, SEEK_SET);
-    if (ret < 0) {
-        ucs_fatal("failed to lseek(0): %m");
-    }
+typedef struct {
+    unsigned long start;
+    unsigned long end;
+    int           prot;
+    int           found;
+} ucs_get_mem_prot_ctx_t;
 
-    prot_flags = PROT_READ|PROT_WRITE|PROT_EXEC;
+static int ucs_get_mem_prot_cb(void *arg, void *addr, size_t length, int prot)
+{
+    ucs_get_mem_prot_ctx_t *ctx = arg;
+    unsigned long seg_start = (uintptr_t)addr;
+    unsigned long seg_end   = (uintptr_t)addr + length;
 
-    read_offset = 0;
-    while (1) {
-        read_size = read(maps_fd, buffer + read_offset, sizeof(buffer) - 1 - read_offset);
-        if (read_size < 0) {
-            if (errno == EINTR) {
-                continue;
-            } else {
-                ucs_fatal("failed to read from %s: %m", UCS_PROCESS_MAPS_FILE);
-            }
-        } else if (read_size == 0) {
-            goto out;
+    if (ctx->start < seg_start) {
+        ucs_trace("address 0x%lx is before next mapping 0x%lx..0x%lx", ctx->start,
+                  seg_start, seg_end);
+        return 1;
+    } else if (ctx->start < seg_end) {
+        ucs_trace("range 0x%lx..0x%lx overlaps with mapping 0x%lx..0x%lx prot 0x%x",
+                  ctx->start, ctx->end, seg_start, seg_end, prot);
+
+        if (!ctx->found) {
+            /* first segment sets protection flags */
+            ctx->prot  = prot;
+            ctx->found = 1;
         } else {
-            buffer[read_size + read_offset] = 0;
+            /* subsequent segments update protection flags */
+            ctx->prot &= prot;
         }
 
-        ptr = buffer;
-        while ( (newline = strchr(ptr, '\n')) != NULL ) {
-            /* 00400000-0040b000 r-xp ... \n */
-            ret = sscanf(ptr, "%lx-%lx %c%c%c%c", &start_addr, &end_addr, &read_c,
-                         &write_c, &exec_c, &priv_c);
-            if (ret != 6) {
-                ucs_fatal("Parse error at %s", ptr);
-            }
-
-            /* Address will not appear on the list */
-            if (start < start_addr) {
-                goto out;
-            }
-
-            /* Start address falls within current VMA */
-            if (start < end_addr) {
-                ucs_trace_data("existing mapping: start=0x%08lx end=0x%08lx prot=%u",
-                               start_addr, end_addr, prot_flags);
-
-                if (read_c != 'r') {
-                    prot_flags &= ~PROT_READ;
-                }
-                if (write_c != 'w') {
-                    prot_flags &= ~PROT_WRITE;
-                }
-                if (exec_c != 'x') {
-                    prot_flags &= ~PROT_EXEC;
-                }
-
-                /* Finished going over entire memory region */
-                if (end <= end_addr) {
-                    return prot_flags;
-                }
-
-                /* Start from the end of current VMA */
-                start = end_addr;
-            }
-
-            ptr = newline + 1;
+        if (ctx->end <= seg_end) {
+            /* finished going over entire memory region */
+            return 1;
         }
 
-        read_offset = strlen(ptr);
-        memmove(buffer, ptr, read_offset);
+        /* continue from the end of current segment */
+        ctx->start = seg_end;
     }
-out:
-    return PROT_NONE;
+    return 0;
+}
+
+int ucs_get_mem_prot(unsigned long start, unsigned long end)
+{
+    ucs_get_mem_prot_ctx_t ctx = { start, end, PROT_NONE, 0 };
+    ucm_parse_proc_self_maps(ucs_get_mem_prot_cb, &ctx);
+    return ctx.prot;
 }
 
 const char* ucs_get_process_cmdline()
@@ -721,9 +713,9 @@ int ucs_tgkill(int tgid, int tid, int sig)
     return syscall(SYS_tgkill, tgid, tid, sig);
 }
 
-double ucs_get_cpuinfo_clock_freq(const char *mhz_header)
+double ucs_get_cpuinfo_clock_freq(const char *header, double scale)
 {
-    double mhz = 0.0;
+    double value = 0.0;
     double m;
     int rc;
     FILE* f;
@@ -736,7 +728,7 @@ double ucs_get_cpuinfo_clock_freq(const char *mhz_header)
         return 0.0;
     }
 
-    snprintf(fmt, sizeof(fmt), "%s : %%lf", mhz_header);
+    snprintf(fmt, sizeof(fmt), "%s : %%lf ", header);
 
     warn = 0;
     while (fgets(buf, sizeof(buf), f)) {
@@ -746,26 +738,70 @@ double ucs_get_cpuinfo_clock_freq(const char *mhz_header)
             continue;
         }
 
-        if (mhz == 0.0) {
-            mhz = m;
+        if (value == 0.0) {
+            value = m;
             continue;
         }
 
-        if (mhz != m) {
-            mhz = ucs_max(mhz,m);
+        if (value != m) {
+            value = ucs_max(value,m);
             warn = 1;
         }
     }
     fclose(f);
 
     if (warn) {
-        ucs_warn("Conflicting CPU frequencies detected, using: %.2f MHz", mhz);
+        ucs_warn("Conflicting CPU frequencies detected, using: %.2f", value);
     }
-    return mhz * 1e6;
+    return value * scale;
+}
+
+void *ucs_sys_realloc(void *old_ptr, size_t old_length, size_t new_length)
+{
+    void *ptr;
+
+    new_length = ucs_align_up_pow2(new_length, ucs_get_page_size());
+    if (old_ptr == NULL) {
+        ptr = mmap(NULL, new_length, PROT_READ|PROT_WRITE,
+                       MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) {
+            ucs_log_fatal_error("mmap(NULL, %zu, READ|WRITE, PRIVATE|ANON) failed: %m",
+                                new_length);
+            return NULL;
+        }
+    } else {
+        old_length = ucs_align_up_pow2(old_length, ucs_get_page_size());
+        ptr = mremap(old_ptr, old_length, new_length, MREMAP_MAYMOVE);
+        if (ptr == MAP_FAILED) {
+            ucs_log_fatal_error("mremap(%p, %zu, %zu, MAYMOVE) failed: %m",
+                                old_ptr, old_length, new_length);
+            return NULL;
+        }
+    }
+
+    return ptr;
+}
+
+void ucs_sys_free(void *ptr, size_t length)
+{
+    int ret;
+
+    if (ptr != NULL) {
+        length = ucs_align_up_pow2(length, ucs_get_page_size());
+        ret = munmap(ptr, length);
+        if (ret) {
+            ucs_log_fatal_error("munmap(%p, %zu) failed: %m", ptr, length);
+        }
+    }
 }
 
 void ucs_empty_function()
 {
+}
+
+unsigned ucs_empty_function_return_zero()
+{
+    return 0;
 }
 
 ucs_status_t ucs_empty_function_return_success()
@@ -788,6 +824,11 @@ ucs_status_t ucs_empty_function_return_no_resource()
     return UCS_ERR_NO_RESOURCE;
 }
 
+ucs_status_ptr_t ucs_empty_function_return_ptr_no_resource()
+{
+    return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
+}
+
 ucs_status_t ucs_empty_function_return_ep_timeout()
 {
     return UCS_ERR_ENDPOINT_TIMEOUT;
@@ -802,4 +843,3 @@ ucs_status_t ucs_empty_function_return_busy()
 {
     return UCS_ERR_BUSY;
 }
-

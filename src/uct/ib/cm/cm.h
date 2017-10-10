@@ -7,6 +7,7 @@
 #ifndef UCT_IB_CM_H_
 #define UCT_IB_CM_H_
 
+#include <uct/base/uct_worker.h>
 #include <uct/ib/base/ib_iface.h>
 #include <ucs/datastruct/queue.h>
 #include <ucs/sys/compiler.h>
@@ -43,13 +44,14 @@ typedef struct uct_cm_iface_op {
  * IB CM interface/
  */
 typedef struct uct_cm_iface {
-    uct_ib_iface_t         super;
-    uint32_t               service_id;  /* Service ID we're listening to */
-    struct ib_cm_device    *cmdev;      /* CM device */
-    struct ib_cm_id        *listen_id;  /* Listening "socket" */
-    ucs_queue_head_t       notify_q;    /* Notification queue */
-    uint32_t               num_outstanding; /* Number of outstanding sends */
-    ucs_queue_head_t       outstanding_q; /* Outstanding operations queue */
+    uct_ib_iface_t            super;
+    uint32_t                  service_id;      /* Service ID we're listening to */
+    struct ib_cm_device      *cmdev;           /* CM device */
+    struct ib_cm_id          *listen_id;       /* Listening "socket" */
+    ucs_queue_head_t          notify_q;        /* Notification queue */
+    uint32_t                  num_outstanding; /* Number of outstanding sends */
+    ucs_queue_head_t          outstanding_q;   /* Outstanding operations queue */
+    uct_worker_cb_id_t        slow_prog_id;    /* Callback id for slowpath progress */
 
     struct {
         int                timeout_ms;
@@ -97,10 +99,10 @@ ucs_status_t uct_cm_ep_connect_to_iface(uct_ep_h ep, const uct_iface_addr_t *ifa
 ucs_status_t uct_cm_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                 uct_completion_t *comp);
 
-ucs_status_t uct_cm_iface_flush_do(uct_iface_h tl_ep, uct_completion_t *comp);
+ucs_status_t uct_cm_iface_flush_do(uct_cm_iface_t *iface, uct_completion_t *comp);
 
 ssize_t uct_cm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id, uct_pack_callback_t pack_cb,
-                           void *arg);
+                           void *arg, unsigned flags);
 
 ucs_status_t uct_cm_ep_pending_add(uct_ep_h ep, uct_pending_req_t *req);
 void uct_cm_ep_pending_purge(uct_ep_h ep, uct_pending_purge_callback_t cb,
@@ -109,6 +111,10 @@ void uct_cm_ep_pending_purge(uct_ep_h ep, uct_pending_purge_callback_t cb,
 ucs_status_t uct_cm_ep_flush(uct_ep_h tl_ep, unsigned flags,
                              uct_completion_t *comp);
 
+static inline int uct_cm_iface_has_tx_resources(uct_cm_iface_t *iface)
+{
+    return iface->num_outstanding < iface->config.max_outstanding;
+}
 
 #define uct_cm_iface_trace_data(_iface, _type, _hdr, _fmt, ...) \
     uct_iface_trace_am(&(_iface)->super.super, _type, (_hdr)->am_id, \

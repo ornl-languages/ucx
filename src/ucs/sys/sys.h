@@ -16,6 +16,7 @@
 #include <ucs/sys/compiler.h>
 #include <ucs/type/status.h>
 #include <ucs/debug/memtrack.h>
+#include <ucs/config/types.h>
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -43,64 +44,23 @@
 #include <math.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
+#include <net/if_arp.h>
+#include <net/if.h>
+#include <netdb.h>
 
-/*
- * Valgrind support
- */
-#ifndef NVALGRIND
-#  include <valgrind/memcheck.h>
-#  ifndef VALGRIND_MAKE_MEM_DEFINED
-#    define VALGRIND_MAKE_MEM_DEFINED(p, n)   VALGRIND_MAKE_READABLE(p, n)
-#  endif
-#  ifndef VALGRIND_MAKE_MEM_UNDEFINED
-#    define VALGRIND_MAKE_MEM_UNDEFINED(p, n) VALGRIND_MAKE_WRITABLE(p, n)
-#  endif
-#else
-#  define VALGRIND_MAKE_MEM_DEFINED(p, n)
-#  define VALGRIND_MAKE_MEM_UNDEFINED(p, n)
-#  define VALGRIND_MAKE_MEM_NOACCESS(p, n)
-#  define VALGRIND_CREATE_MEMPOOL(n,p,x)
-#  define VALGRIND_DESTROY_MEMPOOL(p)
-#  define VALGRIND_MEMPOOL_ALLOC(n,p,x)
-#  define VALGRIND_MEMPOOL_FREE(n,p)
-#  define VALGRIND_MALLOCLIKE_BLOCK(p,s,r,z)
-#  define VALGRIND_FREELIKE_BLOCK(p,r)
-#  define VALGRIND_CHECK_MEM_IS_DEFINED(p, n) ({(uintptr_t)0;})
-#  define VALGRIND_COUNT_ERRORS              0
-#  define VALGRIND_COUNT_LEAKS(a,b,c,d)      { a = b = c = d = 0; }
-#  define RUNNING_ON_VALGRIND                0
-#  define VALGRIND_PRINTF(...)
-#endif
-
-
-/*
- * BullsEye Code Coverage tool
- */
-#if _BullseyeCoverage
-#define BULLSEYE_ON                          1
-#define BULLSEYE_EXCLUDE_START               #pragma BullseyeCoverage off
-#define BULLSEYE_EXCLUDE_END                 #pragma BullseyeCoverage on
-#define BULLSEYE_EXCLUDE_BLOCK_START         "BullseyeCoverage save off";
-#define BULLSEYE_EXCLUDE_BLOCK_END           "BullseyeCoverage restore";
-#else
-#define BULLSEYE_ON                          0
-#define BULLSEYE_EXCLUDE_START
-#define BULLSEYE_EXCLUDE_END
-#define BULLSEYE_EXCLUDE_BLOCK_START
-#define BULLSEYE_EXCLUDE_BLOCK_END
-#endif
-
-#define UCS_SYS_PCI_MAX_PAYLOAD             512
 
 /**
  * @return Host name.
  */
 const char *ucs_get_host_name();
 
+
 /**
  * @return user name.
  */
 const char *ucs_get_user_name();
+
 
 /**
  * Expand a partial path to full path.
@@ -147,18 +107,6 @@ uint64_t ucs_generate_uuid(uint64_t seed);
 
 
 /**
- * Fill a filename template. The following values in the string are replaced:
- *  %p - replaced by process id
- *  %h - replaced by host name
- *
- * @param tmpl   File name template (possibly containing formatting sequences)
- * @param buf    Filled with resulting file name
- * @param max    Maximal size of destination buffer.
- */
-void ucs_fill_filename_template(const char *tmpl, char *buf, size_t max);
-
-
-/**
  * Open an output stream according to user configuration:
  *   - file:<name> - file name, %p, %h, %c are substituted.
  *   - stdout
@@ -169,38 +117,9 @@ void ucs_fill_filename_template(const char *tmpl, char *buf, size_t max);
  * of config_str.
  */
 ucs_status_t
-ucs_open_output_stream(const char *config_str, FILE **p_fstream, int *p_need_close,
+ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
+                       FILE **p_fstream, int *p_need_close,
                        const char **p_next_token);
-
-
-/**
- * Return a number filled with the first characters of the string.
- */
-uint64_t ucs_string_to_id(const char *str);
-
-
-/**
- * Format a string to a buffer of given size, and fill the rest of the buffer
- * with '\0'. Also, guarantee that the last char in the buffer is '\0'.
- *
- * @param buf  Buffer to format the string to.
- * @param size Buffer size.
- * @param fmt  Format string.
- */
-void ucs_snprintf_zero(char *buf, size_t size, const char *fmt, ...)
-    UCS_F_PRINTF(3, 4);
-
-
-/**
- * Convert a memory units value to a string which is abbreviated if possible.
- * For example:
- *  1024 -> 1kb
- *
- * @param value  Value to convert.
- * @param buf    Buffer to place the string.
- * @param max    Maximal length of the buffer.
- */
-void ucs_memunits_to_str(size_t value, char *buf, size_t max);
 
 
 /**
@@ -237,6 +156,12 @@ size_t ucs_get_huge_page_size();
 
 
 /**
+ * @return free mem size on the system.
+ */
+size_t ucs_get_memfree_size();
+
+
+/**
  * @return Physical memory size on the system.
  */
 size_t ucs_get_phys_mem_size();
@@ -257,12 +182,31 @@ ucs_status_t ucs_sysv_alloc(size_t *size, void **address_p, int flags, int *shim
 
 
 /**
- * Release memory allocated via hugetlb.
+ * Release memory allocated via SystemV API.
  *
  * @param address   Memory to release (returned from @ref ucs_sysv_alloc).
  */
 ucs_status_t ucs_sysv_free(void *address);
 
+
+/**
+ * Allocate private memory using mmap API.
+ *
+ * @param size      Pointer to memory size to allocate, updated with actual size
+ *                  (rounded up to huge page size or to regular page size).
+ * @param address_p Filled with allocated memory address.
+ * @param flags     Flags to pass to the mmap() system call
+ */
+ucs_status_t ucs_mmap_alloc(size_t *size, void **address_p,
+                            int flags UCS_MEMTRACK_ARG);
+
+/**
+ * Release memory allocated via mmap API.
+ *
+ * @param address   Address of memory to release as returned from @ref ucs_mmap_alloc.
+ * @param length    Length of memory to release as returned from @ref ucs_mmap_alloc.
+ */
+ucs_status_t ucs_mmap_free(void *address, size_t length);
 
 /**
  * Retrieve memory access flags for a given region of memory.
@@ -310,9 +254,18 @@ int ucs_tgkill(int tgid, int tid, int sig);
 /**
  * Get CPU frequency from /proc/cpuinfo. Return value is clocks-per-second.
  *
- * @param mhz_header String in /proc/cpuinfo which precedes the clock speed number.
+ * @param header String in /proc/cpuinfo which precedes the clock speed number.
+ * @param scale  Frequency value units.
  */
-double ucs_get_cpuinfo_clock_freq(const char *mhz_header);
+double ucs_get_cpuinfo_clock_freq(const char *mhz_header, double scale);
+
+
+/**
+ * Check if transparent huge-pages are enabled .
+ *
+ * @return 1 for true and 0 for false
+ */
+int ucs_is_thp_enabled();
 
 
 /**
@@ -322,14 +275,62 @@ double ucs_get_cpuinfo_clock_freq(const char *mhz_header);
  */
 size_t ucs_get_shmmax();
 
+
+/**
+ * Allocate or re-allocate memory from the operating system.
+ *
+ * @param [in]  old_ptr     Pointer to existing block, may be NULL. If non-NULL,
+ *                          this block will be resized and potentially moved.
+ * @param [in]  old_length  Length of the block pointed by old_ptr.
+ * @param [in]  new_length  Length to allocate for the new block.
+ *
+ * @return New allocated block, with size 'new_length'.
+ * @note Actual allocation size is rounded up to system page size.
+ */
+void *ucs_sys_realloc(void *old_ptr, size_t old_length, size_t new_length);
+
+
+/**
+ * Release memory previously allocated by @ref ucs_sys_realloc().
+ *
+ * @param [in]  ptr         Pointer to memory block to release.
+ * @param [in]  length      Length of the memory block.
+ */
+void ucs_sys_free(void *ptr, size_t length);
+
+
+/**
+ * Perform an ioctl call on the given interface with the given request.
+ * Set the result in the ifreq struct.
+ *
+ * @param [in]  if_name      Interface name to test.
+ * @param [in]  request      The request to fulfill.
+ * @param [out] if_req       Filled with the requested information.
+ *
+ * @return UCS_OK on success or an error code on failure.
+ */
+ucs_status_t ucs_netif_ioctl(const char *if_name, unsigned long request,
+                             struct ifreq *if_req);
+
+
+/**
+ * Create a socket.
+ *
+ * @param [out]  fd_p       Pointer to created fd.
+ */
+ucs_status_t ucs_tcpip_socket_create(int *fd_p);
+
+
 /**
  * Empty function which can be casted to a no-operation callback in various situations.
  */
 void ucs_empty_function();
+unsigned ucs_empty_function_return_zero();
 ucs_status_t ucs_empty_function_return_success();
 ucs_status_t ucs_empty_function_return_unsupported();
 ucs_status_t ucs_empty_function_return_inprogress();
 ucs_status_t ucs_empty_function_return_no_resource();
+ucs_status_ptr_t ucs_empty_function_return_ptr_no_resource();
 ucs_status_t ucs_empty_function_return_ep_timeout();
 ssize_t ucs_empty_function_return_bc_ep_timeout();
 ucs_status_t ucs_empty_function_return_busy();

@@ -15,13 +15,11 @@
 #include <ucs/config/parser.h>
 #include <ucs/datastruct/mpool.inl>
 
-#define UCT_IB_DEVICE_NAME_LEN 256
 #define UCT_IB_MAX_IOV         8UL
 
 /* Forward declarations */
 typedef struct uct_ib_iface_config   uct_ib_iface_config_t;
 typedef struct uct_ib_iface_ops      uct_ib_iface_ops_t;
-typedef struct uct_ib_device_info    uct_ib_device_info_t;
 typedef struct uct_ib_iface         uct_ib_iface_t;
 
 
@@ -50,6 +48,10 @@ struct uct_ib_iface_config {
         unsigned            min_sge;         /* How many SG entries to support */
         unsigned            cq_moderation;   /* How many TX messages are batched to one CQE */
         uct_iface_mpool_config_t mp;
+
+        /* Event moderation parameters */
+        unsigned            cq_moderation_count;
+        double              cq_moderation_period;
     } tx;
 
     struct {
@@ -58,6 +60,10 @@ struct uct_ib_iface_config {
         unsigned            max_poll;        /* How many wcs can be picked when polling rx cq */
         size_t              inl;             /* Inline space to reserve in CQ/QP */
         uct_iface_mpool_config_t mp;
+
+        /* Event moderation parameters */
+        unsigned            cq_moderation_count;
+        double              cq_moderation_period;
     } rx;
 
     /* Change the address type */
@@ -74,24 +80,17 @@ struct uct_ib_iface_config {
 
     /* IB PKEY to use */
     unsigned                pkey_value;
-
 };
 
 
 struct uct_ib_iface_ops {
     uct_iface_ops_t         super;
     ucs_status_t            (*arm_tx_cq)(uct_ib_iface_t *iface);
-    ucs_status_t            (*arm_rx_cq)(uct_ib_iface_t *iface, int solicited);
+    ucs_status_t            (*arm_rx_cq)(uct_ib_iface_t *iface, int solicited_only);
     void                    (*handle_failure)(uct_ib_iface_t *iface, void *arg);
+    void                    (*set_ep_failed)(uct_ib_iface_t *iface, uct_ep_h ep);
 };
 
-
-struct uct_ib_device_info {
-    int                     vendor_part_id;
-    char                    name[UCT_IB_DEVICE_NAME_LEN];
-    unsigned                flags;
-    uint8_t                 priority;
-};
 
 struct uct_ib_iface {
     uct_base_iface_t        super;
@@ -99,6 +98,7 @@ struct uct_ib_iface {
     struct ibv_cq           *send_cq;
     struct ibv_cq           *recv_cq;
     struct ibv_comp_channel *comp_channel;
+    uct_recv_desc_t         release_desc;
 
     uint8_t                 *path_bits;
     unsigned                path_bits_count;
@@ -128,7 +128,7 @@ struct uct_ib_iface {
 };
 UCS_CLASS_DECLARE(uct_ib_iface_t, uct_ib_iface_ops_t*, uct_md_h, uct_worker_h,
                   const uct_iface_params_t*, unsigned, unsigned, unsigned,
-                  size_t, const uct_ib_iface_config_t*)
+                  unsigned, size_t, const uct_ib_iface_config_t*)
 
 
 /*
@@ -144,7 +144,7 @@ UCS_CLASS_DECLARE(uct_ib_iface_t, uct_ib_iface_ops_t*, uct_md_h, uct_worker_h,
  *                   |
  * uct_recv_desc_t   |
  *               |   |
- *               |   am_callback
+ *               |   am_callback/tag_unexp_callback
  *               |   |
  * +------+------+---+-----------+---------+
  * | LKey |  ??? | D | Head Room | Payload |
@@ -155,7 +155,7 @@ UCS_CLASS_DECLARE(uct_ib_iface_t, uct_ib_iface_ops_t*, uct_md_h, uct_worker_h,
  *                      post_receive
  *
  * (2)
- *            am_callback
+ *            am_callback/tag_unexp_callback
  *            |
  * +------+---+------------------+---------+
  * | LKey | D |     Head Room    | Payload |
@@ -187,21 +187,22 @@ ucs_status_t uct_ib_iface_recv_mpool_init(uct_ib_iface_t *iface,
                                           const uct_ib_iface_config_t *config,
                                           const char *name, ucs_mpool_t *mp);
 
-void uct_ib_iface_release_am_desc(uct_iface_t *tl_iface, void *desc);
+void uct_ib_iface_release_desc(uct_recv_desc_t *self, void *desc);
 
 
 static UCS_F_ALWAYS_INLINE void
-uct_ib_iface_invoke_am(uct_ib_iface_t *iface, uint8_t am_id, void *data,
-                       unsigned length, uct_ib_iface_recv_desc_t *ib_desc)
+uct_ib_iface_invoke_am_desc(uct_ib_iface_t *iface, uint8_t am_id, void *data,
+                            unsigned length, uct_ib_iface_recv_desc_t *ib_desc)
 {
     void *desc = (char*)ib_desc + iface->config.rx_headroom_offset;
     ucs_status_t status;
 
-    status = uct_iface_invoke_am(&iface->super, am_id, data, length, desc);
+    status = uct_iface_invoke_am(&iface->super, am_id, data, length,
+                                 UCT_CB_PARAM_FLAG_DESC);
     if (status == UCS_OK) {
         ucs_mpool_put_inline(ib_desc);
     } else {
-        uct_recv_desc_iface(desc) = &iface->super.super;
+        uct_recv_desc(desc) = &iface->release_desc;
     }
 }
 
@@ -261,22 +262,13 @@ ucs_status_t uct_ib_iface_create_ah(uct_ib_iface_t *iface,
                                     struct ibv_ah **ah_p,
                                     int *is_global_p);
 
-ucs_status_t uct_ib_iface_wakeup_open(uct_iface_h iface, unsigned events,
-                                      uct_wakeup_h wakeup);
+ucs_status_t uct_ib_iface_pre_arm(uct_ib_iface_t *iface);
 
-ucs_status_t uct_ib_iface_wakeup_get_fd(uct_wakeup_h wakeup, int *fd_p);
-
-ucs_status_t uct_ib_iface_wakeup_arm(uct_wakeup_h wakeup);
-
-ucs_status_t uct_ib_iface_wakeup_wait(uct_wakeup_h wakeup);
-
-ucs_status_t uct_ib_iface_wakeup_signal(uct_wakeup_h wakeup);
-
-void uct_ib_iface_wakeup_close(uct_wakeup_h wakeup);
+ucs_status_t uct_ib_iface_event_fd_get(uct_iface_h iface, int *fd_p);
 
 ucs_status_t uct_ib_iface_arm_tx_cq(uct_ib_iface_t *iface);
 
-ucs_status_t uct_ib_iface_arm_rx_cq(uct_ib_iface_t *iface, int solicited);
+ucs_status_t uct_ib_iface_arm_rx_cq(uct_ib_iface_t *iface, int solicited_only);
 
 
 static inline uint8_t uct_ib_iface_get_atomic_mr_id(uct_ib_iface_t *iface)
@@ -291,24 +283,26 @@ static inline uint8_t uct_ib_iface_get_atomic_mr_id(uct_ib_iface_t *iface)
     uct_ib_device_name(uct_ib_iface_device(_iface)), (_iface)->config.port_num
 
 
+#define UCT_IB_IFACE_VERBS_COMPLETION_ERR(_type, _iface, _i,  _wc) \
+    ucs_fatal("%s completion[%d] with error on %s/%p: %s, vendor_err 0x%x wr_id 0x%lx", \
+              _type, _i, uct_ib_device_name(uct_ib_iface_device(_iface)), _iface, \
+              ibv_wc_status_str(_wc[i].status), _wc[i].vendor_err, \
+              _wc[i].wr_id);
+
 #define UCT_IB_IFACE_VERBS_FOREACH_RXWQE(_iface, _i, _hdr, _wc, _wc_count) \
     for (_i = 0; _i < _wc_count && ({ \
         if (ucs_unlikely(_wc[i].status != IBV_WC_SUCCESS)) { \
-            ucs_fatal("Receive completion with error: %s", ibv_wc_status_str(_wc[i].status)); \
+            UCT_IB_IFACE_VERBS_COMPLETION_ERR("receive", _iface, _i, _wc); \
         } \
         _hdr = (typeof(_hdr))uct_ib_iface_recv_desc_hdr(_iface, \
                                                       (uct_ib_iface_recv_desc_t *)(uintptr_t)_wc[i].wr_id); \
         VALGRIND_MAKE_MEM_DEFINED(_hdr, _wc[i].byte_len); \
-        UCS_INSTRUMENT_RECORD(UCS_INSTRUMENT_TYPE_IB_RX, __FUNCTION__, \
-                              _wc[i].wr_id, _wc[i].status); \
                1; }); ++_i)
 
 #define UCT_IB_IFACE_VERBS_FOREACH_TXWQE(_iface, _i, _wc, _wc_count) \
     for (_i = 0; _i < _wc_count && ({ \
         if (ucs_unlikely(_wc[i].status != IBV_WC_SUCCESS)) { \
-            ucs_fatal("iface=%p: send completion %d with error: %s wqe: %p wr_id: %llu", \
-                      _iface, _i, ibv_wc_status_str(_wc[i].status), \
-                      &_wc[i], (unsigned long long)_wc[i].wr_id); \
+            UCT_IB_IFACE_VERBS_COMPLETION_ERR("send", _iface, _i, _wc); \
         } \
                1; }); ++_i)
 
@@ -332,7 +326,7 @@ size_t uct_ib_verbs_sge_fill_iov(struct ibv_sge *sge, const uct_iov_t *iov,
             continue; /* to avoid zero length elements in sge */
         }
 
-        if (iov[sge_it].memh == UCT_INVALID_MEM_HANDLE) {
+        if (iov[sge_it].memh == UCT_MEM_HANDLE_NULL) {
             sge[sge_it].lkey = 0;
         } else {
             sge[sge_it].lkey = ((uct_ib_mem_t *)(iov[iov_it].memh))->lkey;

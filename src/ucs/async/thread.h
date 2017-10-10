@@ -8,7 +8,7 @@
 #define UCS_ASYNC_THREAD_H
 
 #include <ucs/type/spinlock.h>
-#include <ucs/sys/sys.h>
+#include <ucs/sys/checker.h>
 
 
 typedef struct ucs_async_thread_context {
@@ -21,7 +21,7 @@ typedef struct ucs_async_thread_context {
 } ucs_async_thread_context_t;
 
 
-#ifdef NVALGRIND
+#if defined(NVALGRIND) || defined(__COVERITY__)
 
 #define UCS_ASYNC_THREAD_BLOCK(_async) \
     ucs_spin_lock(&(_async)->thread.spinlock)

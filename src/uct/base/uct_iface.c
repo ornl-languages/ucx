@@ -9,6 +9,7 @@
 #include "uct_md.h"
 
 #include <uct/api/uct.h>
+#include <ucs/async/async.h>
 #include <ucs/time/time.h>
 
 
@@ -47,7 +48,7 @@ static ucs_stats_class_t uct_iface_stats_class = {
 
 
 static ucs_status_t uct_iface_stub_am_handler(void *arg, void *data,
-                                              size_t length, void *desc)
+                                              size_t length, unsigned flags)
 {
     uint8_t id = (uintptr_t)arg;
     ucs_warn("got active message id %d, but no handler installed", id);
@@ -58,7 +59,7 @@ static void uct_iface_set_stub_am_handler(uct_base_iface_t *iface, uint8_t id)
 {
     iface->am[id].cb    = uct_iface_stub_am_handler;
     iface->am[id].arg   = (void*)(uintptr_t)id;
-    iface->am[id].flags = UCT_AM_CB_FLAG_ASYNC;
+    iface->am[id].flags = UCT_CB_FLAG_ASYNC;
 }
 
 ucs_status_t uct_iface_set_am_handler(uct_iface_h tl_iface, uint8_t id,
@@ -80,7 +81,7 @@ ucs_status_t uct_iface_set_am_handler(uct_iface_h tl_iface, uint8_t id,
         return UCS_OK;
     }
 
-    if (!(flags & (UCT_AM_CB_FLAG_SYNC|UCT_AM_CB_FLAG_ASYNC))) {
+    if (!(flags & (UCT_CB_FLAG_SYNC|UCT_CB_FLAG_ASYNC))) {
         ucs_error("invalid active message flags 0x%x", flags);
         return UCS_ERR_INVALID_PARAM;
     }
@@ -93,8 +94,8 @@ ucs_status_t uct_iface_set_am_handler(uct_iface_h tl_iface, uint8_t id,
     /* If user wants a synchronous callback, it must be supported, or the
      * callback could be called from another thread.
      */
-    if ((flags & UCT_AM_CB_FLAG_SYNC) && !(attr.cap.flags & UCT_IFACE_FLAG_AM_CB_SYNC)) {
-        ucs_error("Synchronous active message callback requested, but not supported");
+    if ((flags & UCT_CB_FLAG_SYNC) && !(attr.cap.flags & UCT_IFACE_FLAG_CB_SYNC)) {
+        ucs_error("Synchronous callback requested, but not supported");
         return UCS_ERR_INVALID_PARAM;
     }
 
@@ -160,49 +161,20 @@ int uct_iface_is_reachable(const uct_iface_h iface, const uct_device_addr_t *dev
     return iface->ops.iface_is_reachable(iface, dev_addr, iface_addr);
 }
 
-ucs_status_t uct_wakeup_open(uct_iface_h iface, unsigned events,
-                             uct_wakeup_h *wakeup_p)
+ucs_status_t uct_ep_check(const uct_ep_h ep, unsigned flags,
+                          uct_completion_t *comp)
 {
-    if ((events == 0) || (wakeup_p == NULL)) {
-        return UCS_ERR_INVALID_PARAM;
-    }
-
-    *wakeup_p = ucs_malloc(sizeof(**wakeup_p), "iface_wakeup_context");
-    if (*wakeup_p == NULL) {
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    (*wakeup_p)->fd = -1;
-    (*wakeup_p)->iface = iface;
-    (*wakeup_p)->events = events;
-
-    return iface->ops.iface_wakeup_open(iface, events, *wakeup_p);
+    return ep->iface->ops.ep_check(ep, flags, comp);
 }
 
-ucs_status_t uct_wakeup_efd_get(uct_wakeup_h wakeup, int *fd_p)
+ucs_status_t uct_iface_event_fd_get(uct_iface_h iface, int *fd_p)
 {
-    return wakeup->iface->ops.iface_wakeup_get_fd(wakeup, fd_p);
+    return iface->ops.iface_event_fd_get(iface, fd_p);
 }
 
-ucs_status_t uct_wakeup_efd_arm(uct_wakeup_h wakeup)
+ucs_status_t uct_iface_event_arm(uct_iface_h iface, unsigned events)
 {
-    return wakeup->iface->ops.iface_wakeup_arm(wakeup);
-}
-
-ucs_status_t uct_wakeup_wait(uct_wakeup_h wakeup)
-{
-    return wakeup->iface->ops.iface_wakeup_wait(wakeup);
-}
-
-ucs_status_t uct_wakeup_signal(uct_wakeup_h wakeup)
-{
-    return wakeup->iface->ops.iface_wakeup_signal(wakeup);
-}
-
-void uct_wakeup_close(uct_wakeup_h wakeup)
-{
-    wakeup->iface->ops.iface_wakeup_close(wakeup);
-    ucs_free(wakeup);
+    return iface->ops.iface_event_arm(iface, events);
 }
 
 void uct_iface_close(uct_iface_h iface)
@@ -210,27 +182,68 @@ void uct_iface_close(uct_iface_h iface)
     iface->ops.iface_close(iface);
 }
 
-static ucs_status_t uct_base_iface_flush(uct_iface_h tl_iface, unsigned flags,
-                                         uct_completion_t *comp)
+void uct_base_iface_progress_enable(uct_iface_h tl_iface, unsigned flags)
+{
+    uct_base_iface_t *iface = ucs_derived_of(tl_iface, uct_base_iface_t);
+    uct_priv_worker_t *worker = iface->worker;
+
+    UCS_ASYNC_BLOCK(worker->async);
+
+    /* Add callback only if previous flags are 0 and new flags != 0 */
+    if (!iface->progress_flags && flags) {
+        if (iface->prog.id == UCS_CALLBACKQ_ID_NULL) {
+            iface->prog.id = ucs_callbackq_add(&worker->super.progress_q,
+                                               (ucs_callback_t)iface->super.ops.iface_progress,
+                                               iface, UCS_CALLBACKQ_FLAG_FAST);
+        }
+    }
+    iface->progress_flags |= flags;
+
+    UCS_ASYNC_UNBLOCK(worker->async);
+}
+
+void uct_base_iface_progress_disable(uct_iface_h tl_iface, unsigned flags)
+{
+    uct_base_iface_t *iface = ucs_derived_of(tl_iface, uct_base_iface_t);
+    uct_priv_worker_t *worker = iface->worker;
+
+    UCS_ASYNC_BLOCK(worker->async);
+
+    /* Remove callback only if previous flags != 0, and removing the given
+     * flags makes it become 0.
+     */
+    if (iface->progress_flags && !(iface->progress_flags & ~flags)) {
+        if (iface->prog.id != UCS_CALLBACKQ_ID_NULL) {
+            ucs_callbackq_remove(&worker->super.progress_q, iface->prog.id);
+            iface->prog.id = UCS_CALLBACKQ_ID_NULL;
+        }
+    }
+    iface->progress_flags &= ~flags;
+
+    UCS_ASYNC_UNBLOCK(worker->async);
+}
+
+ucs_status_t uct_base_iface_flush(uct_iface_h tl_iface, unsigned flags,
+                                  uct_completion_t *comp)
 {
     UCT_TL_IFACE_STAT_FLUSH(ucs_derived_of(tl_iface, uct_base_iface_t));
     return UCS_OK;
 }
 
-static ucs_status_t uct_base_iface_fence(uct_iface_h tl_iface, unsigned flags)
+ucs_status_t uct_base_iface_fence(uct_iface_h tl_iface, unsigned flags)
 {
     UCT_TL_IFACE_STAT_FENCE(ucs_derived_of(tl_iface, uct_base_iface_t));
     return UCS_OK;
 }
 
-static ucs_status_t uct_base_ep_flush(uct_ep_h tl_ep, unsigned flags,
-                                      uct_completion_t *comp)
+ucs_status_t uct_base_ep_flush(uct_ep_h tl_ep, unsigned flags,
+                               uct_completion_t *comp)
 {
     UCT_TL_EP_STAT_FLUSH(ucs_derived_of(tl_ep, uct_base_ep_t));
     return UCS_OK;
 }
 
-static ucs_status_t uct_base_ep_fence(uct_ep_h tl_ep, unsigned flags)
+ucs_status_t uct_base_ep_fence(uct_ep_h tl_ep, unsigned flags)
 {
     UCT_TL_EP_STAT_FENCE(ucs_derived_of(tl_ep, uct_base_ep_t));
     return UCS_OK;
@@ -270,6 +283,9 @@ void uct_set_ep_failed(ucs_class_t *cls, uct_ep_h tl_ep, uct_iface_h tl_iface)
 {
     uct_failed_iface_t *f_iface;
     uct_iface_ops_t    *ops;
+    uct_base_iface_t   *iface = ucs_derived_of(tl_iface, uct_base_iface_t);
+
+    ucs_debug("set ep %p to failed state", tl_ep);
 
     /* TBD: consider allocating one instance per interface
      * rather than for each endpoint */
@@ -286,12 +302,6 @@ void uct_set_ep_failed(ucs_class_t *cls, uct_ep_h tl_ep, uct_iface_h tl_iface)
      * Failed ep will use that queue for purge. */
     uct_ep_pending_purge(tl_ep, uct_ep_failed_purge_cb, &f_iface->pend_q);
 
-    ops->ep_get_address     = (void*)ucs_empty_function_return_ep_timeout;
-    ops->ep_connect_to_ep   = (void*)ucs_empty_function_return_ep_timeout;
-    ops->ep_flush           = (void*)ucs_empty_function_return_ep_timeout;
-    ops->ep_destroy         = uct_ep_failed_destroy;
-    ops->ep_pending_add     = (void*)ucs_empty_function_return_ep_timeout;
-    ops->ep_pending_purge   = uct_ep_failed_purge;
     ops->ep_put_short       = (void*)ucs_empty_function_return_ep_timeout;
     ops->ep_put_bcopy       = (void*)ucs_empty_function_return_bc_ep_timeout;
     ops->ep_put_zcopy       = (void*)ucs_empty_function_return_ep_timeout;
@@ -308,32 +318,50 @@ void uct_set_ep_failed(ucs_class_t *cls, uct_ep_h tl_ep, uct_iface_h tl_iface)
     ops->ep_atomic_fadd32   = (void*)ucs_empty_function_return_ep_timeout;
     ops->ep_atomic_swap32   = (void*)ucs_empty_function_return_ep_timeout;
     ops->ep_atomic_cswap32  = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_eager_short = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_eager_bcopy = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_eager_zcopy = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_rndv_zcopy  = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_rndv_cancel = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_tag_rndv_request= (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_pending_add     = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_pending_purge   = uct_ep_failed_purge;
+    ops->ep_flush           = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_fence           = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_check           = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_connect_to_ep   = (void*)ucs_empty_function_return_ep_timeout;
+    ops->ep_destroy         = uct_ep_failed_destroy;
+    ops->ep_get_address     = (void*)ucs_empty_function_return_ep_timeout;
 
     ucs_class_call_cleanup_chain(cls, tl_ep, -1);
 
     tl_ep->iface = &f_iface->super;
+
+    if (iface->err_handler) {
+        iface->err_handler(iface->err_handler_arg, tl_ep,
+                           UCS_ERR_ENDPOINT_TIMEOUT);
+    } else {
+        ucs_error("Error %s was not handled for ep %p",
+                  ucs_status_string(UCS_ERR_ENDPOINT_TIMEOUT), tl_ep);
+    }
 }
 
 UCS_CLASS_INIT_FUNC(uct_iface_t, uct_iface_ops_t *ops)
 {
+    ucs_assert_always(ops->ep_flush                 != NULL);
+    ucs_assert_always(ops->ep_fence                 != NULL);
+    ucs_assert_always(ops->ep_destroy               != NULL);
+    ucs_assert_always(ops->iface_flush              != NULL);
+    ucs_assert_always(ops->iface_fence              != NULL);
+    ucs_assert_always(ops->iface_progress_enable    != NULL);
+    ucs_assert_always(ops->iface_progress_disable   != NULL);
+    ucs_assert_always(ops->iface_progress           != NULL);
+    ucs_assert_always(ops->iface_close              != NULL);
+    ucs_assert_always(ops->iface_query              != NULL);
+    ucs_assert_always(ops->iface_get_device_address != NULL);
+    ucs_assert_always(ops->iface_is_reachable       != NULL);
 
     self->ops = *ops;
-    if (ops->ep_flush == NULL) {
-        self->ops.ep_flush = uct_base_ep_flush;
-    }
-
-    if (ops->ep_fence == NULL) {
-        self->ops.ep_fence = uct_base_ep_fence;
-    }
-
-    if (ops->iface_flush == NULL) {
-        self->ops.iface_flush = uct_base_iface_flush;
-    }
-
-    if (ops->iface_fence == NULL) {
-        self->ops.iface_fence = uct_base_iface_fence;
-    }
-
     return UCS_OK;
 }
 
@@ -345,7 +373,8 @@ UCS_CLASS_DEFINE(uct_iface_t, void);
 
 
 UCS_CLASS_INIT_FUNC(uct_base_iface_t, uct_iface_ops_t *ops, uct_md_h md,
-                    uct_worker_h worker, const uct_iface_config_t *config
+                    uct_worker_h worker, const uct_iface_params_t *params,
+                    const uct_iface_config_t *config
                     UCS_STATS_ARG(ucs_stats_node_t *stats_parent)
                     UCS_STATS_ARG(const char *iface_name))
 {
@@ -356,10 +385,14 @@ UCS_CLASS_INIT_FUNC(uct_base_iface_t, uct_iface_ops_t *ops, uct_md_h md,
 
     UCS_CLASS_CALL_SUPER_INIT(uct_iface_t, ops);
 
-    self->md            = md;
-    self->worker        = worker;
-    self->am_tracer     = NULL;
-    self->am_tracer_arg = NULL;
+    self->md              = md;
+    self->worker          = ucs_derived_of(worker, uct_priv_worker_t);
+    self->am_tracer       = NULL;
+    self->am_tracer_arg   = NULL;
+    self->err_handler     = params->err_handler;
+    self->err_handler_arg = params->err_handler_arg;
+    self->progress_flags  = 0;
+    uct_worker_progress_init(&self->prog);
 
     for (id = 0; id < UCT_AM_ID_MAX; ++id) {
         uct_iface_set_stub_am_handler(self, id);
@@ -465,7 +498,7 @@ ucs_config_field_t uct_iface_config_table[] = {
    "up to this limit, the actual size can be lower due to transport constraints.",
    ucs_offsetof(uct_iface_config_t, max_bcopy), UCS_CONFIG_TYPE_MEMUNITS},
 
-  {"ALLOC", "huge,md,mmap,heap",
+  {"ALLOC", "huge,thp,md,mmap,heap",
    "Priority of methods to allocate intermediate buffers for communication",
    ucs_offsetof(uct_iface_config_t, alloc_methods), UCS_CONFIG_TYPE_ARRAY(alloc_methods)},
 

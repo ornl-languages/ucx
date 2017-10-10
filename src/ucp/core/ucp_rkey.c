@@ -12,6 +12,7 @@
 
 
 static ucp_rkey_t ucp_mem_dummy_rkey = {
+                                        // TODO cache?
     .md_map = 0
 };
 
@@ -29,7 +30,7 @@ ucs_status_t ucp_rkey_pack(ucp_context_h context, ucp_mem_h memh,
     /* always acquire context lock */
     UCP_THREAD_CS_ENTER(&context->mt_lock);
 
-    ucs_trace("packing rkeys for buffer %p memh %p md_map 0x%x",
+    ucs_trace("packing rkeys for buffer %p memh %p md_map 0x%lx",
               memh->address, memh, memh->md_map);
 
     if (memh->length == 0) {
@@ -126,7 +127,7 @@ ucs_status_t ucp_ep_rkey_unpack(ucp_ep_h ep, void *rkey_buffer, ucp_rkey_h *rkey
     /* Read remote MD map */
     md_map   = *(ucp_md_map_t*)p;
 
-    ucs_trace("unpacking rkey with md_map 0x%x", md_map);
+    ucs_trace("unpacking rkey with md_map 0x%lx", md_map);
 
     if (md_map == 0) {
         /* Dummy key return ok */
@@ -194,6 +195,7 @@ ucs_status_t ucp_ep_rkey_unpack(ucp_ep_h ep, void *rkey_buffer, ucp_rkey_h *rkey
         goto err_destroy;
     }
 
+    ucp_rkey_resolve_inner(rkey, ep);
     *rkey_p = rkey;
     return UCS_OK;
 
@@ -201,6 +203,29 @@ err_destroy:
     ucp_rkey_destroy(rkey);
 err:
     return status;
+}
+
+ucs_status_t ucp_rkey_ptr(ucp_rkey_h rkey, uint64_t raddr, void **addr_p)
+{
+    unsigned num_rkeys;
+    unsigned i;
+    ucs_status_t status;
+
+    if (rkey == &ucp_mem_dummy_rkey) {
+        return UCS_ERR_UNREACHABLE;
+    }
+
+    num_rkeys = ucs_count_one_bits(rkey->md_map);
+
+    for (i = 0; i < num_rkeys; ++i) {
+        status = uct_rkey_ptr(&rkey->uct[i], raddr, addr_p);
+        if ((status == UCS_OK) ||
+            (status == UCS_ERR_INVALID_ADDR)) {
+            return status;
+        }
+    }
+
+    return UCS_ERR_UNREACHABLE;
 }
 
 void ucp_rkey_destroy(ucp_rkey_h rkey)
@@ -219,3 +244,55 @@ void ucp_rkey_destroy(ucp_rkey_h rkey)
     }
     ucs_free(rkey);
 }
+
+static ucp_lane_index_t ucp_config_find_rma_lane(const ucp_ep_config_t *config,
+                                                 const ucp_lane_index_t *lanes,
+                                                 ucp_md_map_t rkey_md_map,
+                                                 ucp_md_index_t *rkey_index_p)
+{
+    ucp_md_index_t dst_md_index;
+    ucp_lane_index_t lane;
+    ucp_md_map_t dst_md_mask;
+    int prio;
+
+    for (prio = 0; prio < UCP_MAX_LANES; ++prio) {
+        lane = lanes[prio];
+        if (lane == UCP_NULL_LANE) {
+            return UCP_NULL_LANE; /* No more lanes */
+        }
+
+        dst_md_index = config->key.lanes[lane].dst_md_index;
+        dst_md_mask  = UCS_BIT(dst_md_index);
+        if (rkey_md_map & dst_md_mask) {
+            /* Return first matching lane */
+            *rkey_index_p = ucs_count_one_bits(rkey_md_map & (dst_md_mask - 1));
+            return lane;
+        }
+    }
+
+    return UCP_NULL_LANE;
+}
+
+void ucp_rkey_resolve_inner(ucp_rkey_h rkey, ucp_ep_h ep)
+{
+    ucp_ep_config_t *config = ucp_ep_config(ep);
+    ucp_md_index_t rkey_index;
+
+    rkey->cache.rma_lane = ucp_config_find_rma_lane(config, config->key.rma_lanes,
+                                                    rkey->md_map, &rkey_index);
+    if (rkey->cache.rma_lane != UCP_NULL_LANE) {
+        rkey->cache.rma_rkey      = rkey->uct[rkey_index].rkey;
+        rkey->cache.max_put_short = config->rma[rkey->cache.rma_lane].max_put_short;
+    }
+
+    rkey->cache.amo_lane = ucp_config_find_rma_lane(config, config->key.amo_lanes,
+                                                    rkey->md_map, &rkey_index);
+    if (rkey->cache.amo_lane != UCP_NULL_LANE) {
+        rkey->cache.amo_rkey      = rkey->uct[rkey_index].rkey;
+    }
+
+    rkey->cache.ep_cfg_index  = ep->cfg_index;
+    ucs_trace("rkey %p ep %p @ cfg[%d] rma_lane %d amo_lane %d", rkey, ep,
+              ep->cfg_index, rkey->cache.rma_lane, rkey->cache.amo_lane);
+}
+

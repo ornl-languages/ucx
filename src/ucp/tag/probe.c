@@ -4,9 +4,9 @@
  * See file LICENSE for terms.
  */
 
-#include "match.h"
 #include "eager.h"
 #include "rndv.h"
+#include "tag_match.inl"
 
 #include <ucp/api/ucp.h>
 #include <ucp/core/ucp_worker.h>
@@ -19,11 +19,11 @@ ucp_tag_probe_search(ucp_context_h context, ucp_tag_t tag, uint64_t tag_mask,
 {
     ucp_recv_desc_t *rdesc;
     ucp_tag_hdr_t *hdr;
-    ucs_queue_iter_t iter;
     ucp_tag_t recv_tag;
     unsigned flags;
 
-    ucs_queue_for_each_safe(rdesc, iter, &context->tag.unexpected, queue) {
+    ucs_list_for_each(rdesc, &context->tm.unexpected.all,
+                      tag_list[UCP_RDESC_ALL_LIST]) {
         hdr      = (void*)(rdesc + 1);
         recv_tag = hdr->tag;
         flags    = rdesc->flags;
@@ -32,7 +32,8 @@ ucp_tag_probe_search(ucp_context_h context, ucp_tag_t tag, uint64_t tag_mask,
         if ((flags & UCP_RECV_DESC_FLAG_FIRST) &&
             ucp_tag_is_match(recv_tag, tag, tag_mask))
         {
-            ucp_tag_log_match(recv_tag, NULL, tag, tag_mask, 0, "probe");
+            ucp_tag_log_match(recv_tag, rdesc->length - rdesc->hdr_len, NULL,
+                              tag, tag_mask, 0, "probe");
 
             info->sender_tag = hdr->tag;
             if (flags & UCP_RECV_DESC_FLAG_EAGER) {
@@ -43,7 +44,10 @@ ucp_tag_probe_search(ucp_context_h context, ucp_tag_t tag, uint64_t tag_mask,
             }
 
             if (remove) {
-                ucs_queue_del_iter(&context->tag.unexpected, iter);
+                /* Prevent the receive descriptor, and any fragments after it,
+                 * from being matched by receive requests.
+                 */
+                rdesc->flags &= ~UCP_RECV_DESC_FLAG_FIRST;
             }
             return rdesc;
         }

@@ -21,12 +21,23 @@ enum {
 };
 
 struct uct_dc_ep {
-    uct_base_ep_t         super;
-    ucs_arbiter_group_t   arb_group;
-    uint8_t               dci;
-    uint8_t               state;
-    uint16_t              atomic_mr_offset;
-    uct_rc_fc_t           fc;
+    /*
+     * per value of 'state':
+     * INVALID   - 'list' is added to iface->tx.gc_list.
+     * Otherwise - 'super' and 'arb_group' are used.
+     */
+    union {
+        struct {
+            uct_base_ep_t         super;
+            ucs_arbiter_group_t   arb_group;
+        };
+        ucs_list_link_t           list;
+    };
+
+    uint8_t                       dci;
+    uint8_t                       state;
+    uint16_t                      atomic_mr_offset;
+    uct_rc_fc_t                   fc;
 };
 
 UCS_CLASS_DECLARE(uct_dc_ep_t, uct_dc_iface_t *, const uct_dc_iface_addr_t *);
@@ -43,6 +54,10 @@ uct_dc_iface_dci_do_pending_tx(ucs_arbiter_t *arbiter,
 
 ucs_status_t uct_dc_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *r);
 void uct_dc_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb, void *arg);
+
+void uct_dc_ep_cleanup(uct_ep_h tl_ep, ucs_class_t *cls);
+
+void uct_dc_ep_release(uct_dc_ep_t *ep);
 
 static inline void uct_dc_iface_dci_sched_tx(uct_dc_iface_t *iface, uct_dc_ep_t *ep)
 {
@@ -87,7 +102,8 @@ static inline void uct_dc_iface_dci_sched_tx(uct_dc_iface_t *iface, uct_dc_ep_t 
 
 enum uct_dc_ep_state {
     UCT_DC_EP_TX_OK,
-    UCT_DC_EP_TX_WAIT
+    UCT_DC_EP_TX_WAIT,
+    UCT_DC_EP_INVALID
 };
 
 #define UCT_DC_EP_NO_DCI ((uint8_t)-1)
@@ -123,6 +139,16 @@ static inline int uct_dc_iface_dci_ep_can_send(uct_dc_ep_t *ep)
            uct_dc_iface_dci_has_tx_resources(iface, ep->dci);
 }
 
+static UCS_F_ALWAYS_INLINE
+void uct_dc_iface_schedule_dci_alloc(uct_dc_iface_t *iface, uct_dc_ep_t *ep)
+{
+    /* If FC window is empty the group will be scheduled when
+     * grant is received */
+    if (ep->fc.fc_wnd > 0) {
+        ucs_arbiter_group_schedule(uct_dc_iface_dci_waitq(iface), &ep->arb_group);
+    }
+}
+
 static inline void uct_dc_iface_dci_put_dcs(uct_dc_iface_t *iface, uint8_t dci)
 {
     uct_dc_ep_t *ep = iface->tx.dcis[dci].ep;
@@ -130,8 +156,11 @@ static inline void uct_dc_iface_dci_put_dcs(uct_dc_iface_t *iface, uint8_t dci)
     ucs_assert(iface->tx.stack_top > 0);
 
     if (uct_dc_iface_dci_has_outstanding(iface, dci)) {
-        if (ucs_unlikely(ep == NULL)) {
-            /* ep was destroyed while holding dci */
+        if (ep == NULL) {
+            /* The EP was destroyed after flush cancel */
+            ucs_assert(ucs_test_all_flags(iface->tx.dcis[dci].flags,
+                                          (UCT_DC_DCI_FLAG_EP_CANCELED |
+                                           UCT_DC_DCI_FLAG_EP_DESTROYED)));
             return;
         }
         if (iface->tx.policy == UCT_DC_TX_POLICY_DCS_QUOTA) {
@@ -153,7 +182,6 @@ static inline void uct_dc_iface_dci_put_dcs(uct_dc_iface_t *iface, uint8_t dci)
     iface->tx.dcis_stack[iface->tx.stack_top] = dci;
 
     if (ucs_unlikely(ep == NULL)) {
-        /* ep was destroyed while holding dci */
         return;
     }
 
@@ -161,12 +189,14 @@ static inline void uct_dc_iface_dci_put_dcs(uct_dc_iface_t *iface, uint8_t dci)
     ep->dci   = UCT_DC_EP_NO_DCI;
     ep->state = UCT_DC_EP_TX_OK;
     iface->tx.dcis[dci].ep = NULL;
-
+#if ENABLE_ASSERT
+    iface->tx.dcis[dci].flags = 0;
+#endif
     /* it is possible that dci is released while ep still has scheduled pending ops.
      * move the group to the 'wait for dci alloc' state
      */
     ucs_arbiter_group_desched(uct_dc_iface_tx_waitq(iface), &ep->arb_group);
-    ucs_arbiter_group_schedule(uct_dc_iface_dci_waitq(iface), &ep->arb_group);
+    uct_dc_iface_schedule_dci_alloc(iface, ep);
 }
 
 static inline ucs_status_t
@@ -185,6 +215,7 @@ static inline void uct_dc_iface_dci_alloc_dcs(uct_dc_iface_t *iface, uct_dc_ep_t
     ep->dci = iface->tx.dcis_stack[iface->tx.stack_top];
     ucs_assert(ep->dci < iface->tx.ndci);
     ucs_assert(iface->tx.dcis[ep->dci].ep == NULL);
+    ucs_assert(iface->tx.dcis[ep->dci].flags == 0);
     iface->tx.dcis[ep->dci].ep = ep;
     iface->tx.stack_top++;
 }
@@ -203,6 +234,9 @@ static inline void uct_dc_iface_dci_free_dcs(uct_dc_iface_t *iface, uct_dc_ep_t 
     iface->tx.stack_top--;
     iface->tx.dcis_stack[iface->tx.stack_top] = dci;
     iface->tx.dcis[dci].ep                    = NULL;
+#if ENABLE_ASSERT
+    iface->tx.dcis[ep->dci].flags             = 0;
+#endif
 
     ep->dci   = UCT_DC_EP_NO_DCI;
     ep->state = UCT_DC_EP_TX_OK;
@@ -254,17 +288,23 @@ static inline ucs_status_t uct_dc_iface_dci_get_dcs(uct_dc_iface_t *iface, uct_d
     return UCS_ERR_NO_RESOURCE;
 }
 
+static UCS_F_ALWAYS_INLINE int uct_dc_ep_fc_wait_for_grant(uct_dc_ep_t *ep)
+{
+    return ep->fc.flags & UCT_DC_EP_FC_FLAG_WAIT_FOR_GRANT;
+}
+
 ucs_status_t uct_dc_ep_check_fc(uct_dc_iface_t *iface, uct_dc_ep_t *ep);
 
 
 #define UCT_DC_CHECK_RES(_iface, _ep) \
     { \
         ucs_status_t status; \
-        UCT_RC_CHECK_CQE(&(_iface)->super, _ep); \
         status = uct_dc_iface_dci_get(_iface, _ep); \
         if (ucs_unlikely(status != UCS_OK)) { \
             return status; \
         } \
+        UCT_RC_CHECK_CQE(&(_iface)->super, _ep, \
+                         &(_iface)->tx.dcis[(_ep)->dci].txqp); \
     }
 
 

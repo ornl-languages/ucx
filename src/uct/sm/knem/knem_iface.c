@@ -10,6 +10,7 @@
 
 #include <uct/base/uct_md.h>
 #include <uct/sm/base/sm_iface.h>
+#include <ucs/sys/string.h>
 
 
 UCT_MD_REGISTER_TL(&uct_knem_md_component, &uct_knem_tl);
@@ -39,12 +40,14 @@ static ucs_status_t uct_knem_iface_query(uct_iface_h tl_iface,
     iface_attr->iface_addr_len         = 0;
     iface_attr->device_addr_len        = UCT_SM_IFACE_DEVICE_ADDR_LEN;
     iface_attr->ep_addr_len            = 0;
+    iface_attr->max_conn_priv          = 0;
     iface_attr->cap.flags              = UCT_IFACE_FLAG_GET_ZCOPY |
                                          UCT_IFACE_FLAG_PUT_ZCOPY |
                                          UCT_IFACE_FLAG_PENDING   |
                                          UCT_IFACE_FLAG_CONNECT_TO_IFACE;
-    iface_attr->latency                = 80e-9; /* 80 ns */
-    iface_attr->bandwidth              = 11320 * 1024.0 * 1024.0; /* 11320 MB*/
+    iface_attr->latency.overhead       = 80e-9; /* 80 ns */
+    iface_attr->latency.growth         = 0;
+    iface_attr->bandwidth              = 12000 * 1024.0 * 1024.0;
     iface_attr->overhead               = 0.25e-6; /* 0.25 us */
     return UCS_OK;
 }
@@ -52,18 +55,24 @@ static ucs_status_t uct_knem_iface_query(uct_iface_h tl_iface,
 static UCS_CLASS_DECLARE_DELETE_FUNC(uct_knem_iface_t, uct_iface_t);
 
 static uct_iface_ops_t uct_knem_iface_ops = {
-    .iface_close         = UCS_CLASS_DELETE_FUNC_NAME(uct_knem_iface_t),
-    .iface_query         = uct_knem_iface_query,
-    .iface_get_address   = (void*)ucs_empty_function_return_success,
+    .ep_put_zcopy             = uct_knem_ep_put_zcopy,
+    .ep_get_zcopy             = uct_knem_ep_get_zcopy,
+    .ep_pending_add           = (void*)ucs_empty_function_return_busy,
+    .ep_pending_purge         = (void*)ucs_empty_function,
+    .ep_flush                 = uct_base_ep_flush,
+    .ep_fence                 = uct_sm_ep_fence,
+    .ep_create_connected      = UCS_CLASS_NEW_FUNC_NAME(uct_knem_ep_t),
+    .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_knem_ep_t),
+    .iface_fence              = uct_sm_iface_fence,
+    .iface_progress_enable    = ucs_empty_function,
+    .iface_progress_disable   = ucs_empty_function,
+    .iface_progress           = ucs_empty_function_return_zero,
+    .iface_flush              = uct_base_iface_flush,
+    .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_knem_iface_t),
+    .iface_query              = uct_knem_iface_query,
     .iface_get_device_address = uct_sm_iface_get_device_address,
-    .iface_is_reachable  = uct_sm_iface_is_reachable,
-    .iface_fence         = uct_sm_iface_fence,
-    .ep_put_zcopy        = uct_knem_ep_put_zcopy,
-    .ep_get_zcopy        = uct_knem_ep_get_zcopy,
-    .ep_fence            = uct_sm_ep_fence,
-    .ep_create_connected = UCS_CLASS_NEW_FUNC_NAME(uct_knem_ep_t),
-    .ep_destroy          = UCS_CLASS_DELETE_FUNC_NAME(uct_knem_ep_t),
-    .ep_pending_purge    = (void*)ucs_empty_function_return_success,
+    .iface_get_address        = (void*)ucs_empty_function_return_success,
+    .iface_is_reachable       = uct_sm_iface_is_reachable
 };
 
 static UCS_CLASS_INIT_FUNC(uct_knem_iface_t, uct_md_h md, uct_worker_h worker,
@@ -71,7 +80,7 @@ static UCS_CLASS_INIT_FUNC(uct_knem_iface_t, uct_md_h md, uct_worker_h worker,
                            const uct_iface_config_t *tl_config)
 {
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_knem_iface_ops, md, worker,
-                              tl_config UCS_STATS_ARG(params->stats_root)
+                              params, tl_config UCS_STATS_ARG(params->stats_root)
                               UCS_STATS_ARG(UCT_KNEM_TL_NAME));
     self->knem_md = (uct_knem_md_t *)md;
     uct_sm_get_max_iov(); /* to initialize ucs_get_max_iov static variable */

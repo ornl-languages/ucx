@@ -7,7 +7,6 @@
 #include "global_opts.h"
 
 #include <ucs/config/parser.h>
-#include <ucs/debug/instrument.h>
 #include <ucs/debug/profile.h>
 #include <ucs/debug/log.h>
 #include <sys/signal.h>
@@ -15,12 +14,15 @@
 
 ucs_global_opts_t ucs_global_opts = {
     .log_level             = UCS_LOG_LEVEL_WARN,
+    .log_print_enable      = 0,
     .log_file              = "",
     .log_buffer_size       = 1024,
     .log_data_size         = 0,
     .mpool_fifo            = 0,
-    .handle_errors         = UCS_HANDLE_ERROR_BACKTRACE,
+    .handle_errors         = UCS_BIT(UCS_HANDLE_ERROR_BACKTRACE),
     .error_signals         = { NULL, 0 },
+    .error_mail_to         = "",
+    .error_mail_footer     = "",
     .gdb_command           = "gdb",
     .debug_signo           = SIGHUP,
     .async_max_events      = 64,
@@ -28,31 +30,20 @@ ucs_global_opts_t ucs_global_opts = {
     .stats_dest            = "",
     .tuning_path           = "",
     .memtrack_dest         = "",
-    .stats_dest            = "",
     .stats_trigger         = "exit",
-    .memtrack_dest         = "",
-    .instrument_file       = "",
-    .instrument_types      = 0,
-    .instrument_max_size   = 1048576,
     .profile_mode          = 0,
-    .profile_file          = ""
+    .profile_file          = "",
+    .stats_filter          = { NULL, 0 },
+    .stats_format          = UCS_STATS_FULL,
 };
 
-static const char *handle_error_modes[] = {
-    [UCS_HANDLE_ERROR_NONE]      = "none",
+static const char *ucs_handle_error_modes[] = {
     [UCS_HANDLE_ERROR_BACKTRACE] = "bt",
     [UCS_HANDLE_ERROR_FREEZE]    = "freeze",
     [UCS_HANDLE_ERROR_DEBUG]     = "debug",
     [UCS_HANDLE_ERROR_LAST]      = NULL
 };
 
-const char *ucs_instrumentation_type_names[] = {
-    [UCS_INSTRUMENT_TYPE_UCP_TX] = "ucp-tx",
-    [UCS_INSTRUMENT_TYPE_UCP_RX] = "ucp-rx",
-    [UCS_INSTRUMENT_TYPE_IB_TX] = "ib-tx",
-    [UCS_INSTRUMENT_TYPE_IB_RX] = "ib-rx",
-    [UCS_INSTRUMENT_TYPE_LAST]  = NULL
-};
 
 static UCS_CONFIG_DEFINE_ARRAY(signo,
                                sizeof(int),
@@ -81,6 +72,10 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "How much packet payload to print, at most, in data mode.",
   ucs_offsetof(ucs_global_opts_t, log_data_size), UCS_CONFIG_TYPE_ULONG},
 
+ {"LOG_PRINT_ENABLE", "n",
+  "Enable output of ucs_print(). This option is intended for use by the library developers.\n",
+  ucs_offsetof(ucs_global_opts_t, log_print_enable), UCS_CONFIG_TYPE_BOOL},
+
 #if ENABLE_DEBUG_DATA
  {"MPOOL_FIFO", "n",
   "Enable FIFO behavior for memory pool, instead of LIFO. Useful for\n"
@@ -88,16 +83,25 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   ucs_offsetof(ucs_global_opts_t, mpool_fifo), UCS_CONFIG_TYPE_BOOL},
 #endif
 
- {"HANDLE_ERRORS", "bt",
-  "Error handling mode. Possible values are: 'none' (no error handling), 'bt' (print\n"
-  "backtrace), 'freeze' (freeze and wait for a debugger), 'debug' (attach debugger)",
-  ucs_offsetof(ucs_global_opts_t, handle_errors), UCS_CONFIG_TYPE_ENUM(handle_error_modes)},
+ {"HANDLE_ERRORS", "bt,freeze",
+  "Error handling mode. A combination of: 'bt' (print backtrace),\n"
+  "'freeze' (freeze and wait for a debugger), 'debug' (attach debugger)",
+  ucs_offsetof(ucs_global_opts_t, handle_errors),
+  UCS_CONFIG_TYPE_BITMAP(ucs_handle_error_modes)},
 
  {"ERROR_SIGNALS", "SIGILL,SIGSEGV,SIGBUS,SIGFPE",
   "Signals which are considered an error indication and trigger error handling.",
   ucs_offsetof(ucs_global_opts_t, error_signals), UCS_CONFIG_TYPE_ARRAY(signo)},
 
- {"GDB_COMMAND", "gdb",
+ {"ERROR_MAIL_TO", "",
+  "If non-empty, send mail notification for fatal errors.",
+  ucs_offsetof(ucs_global_opts_t, error_mail_to), UCS_CONFIG_TYPE_STRING},
+
+ {"ERROR_MAIL_FOOTER", "",
+  "Footer for error report email",
+  ucs_offsetof(ucs_global_opts_t, error_mail_footer), UCS_CONFIG_TYPE_STRING},
+
+ {"GDB_COMMAND", "gdb -quiet",
   "If non-empty, attaches a gdb to the process in case of error, using the provided command.",
   ucs_offsetof(ucs_global_opts_t, gdb_command), UCS_CONFIG_TYPE_STRING},
 
@@ -105,7 +109,11 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "Signal number which causes UCS to enter debug mode. Set to 0 to disable.",
   ucs_offsetof(ucs_global_opts_t, debug_signo), UCS_CONFIG_TYPE_SIGNO},
 
- {"ASYNC_MAX_EVENTS", "64", /* TODO remove this; resize mpmc */
+ {"LOG_LEVEL_TRIGGER", "fatal",
+  "Log level to trigger error handling.",
+  ucs_offsetof(ucs_global_opts_t, log_level_trigger), UCS_CONFIG_TYPE_ENUM(ucs_log_level_names)},
+
+ {"ASYNC_MAX_EVENTS", "1024", /* TODO remove this; resize mpmc */
   "Maximal number of events which can be handled from one context",
   ucs_offsetof(ucs_global_opts_t, async_max_events), UCS_CONFIG_TYPE_UINT},
 
@@ -130,6 +138,25 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "  timer:<interval>  - dump in specified intervals (in seconds).",
   ucs_offsetof(ucs_global_opts_t, stats_trigger), UCS_CONFIG_TYPE_STRING},
 
+  {"STATS_FILTER", "*",
+   "Used for filter counters summary.\n"
+   "Comma-separated list of glob patterns specifying counters.\n"
+   "Statistics summary will contain only the matching counters.\n"
+   "The order is not meaningful.\n"
+   "Each expression in the list may contain any of the following wildcard:\n"
+   "  *     - matches any number of any characters including none.\n"
+   "  ?     - matches any single character.\n"
+   "  [abc] - matches one character given in the bracket.\n"
+   "  [a-z] - matches one character from the range given in the bracket.",
+   ucs_offsetof(ucs_global_opts_t, stats_filter), UCS_CONFIG_TYPE_STRING_ARRAY},
+
+  {"STATS_FORMAT", "full",
+   "Statistics format parameter:\n"
+   "  full    - each counter will be displayed in a separate line \n"
+   "  agg     - like full but there will also be an aggregation between similar counters\n"
+   "  summary - all counters will be printed in the same line.",
+   ucs_offsetof(ucs_global_opts_t, stats_format), UCS_CONFIG_TYPE_ENUM(ucs_stats_formats_names)},
+
 #endif
 
 #if ENABLE_MEMTRACK
@@ -140,27 +167,6 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "  stdout            - print to standard output.\n"
   "  stderr            - print to standard error.\n",
   ucs_offsetof(ucs_global_opts_t, memtrack_dest), UCS_CONFIG_TYPE_STRING},
-#endif
-
-#if HAVE_INSTRUMENTATION
- {"INSTRUMENT_FILE", "",
-  "File name to dump instrumentation records to.\n"
-  "Substitutions: %h: host, %p: pid, %c: cpu, %t: time, %u: user, %e: exe.\n",
-  ucs_offsetof(ucs_global_opts_t, instrument_file),
-  UCS_CONFIG_TYPE_STRING},
-
- {"INSTRUMENT_TYPES", "ib-tx,ib-rx",
-  "Comma-separated list of intrumentation types to record. "
-  "The order is not meaningful.\n"
-  " - ib-tx  : Infiniband send requests."
-  " - ib-rx  : Infiniband recv requests.\n",
-  ucs_offsetof(ucs_global_opts_t, instrument_types),
-  UCS_CONFIG_TYPE_BITMAP(ucs_instrumentation_type_names)},
-
- {"INSTRUMENT_SIZE", "1m",
-  "Maximal size of instrumentation data. New records will replace old records.",
-  ucs_offsetof(ucs_global_opts_t, instrument_max_size),
-  UCS_CONFIG_TYPE_MEMUNITS},
 #endif
 
 #if HAVE_PROFILING
@@ -199,6 +205,12 @@ ucs_status_t ucs_global_opts_set_value(const char *name, const char *value)
 {
     return ucs_config_parser_set_value(&ucs_global_opts, ucs_global_opts_table,
                                        name, value);
+}
+
+ucs_status_t ucs_global_opts_get_value(const char *name, char *value, size_t max)
+{
+    return ucs_config_parser_get_value(&ucs_global_opts, ucs_global_opts_table,
+                                       name, value, max);
 }
 
 ucs_status_t ucs_global_opts_clone(void *dst)

@@ -18,7 +18,7 @@
 #include <ucs/type/status.h>
 #include <ucs/type/thread_mode.h>
 #include <ucs/type/cpu_set.h>
-#include <ucs/stats/stats_fd.h>
+#include <ucs/stats/stats_fwd.h>
 
 #include <sys/socket.h>
 #include <stdio.h>
@@ -93,6 +93,13 @@
  * @}
  */
 
+/**
+ * @defgroup UCT_TAG   UCT Tag matching operations
+ * @ingroup UCT_API
+ * @{
+ * Defines tag matching operations.
+ * @}
+ */
 
 /**
  * @ingroup UCT_RESOURCE
@@ -140,79 +147,94 @@ typedef struct uct_tl_resource_desc {
 
 
 /**
+ * @defgroup UCT_RESOURCE_IFACE_CAP   UCT interface operations and capabilities
  * @ingroup UCT_RESOURCE
+ *
  * @brief  List of capabilities supported by UCX API
  *
- * The enumeration list presents a full list of operations and capabilities
+ * The definition list presents a full list of operations and capabilities
  * exposed by UCX API.
+ * @{
  */
-enum {
-    /* Active message capabilities */
-    UCT_IFACE_FLAG_AM_SHORT       = UCS_BIT(0), /**< Short active message */
-    UCT_IFACE_FLAG_AM_BCOPY       = UCS_BIT(1), /**< Buffered active message */
-    UCT_IFACE_FLAG_AM_ZCOPY       = UCS_BIT(2), /**< Zero-copy active message */
+        /* Active message capabilities */
+#define UCT_IFACE_FLAG_AM_SHORT       UCS_BIT(0)  /**< Short active message */
+#define UCT_IFACE_FLAG_AM_BCOPY       UCS_BIT(1)  /**< Buffered active message */
+#define UCT_IFACE_FLAG_AM_ZCOPY       UCS_BIT(2)  /**< Zero-copy active message */
 
-    UCT_IFACE_FLAG_PENDING        = UCS_BIT(3), /**< Pending operations */
+#define UCT_IFACE_FLAG_PENDING        UCS_BIT(3)  /**< Pending operations */
 
-    /* PUT capabilities */
-    UCT_IFACE_FLAG_PUT_SHORT      = UCS_BIT(4), /**< Short put */
-    UCT_IFACE_FLAG_PUT_BCOPY      = UCS_BIT(5), /**< Buffered put */
-    UCT_IFACE_FLAG_PUT_ZCOPY      = UCS_BIT(6), /**< Zero-copy put */
+        /* PUT capabilities */
+#define UCT_IFACE_FLAG_PUT_SHORT      UCS_BIT(4)  /**< Short put */
+#define UCT_IFACE_FLAG_PUT_BCOPY      UCS_BIT(5)  /**< Buffered put */
+#define UCT_IFACE_FLAG_PUT_ZCOPY      UCS_BIT(6)  /**< Zero-copy put */
 
-    /* GET capabilities */
-    UCT_IFACE_FLAG_GET_SHORT      = UCS_BIT(8), /**< Short get */
-    UCT_IFACE_FLAG_GET_BCOPY      = UCS_BIT(9), /**< Buffered get */
-    UCT_IFACE_FLAG_GET_ZCOPY      = UCS_BIT(10), /**< Zero-copy get */
+        /* GET capabilities */
+#define UCT_IFACE_FLAG_GET_SHORT      UCS_BIT(8)  /**< Short get */
+#define UCT_IFACE_FLAG_GET_BCOPY      UCS_BIT(9)  /**< Buffered get */
+#define UCT_IFACE_FLAG_GET_ZCOPY      UCS_BIT(10) /**< Zero-copy get */
 
-    /* Atomic operations capabilities */
-    UCT_IFACE_FLAG_ATOMIC_ADD32   = UCS_BIT(16), /**< 32bit atomic add */
-    UCT_IFACE_FLAG_ATOMIC_ADD64   = UCS_BIT(17), /**< 64bit atomic add */
-    UCT_IFACE_FLAG_ATOMIC_FADD32  = UCS_BIT(18), /**< 32bit atomic fetch-and-add */
-    UCT_IFACE_FLAG_ATOMIC_FADD64  = UCS_BIT(19), /**< 64bit atomic fetch-and-add */
-    UCT_IFACE_FLAG_ATOMIC_SWAP32  = UCS_BIT(20), /**< 32bit atomic swap */
-    UCT_IFACE_FLAG_ATOMIC_SWAP64  = UCS_BIT(21), /**< 64bit atomic swap */
-    UCT_IFACE_FLAG_ATOMIC_CSWAP32 = UCS_BIT(22), /**< 32bit atomic compare-and-swap */
-    UCT_IFACE_FLAG_ATOMIC_CSWAP64 = UCS_BIT(23), /**< 64bit atomic compare-and-swap */
+        /* Atomic operations capabilities */
+#define UCT_IFACE_FLAG_ATOMIC_ADD32   UCS_BIT(16) /**< 32bit atomic add */
+#define UCT_IFACE_FLAG_ATOMIC_ADD64   UCS_BIT(17) /**< 64bit atomic add */
+#define UCT_IFACE_FLAG_ATOMIC_FADD32  UCS_BIT(18) /**< 32bit atomic fetch-and-add */
+#define UCT_IFACE_FLAG_ATOMIC_FADD64  UCS_BIT(19) /**< 64bit atomic fetch-and-add */
+#define UCT_IFACE_FLAG_ATOMIC_SWAP32  UCS_BIT(20) /**< 32bit atomic swap */
+#define UCT_IFACE_FLAG_ATOMIC_SWAP64  UCS_BIT(21) /**< 64bit atomic swap */
+#define UCT_IFACE_FLAG_ATOMIC_CSWAP32 UCS_BIT(22) /**< 32bit atomic compare-and-swap */
+#define UCT_IFACE_FLAG_ATOMIC_CSWAP64 UCS_BIT(23) /**< 64bit atomic compare-and-swap */
 
-    /* Atomic operations domain */
-    UCT_IFACE_FLAG_ATOMIC_CPU     = UCS_BIT(30), /**< Atomic communications are consistent
-                                                      with respect to CPU operations. */
-    UCT_IFACE_FLAG_ATOMIC_DEVICE  = UCS_BIT(31), /**< Atomic communications are consistent
-                                                      only with respect to other atomics
-                                                      on the same device. */
+        /* Atomic operations domain */
+#define UCT_IFACE_FLAG_ATOMIC_CPU     UCS_BIT(30) /**< Atomic communications are consistent
+                                                       with respect to CPU operations. */
+#define UCT_IFACE_FLAG_ATOMIC_DEVICE  UCS_BIT(31) /**< Atomic communications are consistent
+                                                       only with respect to other atomics
+                                                       on the same device. */
 
-    /* Error handling capabilities */
-    UCT_IFACE_FLAG_ERRHANDLE_SHORT_BUF    = UCS_BIT(32), /**< Invalid buffer for short operation */
-    UCT_IFACE_FLAG_ERRHANDLE_BCOPY_BUF    = UCS_BIT(33), /**< Invalid buffer for buffered operation */
-    UCT_IFACE_FLAG_ERRHANDLE_ZCOPY_BUF    = UCS_BIT(34), /**< Invalid buffer for zero copy operation */
-    UCT_IFACE_FLAG_ERRHANDLE_AM_ID        = UCS_BIT(35), /**< Invalid AM id on remote */
-    UCT_IFACE_FLAG_ERRHANDLE_REMOTE_MEM   = UCS_BIT(36), /**< Remote memory access */
-    UCT_IFACE_FLAG_ERRHANDLE_BCOPY_LEN    = UCS_BIT(37), /**< Invalid length for buffered operation */
-    UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE = UCS_BIT(38), /**< Remote peer failures/outage */
+        /* Error handling capabilities */
+#define UCT_IFACE_FLAG_ERRHANDLE_SHORT_BUF    UCS_BIT(32) /**< Invalid buffer for short operation */
+#define UCT_IFACE_FLAG_ERRHANDLE_BCOPY_BUF    UCS_BIT(33) /**< Invalid buffer for buffered operation */
+#define UCT_IFACE_FLAG_ERRHANDLE_ZCOPY_BUF    UCS_BIT(34) /**< Invalid buffer for zero copy operation */
+#define UCT_IFACE_FLAG_ERRHANDLE_AM_ID        UCS_BIT(35) /**< Invalid AM id on remote */
+#define UCT_IFACE_FLAG_ERRHANDLE_REMOTE_MEM   UCS_BIT(36) /**< Remote memory access */
+#define UCT_IFACE_FLAG_ERRHANDLE_BCOPY_LEN    UCS_BIT(37) /**< Invalid length for buffered operation */
+#define UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE UCS_BIT(38) /**< Remote peer failures/outage */
 
-    /* Connection establishment */
-    UCT_IFACE_FLAG_CONNECT_TO_IFACE = UCS_BIT(40), /**< Supports connecting to interface */
-    UCT_IFACE_FLAG_CONNECT_TO_EP    = UCS_BIT(41), /**< Supports connecting to specific endpoint */
+#define UCT_IFACE_FLAG_EP_CHECK               UCS_BIT(39) /**< Endpoint check */
 
-    /* Special transport flags */
-    UCT_IFACE_FLAG_AM_DUP           = UCS_BIT(43), /**< Active messages may be received with duplicates
-                                                        This happens if the transport does not keep enough
-                                                        information to detect retransmissions */
+        /* Connection establishment */
+#define UCT_IFACE_FLAG_CONNECT_TO_IFACE       UCS_BIT(40) /**< Supports connecting to interface */
+#define UCT_IFACE_FLAG_CONNECT_TO_EP          UCS_BIT(41) /**< Supports connecting to specific endpoint */
+#define UCT_IFACE_FLAG_CONNECT_TO_SOCKADDR    UCS_BIT(42) /**< Supports connecting to sockaddr */
 
-    /* Active message callback invocation */
-    UCT_IFACE_FLAG_AM_CB_SYNC       = UCS_BIT(44), /**< Interface supports setting active message callback
-                                                        which is invoked only from the calling context of
-                                                        uct_worker_progress() */
-    UCT_IFACE_FLAG_AM_CB_ASYNC      = UCS_BIT(45), /**< Interface supports setting active message callback
-                                                        which will be invoked within a reasonable amount of
-                                                        time if uct_worker_progress() is not being called.
-                                                        The callback can be invoked from any progress context
-                                                        and it may also be invoked when uct_worker_progress()
-                                                        is called. */
+        /* Special transport flags */
+#define UCT_IFACE_FLAG_AM_DUP         UCS_BIT(43) /**< Active messages may be received with duplicates
+                                                       This happens if the transport does not keep enough
+                                                       information to detect retransmissions */
 
-    /* Event notification */
-    UCT_IFACE_FLAG_WAKEUP = UCS_BIT(46), /**< Event notification supported */
-};
+        /* Callback invocation */
+#define UCT_IFACE_FLAG_CB_SYNC        UCS_BIT(44) /**< Interface supports setting a callback
+                                                       which is invoked only from the calling context of
+                                                       uct_worker_progress() */
+#define UCT_IFACE_FLAG_CB_ASYNC       UCS_BIT(45) /**< Interface supports setting a callback
+                                                       which will be invoked within a reasonable amount of
+                                                       time if uct_worker_progress() is not being called.
+                                                       The callback can be invoked from any progress context
+                                                       and it may also be invoked when uct_worker_progress()
+                                                       is called. */
+
+        /* Event notification */
+#define UCT_IFACE_FLAG_EVENT_SEND_COMP    UCS_BIT(46) /**< Event notification of send completion is supported */
+#define UCT_IFACE_FLAG_EVENT_RECV_AM      UCS_BIT(47) /**< Event notification of active message receive is supported */
+#define UCT_IFACE_FLAG_EVENT_RECV_SIG_AM  UCS_BIT(48) /**< Event notification of signaled active message is supported */
+
+        /* Tag matching operations */
+#define UCT_IFACE_FLAG_TAG_EAGER_SHORT UCS_BIT(50) /**< Hardware tag matching short eager support */
+#define UCT_IFACE_FLAG_TAG_EAGER_BCOPY UCS_BIT(51) /**< Hardware tag matching bcopy eager support */
+#define UCT_IFACE_FLAG_TAG_EAGER_ZCOPY UCS_BIT(52) /**< Hardware tag matching zcopy eager support */
+#define UCT_IFACE_FLAG_TAG_RNDV_ZCOPY  UCS_BIT(53) /**< Hardware tag matching rendezvous zcopy support */
+/**
+ * @}
+ */
 
 
 /**
@@ -220,6 +242,8 @@ enum {
  * @brief  Memory allocation methods.
  */
 typedef enum {
+    UCT_ALLOC_METHOD_THP,  /**< Allocate from OS using libc allocator with
+                                Transparent Huge Pages enabled*/
     UCT_ALLOC_METHOD_MD,   /**< Allocate using memory domain */
     UCT_ALLOC_METHOD_HEAP, /**< Allocate from heap using libc allocator */
     UCT_ALLOC_METHOD_MMAP, /**< Allocate from OS using mmap() syscall */
@@ -231,13 +255,173 @@ typedef enum {
 
 /**
  * @ingroup UCT_RESOURCE
- * @brief  Wakeup event types.
+ * @brief  Asynchronous event types.
  */
-enum uct_wakeup_event_types {
-    UCT_WAKEUP_TX_COMPLETION   = UCS_BIT(0),
-    UCT_WAKEUP_RX_AM           = UCS_BIT(1),
-    UCT_WAKEUP_RX_SIGNALED_AM  = UCS_BIT(2),
+enum uct_iface_event_types {
+    UCT_EVENT_SEND_COMP   = UCS_BIT(0), /**< Send completion event */
+    UCT_EVENT_RECV_AM     = UCS_BIT(1), /**< Active message received */
+    UCT_EVENT_RECV_SIG_AM = UCS_BIT(2)  /**< Signaled active message received */
 };
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief  Flush modifiers.
+ */
+enum uct_flush_flags {
+    UCT_FLUSH_FLAG_LOCAL    = 0,            /**< Guarantees that the data
+                                                 transfer is completed but the
+                                                 target buffer may not be
+                                                 updated yet.*/
+    UCT_FLUSH_FLAG_CANCEL   = UCS_BIT(0)    /**< The library will make a best
+                                                 effort attempt to cancel all
+                                                 uncompleted operations.
+                                                 However, there is a chance that
+                                                 some operations will not be
+                                                 canceled in which case the user
+                                                 will need to handle their
+                                                 completions through
+                                                 the relevant callbacks. */
+};
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief UCT progress types
+ */
+enum uct_progress_types {
+    UCT_PROGRESS_SEND   = UCS_BIT(0),  /**< Progress send operations */
+    UCT_PROGRESS_RECV   = UCS_BIT(1)   /**< Progress receive operations */
+};
+
+
+/**
+ * @ingroup UCT_AM
+ * @brief Flags for active message send operation.
+ */
+enum uct_am_flags {
+    UCT_AM_FLAG_SIGNALED = UCS_BIT(0)  /**< Trigger @ref UCT_EVENT_RECV_SIG_AM
+                                            event on remote side. Make best
+                                            effort attempt to avoid triggering
+                                            @ref UCT_EVENT_RECV_AM event.
+                                            Ignored if not supported by interface. */
+};
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback flags.
+ *
+ * List of flags for a callback.
+ * A callback must have either the SYNC or ASYNC flag set.
+ */
+enum uct_cb_flags {
+    UCT_CB_FLAG_SYNC  = UCS_BIT(1), /**< Callback is always invoked from the context (thread, process)
+                                         that called uct_iface_progress(). An interface must
+                                         have the @ref UCT_IFACE_FLAG_CB_SYNC flag set to support sync
+                                         callback invocation. */
+
+    UCT_CB_FLAG_ASYNC = UCS_BIT(2)  /**< Callback may be invoked from any context. For example,
+                                         it may be called from a transport async progress thread. To guarantee
+                                         async invocation, the interface must have the @ref UCT_IFACE_FLAG_CB_ASYNC
+                                         flag set.
+                                         If async callback is requested on an interface
+                                         which only supports sync callback
+                                         (i.e., only the @ref UCT_IFACE_FLAG_CB_SYNC flag is set),
+                                         it will behave exactly like a sync callback.  */
+};
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Mode in which to open the interface.
+ */
+enum uct_iface_open_mode {
+   UCT_IFACE_OPEN_MODE_DEVICE          = UCS_BIT(0),  /**< Interface is opened on a specific device */
+   UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER = UCS_BIT(1),  /**< Interface is opened on a specific address
+                                                           on the server side */
+   UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT = UCS_BIT(2)   /**< Interface is opened on a specific address
+                                                           on the client side */
+};
+
+
+/**
+ * @ingroup UCT_MD
+ * @brief Socket address accessibility type.
+ */
+typedef enum {
+   UCT_SOCKADDR_ACC_LOCAL,  /**< Check if local address exists.
+                                 Address should belong to a local
+                                 network interface */
+   UCT_SOCKADDR_ACC_REMOTE  /**< Check if remote address can be reached.
+                                 Address is routable from one of the
+                                 local network interfaces */
+} uct_sockaddr_accessibility_t;
+
+
+/**
+ * @ingroup UCT_MD
+ * @brief  Memory domain capability flags.
+ */
+enum {
+    UCT_MD_FLAG_ALLOC      = UCS_BIT(0),  /**< MD supports memory allocation */
+    UCT_MD_FLAG_REG        = UCS_BIT(1),  /**< MD supports memory registration */
+    UCT_MD_FLAG_NEED_MEMH  = UCS_BIT(2),  /**< The transport needs a valid local
+                                               memory handle for zero-copy operations */
+    UCT_MD_FLAG_NEED_RKEY  = UCS_BIT(3),  /**< The transport needs a valid
+                                               remote memory key for remote memory
+                                               operations */
+    UCT_MD_FLAG_ADVISE     = UCS_BIT(4),  /**< MD supports memory advice */
+    UCT_MD_FLAG_FIXED      = UCS_BIT(5),  /**< MD supports memory allocation with
+                                               fixed address */
+    UCT_MD_FLAG_RKEY_PTR   = UCS_BIT(6),  /**< MD supports direct access to
+                                               remote memory via a pointer that
+                                               is returned by @ref uct_rkey_ptr */
+    UCT_MD_FLAG_SOCKADDR   = UCS_BIT(7)   /**< MD support for client-server
+                                               connection establishment via
+                                               sockaddr */
+};
+
+
+/**
+ * @ingroup UCT_MD
+ * @brief  Memory allocation/registration flags.
+ */
+enum uct_md_mem_flags {
+    UCT_MD_MEM_FLAG_NONBLOCK = UCS_BIT(0), /**< Hint to perform non-blocking
+                                                allocation/registration: page
+                                                mapping may be deferred until
+                                                it is accessed by the CPU or a
+                                                transport. */
+    UCT_MD_MEM_FLAG_FIXED    = UCS_BIT(1), /**< Place the mapping at exactly
+                                                defined address */
+    /* memory access flags */
+    UCT_MD_MEM_ACCESS_REMOTE_PUT    = UCS_BIT(2), /**< enable remote put access */
+    UCT_MD_MEM_ACCESS_REMOTE_GET    = UCS_BIT(3), /**< enable remote get access */
+    UCT_MD_MEM_ACCESS_REMOTE_ATOMIC = UCS_BIT(4), /**< enable remote atomic access */
+
+    /** enable local and remote access for all operations */
+    UCT_MD_MEM_ACCESS_ALL =  (UCT_MD_MEM_ACCESS_REMOTE_PUT|
+                              UCT_MD_MEM_ACCESS_REMOTE_GET|
+                              UCT_MD_MEM_ACCESS_REMOTE_ATOMIC),
+
+    /** enable local and remote access for put and get operations */
+    UCT_MD_MEM_ACCESS_RMA = (UCT_MD_MEM_ACCESS_REMOTE_PUT|
+                             UCT_MD_MEM_ACCESS_REMOTE_GET)
+};
+
+
+/**
+ * @ingroup UCT_MD
+ * @brief list of UCT memory use advice
+ */
+typedef enum {
+    UCT_MADV_NORMAL  = 0,  /**< No special treatment */
+    UCT_MADV_WILLNEED      /**< can be used on the memory mapped with
+                                @ref UCT_MD_MEM_FLAG_NONBLOCK to speed up
+                                memory mapping and to avoid page faults when
+                                the memory is accessed for the first time. */
+} uct_mem_advice_t;
 
 
 /*
@@ -311,21 +495,57 @@ struct uct_iface_attr {
                                               @anchor uct_iface_attr_cap_am_max_iov */
         } am;                            /**< Attributes for AM operations */
 
-        uint64_t             flags;      /**< Flags from UCT_IFACE_FLAG_xx */
+        struct {
+            struct {
+                size_t       min_recv;   /**< Minimal allowed length of posted receive buffer */
+                size_t       max_zcopy;  /**< Maximal allowed data length in
+                                              @ref uct_iface_tag_recv_zcopy */
+                size_t       max_iov;    /**< Maximal @a iovcnt parameter in
+                                              @ref uct_iface_tag_recv_zcopy
+                                              @anchor uct_iface_attr_cap_tag_recv_iov */
+                size_t       max_outstanding; /**< Maximal number of simultaneous
+                                                   receive operations */
+            } recv;
+
+            struct {
+                  size_t     max_short;  /**< Maximal allowed data length in
+                                              @ref uct_ep_tag_eager_short */
+                  size_t     max_bcopy;  /**< Maximal allowed data length in
+                                              @ref uct_ep_tag_eager_bcopy */
+                  size_t     max_zcopy;  /**< Maximal allowed data length in
+                                              @ref uct_ep_tag_eager_zcopy */
+                  size_t     max_iov;    /**< Maximal @a iovcnt parameter in
+                                              @ref uct_ep_tag_eager_zcopy */
+            } eager;                     /**< Attributes related to eager protocol */
+
+            struct {
+                  size_t     max_zcopy;  /**< Maximal allowed data length in
+                                              @ref uct_ep_tag_rndv_zcopy */
+                  size_t     max_hdr;    /**< Maximal allowed header length in
+                                              @ref uct_ep_tag_rndv_zcopy and
+                                              @ref uct_ep_tag_rndv_request */
+                  size_t     max_iov;    /**< Maximal @a iovcnt parameter in
+                                              @ref uct_ep_tag_rndv_zcopy */
+            } rndv;                      /**< Attributes related to rendezvous protocol */
+        } tag;                           /**< Attributes for TAG operations */
+
+        uint64_t             flags;      /**< Flags from @ref UCT_RESOURCE_IFACE_CAP */
     } cap;                               /**< Interface capabilities */
 
     size_t                   device_addr_len;/**< Size of device address */
     size_t                   iface_addr_len; /**< Size of interface address */
     size_t                   ep_addr_len;    /**< Size of endpoint address */
-
+    size_t                   max_conn_priv;  /**< Max size of the iface's private data.
+                                                  used for connection
+                                                  establishment with sockaddr */
     /*
      * The following fields define expected performance of the communication
      * interface, this would usually be a combination of device and system
      * characteristics and determined at run time.
      */
     double                   overhead;     /**< Message overhead, seconds */
-    double                   latency;      /**< Latency, seconds */
     double                   bandwidth;    /**< Maximal bandwidth, bytes/second */
+    uct_linear_growth_t      latency;      /**< Latency model */
     uint8_t                  priority;     /**< Priority of device */
 };
 
@@ -338,43 +558,62 @@ struct uct_iface_attr {
  * @ref uct_iface_open. User has to initialize all fields of this structure.
  */
 struct uct_iface_params {
-    ucs_cpu_set_t            cpu_mask;    /**< Mask of CPUs to use for resources */
-    const char               *tl_name;    /**< Transport name */
-    const char               *dev_name;   /**< Device Name */
-    ucs_stats_node_t         *stats_root; /**< Root in the statistics tree.
-                                               Can be NULL. If non NULL, it will be
-                                               a root of @a uct_iface object in the
-                                               statistics tree. */
-    size_t                   rx_headroom; /**< How much bytes to reserve before
-                                               the receive segment.*/
-};
+    /** Mask of CPUs to use for resources */
+    ucs_cpu_set_t                                cpu_mask;
+    /** Interface open mode bitmap. @ref uct_iface_open_mode */
+    uint64_t                                     open_mode;
+    /** Mode-specific parameters */
+    union {
+        /** The fields in this structure (tl_name and dev_name) need to be set only when
+         *  the @ref UCT_IFACE_OPEN_MODE_DEVICE bit is set in @ref
+         *  uct_iface_params_t.open_mode This will make @ref uct_iface_open
+         *  open the interface on the specified device.
+         */
+        struct {
+            const char                           *tl_name;  /**< Transport name */
+            const char                           *dev_name; /**< Device Name */
+        } device;
+        /** These callbacks and address are only relevant for client-server
+         *  connection establishment with sockaddr and are needed on the server side.
+         *  The callbacks and address need to be set when the @ref
+         *  UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER bit is set in @ref
+         *  uct_iface_params_t.open_mode. This will make @ref uct_iface_open
+         *  open the interface on the specified address as a server. */
+        struct {
+            ucs_sock_addr_t                      listen_sockaddr;
+            /** Argument for connection request callback */
+            void                                 *conn_request_arg;
+            /** Callback for an incoming connection request on the server */
+            uct_sockaddr_conn_request_callback_t conn_request_cb;
+            /** Argument for connection ready callback */
+            void                                 *conn_ready_arg;
+            /** Callback for an incoming message on the server indicating that
+                the connection is ready */
+            uct_sockaddr_conn_ready_callback_t   conn_ready_cb;
+            /** Callback flags to indicate where the callback can be invoked from.
+             * @ref uct_cb_flags */
+            uint32_t                             cb_flags;
+        } sockaddr;
+    } mode;
 
+    /** Root in the statistics tree. Can be NULL. If non NULL, it will be
+        a root of @a uct_iface object in the statistics tree. */
+    ucs_stats_node_t                             *stats_root;
+    /** How much bytes to reserve before the receive segment.*/
+    size_t                                       rx_headroom;
 
-/**
- * @ingroup UCT_MD
- * @brief  Memory domain capability flags.
- */
-enum {
-    UCT_MD_FLAG_ALLOC     = UCS_BIT(0),  /**< MD support memory allocation */
-    UCT_MD_FLAG_REG       = UCS_BIT(1),  /**< MD support memory registration */
-    UCT_MD_FLAG_NEED_MEMH = UCS_BIT(2),  /**< The transport needs a valid local
-                                              memory handle for zero-copy operations */
-    UCT_MD_FLAG_NEED_RKEY = UCS_BIT(3),  /**< The transport needs a valid
-                                              remote memory key for remote memory
-                                              operations */
-};
+    /** Custom argument of @a err_handler. */
+    void                                         *err_handler_arg;
+    /** The callback to handle transport level error.*/
+    uct_error_handler_t                          err_handler;
 
-
-/**
- * @ingroup UCT_MD
- * @brief  Memory domain capability flags.
- */
-enum {
-    UCT_MD_MEM_FLAG_NONBLOCK = UCS_BIT(0), /**< Hint to perform non-blocking
-                                                allocation/registration: page
-                                                mapping may be deferred until
-                                                it is accessed by the CPU or a
-                                                transport. */
+    /** These callbacks are only relevant for HW Tag Matching */
+    void                                         *eager_arg;
+    /** Callback for tag matching unexpected eager messages */
+    uct_tag_unexp_eager_cb_t                     eager_cb;
+    void                                         *rndv_arg;
+    /** Callback for tag matching unexpected rndv messages */
+    uct_tag_unexp_rndv_cb_t                      rndv_cb;
 };
 
 
@@ -466,6 +705,58 @@ struct uct_completion {
 struct uct_pending_req {
     uct_pending_callback_t    func;   /**< User callback function */
     char                      priv[UCT_PENDING_REQ_PRIV_LEN]; /**< Used internally by UCT */
+};
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Posted tag context.
+ *
+ * Tag context is an object which tracks a tag posted to the transport. It
+ * contains callbacks for matching events on this tag.
+ */
+struct uct_tag_context {
+    /**
+     * Tag is consumed by the transport and should not be matched in software.
+     *
+     * @param [in]  self    Pointer to relevant context structure, which was
+     *                      initially passed to @ref uct_iface_tag_recv_zcopy.
+     */
+    void (*tag_consumed_cb)(uct_tag_context_t *self);
+
+    /**
+     * Tag processing is completed by the transport.
+     *
+     * @param [in]  self    Pointer to relevant context structure, which was
+     *                      initially passed to @ref uct_iface_tag_recv_zcopy.
+     * @param [in]  stag    Tag from sender.
+     * @param [in]  imm     Immediate data from sender. For rendezvous, it's always 0.
+     * @param [in]  length  Completed length.
+     * @param [in]  status  Completion status:
+     * (a)   UCS_OK - Success, data placed in provided buffer.
+     * (b)   UCS_ERR_TRUNCATED - Sender's length exceed posted
+                                 buffer, no data is copied.
+     * (c)   UCS_ERR_CANCELED - Canceled by user.
+     */
+     void (*completed_cb)(uct_tag_context_t *self, uct_tag_t stag, uint64_t imm,
+                          size_t length, ucs_status_t status);
+
+    /**
+     * Tag was matched by a rendezvous request, which should be completed by
+     * the protocol layer.
+     *
+     * @param [in]  self          Pointer to relevant context structure, which was
+     *                            initially passed to @ref uct_iface_tag_recv_zcopy.
+     * @param [in]  stag          Tag from sender.
+     * @param [in]  header        User defined header.
+     * @param [in]  header_length User defined header length in bytes.
+     * @param [in]  status        Completion status.
+     */
+     void (*rndv_cb)(uct_tag_context_t *self, uct_tag_t stag, const void *header,
+                     unsigned header_length, ucs_status_t status);
+
+     /** A placeholder for the private data used by the transport */
+     char priv[UCT_TAG_PRIV_LEN];
 };
 
 
@@ -591,94 +882,74 @@ void uct_worker_destroy(uct_worker_h worker);
 
 /**
  * @ingroup UCT_CONTEXT
- * @brief Explicit progress for UCT worker.
- *
- * This routine explicitly progresses any outstanding communication operations
- * and active message requests.
- *
- * @note @li In the current implementation, users @b MUST call this routine
- * to receive the active message requests.
- *
- * @param [in]  worker        Handle to worker.
- */
-void uct_worker_progress(uct_worker_h worker);
-
-
-/**
- * @ingroup UCT_CONTEXT
- * @brief Add a callback function to a worker progress.
- *
- * Add a function which will be called every time a progress is made on the worker.
- *
- * @param [in]  worker        Handle to worker.
- * @param [in]  func          Pointer to callback function.
- * @param [in]  arg           Argument to the function.
- *
- * @note If the same function and argument are already on the list, their reference
- *       count will be incremented.
- * @note This operation could potentially be slow.
- */
-void uct_worker_progress_register(uct_worker_h worker,
-                                  ucs_callback_t func, void *arg);
-
-
-/**
- * @ingroup UCT_CONTEXT
- * @brief Remove a callback function from worker's progress.
- *
- * Remove a previously added function from worker's progress.
- *
- * @param [in]  worker        Handle to worker.
- * @param [in]  func          Pointer to callback function.
- * @param [in]  arg           Argument to the function.
- *
- * @note If the reference count of the function is >1, it will be decremented and
- *       the function will not be removed.
- * @note This operation could potentially be slow.
- */
-void uct_worker_progress_unregister(uct_worker_h worker,
-                                    ucs_callback_t func, void *arg);
-
-
-/**
- * @ingroup UCT_CONTEXT
  * @brief Add a slow path callback function to a worker progress.
  *
- * Add a function which will be called every time a progress is made on the worker.
- * The number of functions which can be added this way is unlimited since the
- * element is allocated by the caller, but the overhead of calling this function
- * is slightly higher than @ref uct_worker_progress_register.
+ * If *id_p is equal to UCS_CALLBACKQ_ID_NULL, this function will add a callback
+ * which will be invoked every time progress is made on the worker. *id_p will
+ * be updated with an id which refers to this callback and can be used in
+ * @ref uct_worker_progress_unregister_safe to remove it from the progress path.
  *
- * @param [in]  worker        Handle to worker.
- * @param [in]  elem          Callback function to add, with it's associated context.
+ * @param [in]    worker        Handle to the worker whose progress should invoke
+ *                              the callback.
+ * @param [in]    func          Pointer to the callback function.
+ * @param [in]    arg           Argument for the callback function.
+ * @param [in]    flags         Callback flags, see @ref ucs_callbackq_flags.
+ * @param [inout] id_p          Points to a location to store a callback identifier.
+ *                              If *id_p is equal to UCS_CALLBACKQ_ID_NULL, a
+ *                              callback will be added and *id_p will be replaced
+ *                              with a callback identifier which can be subsequently
+ *                              used to remove the callback. Otherwise, no callback
+ *                              will be added and *id_p will be left unchanged.
  *
- * @note This operation could potentially be slow.
+ * @note This function is thread safe.
  */
-void uct_worker_slowpath_progress_register(uct_worker_h worker,
-                                           ucs_callbackq_slow_elem_t *elem);
+void uct_worker_progress_register_safe(uct_worker_h worker, ucs_callback_t func,
+                                       void *arg, unsigned flags,
+                                       uct_worker_cb_id_t *id_p);
 
 
 /**
  * @ingroup UCT_CONTEXT
  * @brief Remove a slow path callback function from worker's progress.
  *
- * Remove a function previously added by @ref uct_worker_slowpath_progress_register.
+ * If *id_p is not equal to UCS_CALLBACKQ_ID_NULL, remove a callback which was
+ * previously added by @ref uct_worker_progress_register_safe. *id_p will be reset
+ * to UCS_CALLBACKQ_ID_NULL.
  *
- * @param [in]  worker        Handle to worker.
- * @param [in]  elem          Callback element to remove. Must be the same pointer
- *                            added earlier.
+ * @param [in]    worker        Handle to the worker whose progress should invoke
+ *                              the callback.
+ * @param [inout] id_p          Points to a callback identifier which indicates
+ *                              the callback to remove. If *id_p is not equal to
+ *                              UCS_CALLBACKQ_ID_NULL, the callback will be removed
+ *                              and *id_p will be reset to UCS_CALLBACKQ_ID_NULL.
+ *                              If *id_p is equal to UCS_CALLBACKQ_ID_NULL, no
+ *                              operation will be performed and *id_p will be
+ *                              left unchanged.
  *
- * @note This operation could potentially be slow.
+ * @note This function is thread safe.
  */
-void uct_worker_slowpath_progress_unregister(uct_worker_h worker,
-                                             ucs_callbackq_slow_elem_t *elem);
+void uct_worker_progress_unregister_safe(uct_worker_h worker,
+                                         uct_worker_cb_id_t *id_p);
 
 
 /**
  * @ingroup UCT_RESOURCE
  * @brief Read transport-specific interface configuration.
  *
- * @param [in]  tl_name       Transport name.
+ * @param [in]  md            Memory domain on which the transport's interface
+ *                            was registered.
+ * @param [in]  tl_name       Transport name. If @e md supports
+ *                            @ref UCT_MD_FLAG_SOCKADDR, the transport name
+ *                            is allowed to be NULL. In this case, the configuration
+ *                            returned from this routine should be passed to
+ *                            @ref uct_iface_open with
+ *                            @ref UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER or
+ *                            @ref UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT set in
+ *                            @ref uct_iface_params_t.open_mode.
+ *                            In addition, if tl_name is not NULL, the configuration
+ *                            returned from this routine should be passed to
+ *                            @ref uct_iface_open with @ref UCT_IFACE_OPEN_MODE_DEVICE
+ *                            set in @ref uct_iface_params_t.open_mode.
  * @param [in]  env_prefix    If non-NULL, search for environment variables
  *                            starting with this UCT_<prefix>_. Otherwise, search
  *                            for environment variables starting with just UCT_.
@@ -688,14 +959,14 @@ void uct_worker_slowpath_progress_unregister(uct_worker_h worker,
  *
  * @return Error code.
  */
-ucs_status_t uct_iface_config_read(const char *tl_name, const char *env_prefix,
-                                   const char *filename,
-                                   uct_iface_config_t **config_p);
+ucs_status_t uct_md_iface_config_read(uct_md_h md, const char *tl_name,
+                                      const char *env_prefix, const char *filename,
+                                      uct_iface_config_t **config_p);
 
 
 /**
  * @ingroup UCT_RESOURCE
- * @brief Release configuration memory returned from uct_iface_config_read() or
+ * @brief Release configuration memory returned from uct_md_iface_config_read() or
  * from uct_md_config_read().
  *
  * @param [in]  config        Configuration to release.
@@ -718,6 +989,23 @@ void uct_config_print(const void *config, FILE *stream, const char *title,
 
 /**
  * @ingroup UCT_CONTEXT
+ * @brief Get value by name from interface/MD configuration.
+ *
+ * @param [in]  config        Configuration to get from.
+ * @param [in]  name          Configuration variable name.
+ * @param [out] value         Pointer to get value. Should be allocated/freed by
+ *                            caller.
+ * @param [in]  max           Available memory space at @a value pointer.
+ *
+ * @return UCS_OK if found, otherwise UCS_ERR_INVALID_PARAM or UCS_ERR_NO_ELEM
+ *         if error.
+ */
+ucs_status_t uct_config_get(void *config, const char *name, char *value,
+                            size_t max);
+
+
+/**
+ * @ingroup UCT_CONTEXT
  * @brief Modify interface/MD configuration.
  *
  * @param [in]  config        Configuration to modify.
@@ -735,10 +1023,10 @@ ucs_status_t uct_config_modify(void *config, const char *name, const char *value
  *
  * @param [in]  md            Memory domain to create the interface on.
  * @param [in]  worker        Handle to worker which will be used to progress
- *                             communications on this interface.
+ *                            communications on this interface.
  * @param [in]  params        User defined @ref uct_iface_params_t parameters.
  * @param [in]  config        Interface configuration options. Should be obtained
- *                            from uct_iface_config_read() function, or point to
+ *                            from uct_md_iface_config_read() function, or point to
  *                            transport-specific structure which extends uct_iface_config_t.
  * @param [out] iface_p       Filled with a handle to opened communication interface.
  *
@@ -778,7 +1066,7 @@ ucs_status_t uct_iface_query(uct_iface_h iface, uct_iface_attr_t *iface_attr);
  *
  * @param [in]  iface       Interface to query.
  * @param [out] addr        Filled with device address. The size of the buffer
- *                           provided must be at least @ref uct_iface_attr_t::device_addr_len.
+ *                          provided must be at least @ref uct_iface_attr_t::device_addr_len.
  */
 ucs_status_t uct_iface_get_device_address(uct_iface_h iface, uct_device_addr_t *addr);
 
@@ -787,11 +1075,11 @@ ucs_status_t uct_iface_get_device_address(uct_iface_h iface, uct_device_addr_t *
  * @ingroup UCT_RESOURCE
  * @brief Get interface address.
  *
- * requires UCT_IFACE_FLAG_CONNECT_TO_IFACE.
+ * requires @ref UCT_IFACE_FLAG_CONNECT_TO_IFACE.
  *
  * @param [in]  iface       Interface to query.
  * @param [out] addr        Filled with interface address. The size of the buffer
- *                           provided must be at least @ref uct_iface_attr_t::iface_addr_len.
+ *                          provided must be at least @ref uct_iface_attr_t::iface_addr_len.
  */
 ucs_status_t uct_iface_get_address(uct_iface_h iface, uct_iface_addr_t *addr);
 
@@ -820,38 +1108,38 @@ int uct_iface_is_reachable(const uct_iface_h iface, const uct_device_addr_t *dev
 
 /**
  * @ingroup UCT_RESOURCE
- * @brief Create an event handle for interrupt notification.
+ * @brief check if the destination endpoint is alive in respect to UCT library
  *
- * @param [in]  iface       Handle to an open communication interface.
- * @param [in]  events      Requested event mask out of @ref uct_event_types.
- * @param [out] wakeup_p    Location to write the notification event handle.
+ * This function checks if the destination endpoint is alive with respect to the
+ * UCT library. If the status of @a ep is known, either @ref UCS_OK or an error
+ * is returned immediately. Otherwise, @ref UCS_INPROGRESS is returned,
+ * indicating that synchronization on the status is needed. In this case, the
+ * status will be be propagated by @a comp callback.
  *
- * @return Error code.
+ * @param [in]  ep      Endpoint to check
+ * @param [in]  flags   Flags that define level of check
+ *                      (currently unsupported - set to 0).
+ * @param [in]  comp    Handler to process status of @a ep
+ *
+ * @return              Error code.
  */
-ucs_status_t uct_wakeup_open(uct_iface_h iface, unsigned events,
-                             uct_wakeup_h *wakeup_p);
-
-
-/**
- * @ingroup UCT_RESOURCE
- * @brief Close the notification event handle.
- *
- * @param [in] wakeup      Handle to the notification event.
- *
- */
-void uct_wakeup_close(uct_wakeup_h wakeup);
+ucs_status_t uct_ep_check(const uct_ep_h ep, unsigned flags,
+                          uct_completion_t *comp);
 
 
 /**
  * @ingroup UCT_RESOURCE
  * @brief Obtain a notification file descriptor for polling.
  *
- * @param [in]  wakeup     Handle to the notification event.
+ * Only interfaces supporting the @ref UCT_IFACE_FLAG_EVENT_FD implement this
+ * function.
+ *
+ * @param [in]  iface      Interface to get the notification descriptor.
  * @param [out] fd_p       Location to write the notification file descriptor.
  *
  * @return Error code.
  */
-ucs_status_t uct_wakeup_efd_get(uct_wakeup_h wakeup, int *fd_p);
+ucs_status_t uct_iface_event_fd_get(uct_iface_h iface, int *fd_p);
 
 
 /**
@@ -860,9 +1148,10 @@ ucs_status_t uct_wakeup_efd_get(uct_wakeup_h wakeup, int *fd_p);
  *
  * This routine needs to be called before waiting on each notification on this
  * interface, so will typically be called once the processing of the previous
- * event is over, as part of the wake-up mechanism.
+ * event is over.
  *
- * @param [in] wakeup      Handle to the notification event.
+ * @param [in] iface       Interface to arm.
+ * @param [in] events      Events to wakeup on. See @ref uct_iface_event_types
  *
  * @return ::UCS_OK        The operation completed successfully. File descriptor
  *                         will be signaled by new events.
@@ -872,61 +1161,36 @@ ucs_status_t uct_wakeup_efd_get(uct_wakeup_h wakeup, int *fd_p);
  *                         will not be signaled by new events.
  * @return @ref ucs_status_t "Other" different error codes in case of issues.
  */
-ucs_status_t uct_wakeup_efd_arm(uct_wakeup_h wakeup);
+ucs_status_t uct_iface_event_arm(uct_iface_h iface, unsigned events);
 
 
 /**
  * @ingroup UCT_RESOURCE
- * @brief Wait for the next notification.
+ * @brief Allocate memory which can be used for zero-copy communications.
  *
- * @param [in] wakeup      Handle to the notification event.
+ * Allocate a region of memory which can be used for zero-copy data transfer or
+ * remote access on a particular transport interface.
  *
- * @return Error code.
- */
-ucs_status_t uct_wakeup_wait(uct_wakeup_h wakeup);
-
-
-/**
- * @ingroup UCT_RESOURCE
- * @brief Cause the next notification.
+ * @param [in]  iface    Interface to allocate memory on.
+ * @param [in]  length   Size of memory region to allocate.
+ * @param [in]  flags    Memory allocation flags, see @ref uct_md_mem_flags.
+ * @param [in]  name     Allocation name, for debug purposes.
+ * @param [out] mem      Descriptor of allocated memory.
  *
- * @param [in] wakeup      Handle to the notification event.
- *
- * @return Error code.
- */
-ucs_status_t uct_wakeup_signal(uct_wakeup_h wakeup);
-
-
-/**
- * @ingroup UCT_RESOURCE
+ * @return UCS_OK if allocation was successful, error code otherwise.
  */
 ucs_status_t uct_iface_mem_alloc(uct_iface_h iface, size_t length, unsigned flags,
                                  const char *name, uct_allocated_memory_t *mem);
 
-void uct_iface_mem_free(const uct_allocated_memory_t *mem);
 
 /**
- * @ingroup UCT_AM
- * @brief AM callback capabilities
+ * @ingroup UCT_RESOURCE
+ * @brief Release memory allocated with @ref uct_iface_mem_alloc().
  *
- * List of capabilities of active message callback
- *
- * A callback must have either SYNC or ASYNC flags.
+ * @param [in]  mem      Descriptor of memory to release.
  */
-enum uct_am_cb_cap {
-    UCT_AM_CB_FLAG_SYNC  = UCS_BIT(1), /**< Callback is always invoked from the context (thread, process)
-                                            that called uct_iface_progress(). An interface must
-                                            have @ref UCT_IFACE_FLAG_AM_CB_SYNC flag set to support sync
-                                            callback invocation */
+void uct_iface_mem_free(const uct_allocated_memory_t *mem);
 
-    UCT_AM_CB_FLAG_ASYNC = UCS_BIT(2), /**< Callback may be invoked from any context. For example,
-                                            it may be called from transport async progress thread. To guarantee
-                                            async invocation, interface must have @ref UCT_IFACE_FLAG_AM_CB_ASYNC
-                                            flag set.
-                                            If async callback is set on interface with only @ref
-                                            UCT_IFACE_FLAG_AM_CB_SYNC flags, it will behave exactly like a
-                                            sync callback  */
-};
 
 /**
  * @ingroup UCT_AM
@@ -940,7 +1204,7 @@ enum uct_am_cb_cap {
  * @param [in]  id       Active message id. Must be 0..UCT_AM_ID_MAX-1.
  * @param [in]  cb       Active message callback. NULL to clear.
  * @param [in]  arg      Active message argument.
- * @param [in]  flags    Required @ref uct_am_cb_cap "active message callback capabilities"
+ * @param [in]  flags    Required @ref uct_cb_flags "callback flags"
  *
  * @return error code if the interface does not support active messages or
  *         requested callback flags
@@ -1008,7 +1272,7 @@ void uct_ep_destroy(uct_ep_h ep);
  *
  * @param [in]  ep       Endpoint to query.
  * @param [out] addr     Filled with endpoint address. The size of the buffer
- *                        provided must be at least @ref uct_iface_attr_t::ep_addr_len.
+ *                       provided must be at least @ref uct_iface_attr_t::ep_addr_len.
  */
 ucs_status_t uct_ep_get_address(uct_ep_h ep, uct_ep_addr_t *addr);
 
@@ -1028,8 +1292,41 @@ ucs_status_t uct_ep_connect_to_ep(uct_ep_h ep, const uct_device_addr_t *dev_addr
 
 
 /**
+ * @ingroup UCT_RESOURCE
+ * @brief Initiate a client-server connection to a remote peer.
+ *
+ * This routine will create an endpoint for a connection to the remote peer,
+ * specified by its socket address.
+ * The user may provide private data to be sent on a connection request to the
+ * remote peer.
+ *
+ * @note The interface in this routine requires the
+ * @ref UCT_IFACE_FLAG_CONNECT_TO_SOCKADDR capability.
+ *
+ * @param [in]  iface            Interface to create the endpoint on.
+ * @param [in]  sockaddr         The sockaddr to connect to on the remote peer.
+ * @param [in]  reply_cb         Callback for an incoming reply message from
+ *                               the server.
+ * @param [in]  arg              User defined argument to pass to the callback.
+ * @param [in]  cb_flags         Required @ref uct_cb_flags "callback flags" to
+ *                               indicate where the @ref uct_sockaddr_conn_reply_callback_t
+ *                               reply callback can be invoked from.
+ * @param [in]  priv_data        User's private data for connecting to the
+ *                               remote peer.
+ * @param [in]  length           Length of the private data.
+ * @param [out] ep_p             Handle to the created endpoint.
+ */
+ucs_status_t uct_ep_create_sockaddr(uct_iface_h iface,
+                                    const ucs_sock_addr_t *sockaddr,
+                                    uct_sockaddr_conn_reply_callback_t reply_cb,
+                                    void *arg, uint32_t cb_flags,
+                                    const void *priv_data, size_t length,
+                                    uct_ep_h *ep_p);
+
+
+/**
  * @ingroup UCT_MD
- * @brief Query for memory domain attributes. *
+ * @brief Query for memory domain attributes.
  *
  * @param [in]  md       Memory domain to query.
  * @param [out] md_attr  Filled with memory domain attributes.
@@ -1046,12 +1343,12 @@ ucs_status_t uct_md_query(uct_md_h md, uct_md_attr_t *md_attr);
  *
  * @param [in]     md          Memory domain to allocate memory on.
  * @param [in,out] length_p    Points to the size of memory to allocate. Upon successful
- *                              return, filled with the actual size that was allocated,
- *                              which may be larger than the one requested. Must be >0.
+ *                             return, filled with the actual size that was allocated,
+ *                             which may be larger than the one requested. Must be >0.
  * @param [in,out] address_p   The address
- * @param [in]     flags       Memory allocation flags, UCT_MD_MEM_FLAG_xx.
+ * @param [in]     flags       Memory allocation flags, see @ref uct_md_mem_flags.
  * @param [in]     name        Name of the allocated region, used to track memory
- *                              usage for debugging and profiling.
+ *                             usage for debugging and profiling.
  * @param [out]    memh_p      Filled with handle for allocated region.
  */
 ucs_status_t uct_md_mem_alloc(uct_md_h md, size_t *length_p, void **address_p,
@@ -1070,6 +1367,27 @@ ucs_status_t uct_md_mem_free(uct_md_h md, uct_mem_h memh);
 
 /**
  * @ingroup UCT_MD
+ * @brief Give advice about the use of memory 
+ *
+ * This routine advises the UCT about how to handle memory range beginning at
+ * address and size of length bytes. This call does not influence the semantics
+ * of the application, but may influence its performance. The advice may be 
+ * ignored. 
+ *
+ * @param [in]     md          Memory domain memory was allocated or registered on.
+ * @param [in]     memh        Memory handle, as returned from @ref uct_md_mem_alloc
+ * @param [in]     addr        Memory base address. Memory range must belong to the
+ *                             @a memh
+ * @param [in]     length      Length of memory to advise. Must be >0.
+ * @param [in]     advice      Memory use advice as defined in the
+ *                             @ref uct_mem_advice_t list
+ */
+ucs_status_t uct_md_mem_advise(uct_md_h md, uct_mem_h memh, void *addr,
+                               size_t length, uct_mem_advice_t advice);
+
+
+/**
+ * @ingroup UCT_MD
  * @brief Register memory for zero-copy sends and remote access.
  *
  *  Register memory on the memory domain. In order to use this function, MD
@@ -1078,7 +1396,7 @@ ucs_status_t uct_md_mem_free(uct_md_h md, uct_mem_h memh);
  * @param [in]     md        Memory domain to register memory on.
  * @param [out]    address   Memory to register.
  * @param [in]     length    Size of memory to register. Must be >0.
- * @param [in]     flags     Memory allocation flags, UCT_MD_MEM_FLAG_xx.
+ * @param [in]     flags     Memory allocation flags, see @ref uct_md_mem_flags.
  * @param [out]    memh_p    Filled with handle for allocated region.
  */
 ucs_status_t uct_md_mem_reg(uct_md_h md, void *address, size_t length,
@@ -1106,9 +1424,18 @@ ucs_status_t uct_md_mem_dereg(uct_md_h md, uct_mem_h memh);
  * exhausted. In this case the next allocation method from the initial list will
  * be attempted.
  *
+ * @param [in]     addr        If @a addr is NULL, the underlying allocation routine
+ *                             will choose the address at which to create the mapping.
+ *                             If @a addr is non-NULL but UCT_MD_MEM_FLAG_FIXED is
+ *                             not set, the address will be interpreted as a hint
+ *                             as to where to establish the mapping. If @a addr is
+ *                             non-NULL and UCT_MD_MEM_FLAG_FIXED is set, then
+ *                             the specified address is interpreted as a requirement.
+ *                             In this case, if the mapping to the exact address
+ *                             cannot be made, the allocation request fails.
  * @param [in]     min_length  Minimal size to allocate. The actual size may be
  *                             larger, for example because of alignment restrictions.
- * @param [in]     flags       Memory allocation flags, UCT_MD_MEM_FLAG_xx.
+ * @param [in]     flags       Memory allocation flags, see @ref uct_md_mem_flags.
  * @param [in]     methods     Array of memory allocation methods to attempt.
  * @param [in]     num_methods Length of 'methods' array.
  * @param [in]     mds         Array of memory domains to attempt to allocate
@@ -1120,9 +1447,10 @@ ucs_status_t uct_md_mem_dereg(uct_md_h md, uct_mem_h memh);
  * @param [out]    mem         In case of success, filled with information about
  *                              the allocated memory. @ref uct_allocated_memory_t.
  */
-ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t *methods,
-                           unsigned num_methods, uct_md_h *mds, unsigned num_mds,
-                           const char *name, uct_allocated_memory_t *mem);
+ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
+                           uct_alloc_method_t *methods, unsigned num_methods,
+                           uct_md_h *mds, unsigned num_mds, const char *name,
+                           uct_allocated_memory_t *mem);
 
 
 /**
@@ -1137,7 +1465,7 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
 ucs_status_t uct_mem_free(const uct_allocated_memory_t *mem);
 
 /**
- * @ingroup RESOURCE
+ * @ingroup UCT_MD
  * @brief Read the configuration of the MD component.
  *
  * @param [in]  name          Name of the MD or the MD component.
@@ -1153,6 +1481,31 @@ ucs_status_t uct_mem_free(const uct_allocated_memory_t *mem);
 ucs_status_t uct_md_config_read(const char *name, const char *env_prefix,
                                 const char *filename,
                                 uct_md_config_t **config_p);
+
+
+
+/**
+ * @ingroup UCT_MD
+ * @brief Check if remote sock address is accessible from the memory domain.
+ *
+ * This function checks if a remote sock address can be accessed from a local
+ * memory domain. Accessibility can be checked in local or remote mode.
+ *
+ * @param [in]  md         Memory domain to check accessibility from.
+ *                         This memory domain must support the @ref
+ *                         UCT_MD_FLAG_SOCKADDR flag.
+ * @param [in]  sockaddr   Socket address to check accessibility to.
+ * @param [in]  mode       Mode for checking accessibility, as defined in @ref
+ *                         uct_sockaddr_accessibility_t.
+ *                         Indicates if accessibility is tested on the server side -
+ *                         for binding to the given sockaddr, or on the
+ *                         client side - for connecting to the given remote
+ *                         peer's sockaddr.
+ *
+ * @return Nonzero if accessible, 0 if inaccessible.
+ */
+int uct_md_is_sockaddr_accessible(uct_md_h md, const ucs_sock_addr_t *sockaddr,
+                                  uct_sockaddr_accessibility_t mode);
 
 
 /**
@@ -1185,11 +1538,54 @@ ucs_status_t uct_rkey_unpack(const void *rkey_buffer, uct_rkey_bundle_t *rkey_ob
 /**
  * @ingroup UCT_MD
  *
+ * @brief Get a local pointer to remote memory.
+ *
+ * This routine returns a local pointer to the remote memory
+ * described by the rkey bundle. The MD must support
+ * @ref UCT_MD_FLAG_RKEY_PTR flag.
+ *
+ * @param [in]  rkey_ob      A remote key bundle as returned by
+ *                           the @ref uct_rkey_unpack function.
+ * @param [in]  remote_addr  A remote address within the memory area described
+ *                           by the rkey_ob.
+ * @param [out] addr_p       A pointer that can be used for direct access to
+ *                           the remote memory.
+ *
+ * @return Error code if the remote memory cannot be accessed directly or
+ *         the remote address is not valid.
+ */
+ucs_status_t uct_rkey_ptr(uct_rkey_bundle_t *rkey_ob, uint64_t remote_addr,
+                          void **addr_p);
+
+
+/**
+ * @ingroup UCT_MD
+ *
  * @brief Release a remote key.
  *
  * @param [in]  rkey_ob      Remote key to release.
  */
 ucs_status_t uct_rkey_release(const uct_rkey_bundle_t *rkey_ob);
+
+
+/**
+ * @ingroup UCT_CONTEXT
+ * @brief Explicit progress for UCT worker.
+ *
+ * This routine explicitly progresses any outstanding communication operations
+ * and active message requests.
+ *
+ * @note @li In the current implementation, users @b MUST call this routine
+ * to receive the active message requests.
+ *
+ * @param [in]  worker        Handle to worker.
+ *
+ * @return Non-zero if any communication was progressed, zero otherwise.
+ */
+UCT_INLINE_API unsigned uct_worker_progress(uct_worker_h worker)
+{
+    return ucs_callbackq_dispatch(&worker->progress_q);
+}
 
 
 /**
@@ -1200,25 +1596,25 @@ ucs_status_t uct_rkey_release(const uct_rkey_bundle_t *rkey_ob);
  * this call. The operations are completed at the origin or at the target
  * as well. The exact completion semantic depends on @a flags parameter.
  *
- * @note Currently only one completion type is supported. It guaranties that
+ * @note Currently only one completion type is supported. It guarantees that
  * the data transfer is completed but the target buffer may not be updated yet.
  *
  * @param [in]    iface  Interface to flush communications from.
- * @param [in]    flags  Flags that control completion semantic (currently
- *                        unsupported - set to 0).
+ * @param [in]    flags  Flags that control completion semantic (currently only
+ *                       @ref UCT_FLUSH_FLAG_LOCAL is supported).
  * @param [inout] comp   Completion handle as defined by @ref uct_completion_t.
- *                        Can be NULL, which means that the call will return the
- *                        current state of the interface and no completion will
- *                        be generated in case of outstanding communications.
- *                        If it is not NULL completion counter is decremented
- *                        by 1 when the call completes. Completion callback is
- *                        called when the counter reaches 0.
+ *                       Can be NULL, which means that the call will return the
+ *                       current state of the interface and no completion will
+ *                       be generated in case of outstanding communications.
+ *                       If it is not NULL completion counter is decremented
+ *                       by 1 when the call completes. Completion callback is
+ *                       called when the counter reaches 0.
  *
  *
  * @return UCS_OK         - No outstanding communications left.
  *         UCS_INPROGRESS - Some communication operations are still in progress.
- *                           If non-NULL 'comp' is provided, it will be updated
- *                           upon completion of these operations.
+ *                          If non-NULL 'comp' is provided, it will be updated
+ *                          upon completion of these operations.
  */
 UCT_INLINE_API ucs_status_t uct_iface_flush(uct_iface_h iface, unsigned flags,
                                             uct_completion_t *comp)
@@ -1235,7 +1631,7 @@ UCT_INLINE_API ucs_status_t uct_iface_flush(uct_iface_h iface, unsigned flags,
  *
  * @param [in]    iface  Interface to issue communications from.
  * @param [in]    flags  Flags that control ordering semantic (currently
- *                        unsupported - set to 0).
+ *                       unsupported - set to 0).
  * @return UCS_OK         - Ordering is inserted.
  */
 
@@ -1253,10 +1649,10 @@ UCT_INLINE_API ucs_status_t uct_iface_fence(uct_iface_h iface, unsigned flags)
  *
  * @param [in]  desc  Descriptor to release.
  */
-UCT_INLINE_API void uct_iface_release_am_desc(void *desc)
+UCT_INLINE_API void uct_iface_release_desc(void *desc)
 {
-    uct_iface_h iface = uct_recv_desc_iface(desc);
-    iface->ops.iface_release_am_desc(iface, desc);
+    uct_recv_desc_t *release_desc = uct_recv_desc(desc);
+    release_desc->cb(release_desc, desc);
 }
 
 
@@ -1389,9 +1785,10 @@ UCT_INLINE_API ucs_status_t uct_ep_am_short(uct_ep_h ep, uint8_t id, uint64_t he
  * @brief
  */
 UCT_INLINE_API ssize_t uct_ep_am_bcopy(uct_ep_h ep, uint8_t id,
-                                       uct_pack_callback_t pack_cb, void *arg)
+                                       uct_pack_callback_t pack_cb, void *arg,
+                                       unsigned flags)
 {
-    return ep->iface->ops.ep_am_bcopy(ep, id, pack_cb, arg);
+    return ep->iface->ops.ep_am_bcopy(ep, id, pack_cb, arg, flags);
 }
 
 
@@ -1418,6 +1815,7 @@ UCT_INLINE_API ssize_t uct_ep_am_bcopy(uct_ep_h ep, uint8_t id,
  *                           array. If @a iovcnt is zero, the data is considered empty.
  *                           @a iovcnt is limited by @ref uct_iface_attr_cap_am_max_iov
  *                           "uct_iface_attr::cap::am::max_iov"
+ * @param [in] flags         Active message flags, see @ref uct_am_flags.
  * @param [in] comp          Completion handle as defined by @ref ::uct_completion_t.
  *
  * @return UCS_INPROGRESS    Some communication operations are still in progress.
@@ -1425,12 +1823,15 @@ UCT_INLINE_API ssize_t uct_ep_am_bcopy(uct_ep_h ep, uint8_t id,
  *                           upon completion of these operations.
  *
  */
-UCT_INLINE_API ucs_status_t uct_ep_am_zcopy(uct_ep_h ep, uint8_t id, void *header,
+UCT_INLINE_API ucs_status_t uct_ep_am_zcopy(uct_ep_h ep, uint8_t id,
+                                            const void *header,
                                             unsigned header_length,
                                             const uct_iov_t *iov, size_t iovcnt,
+                                            unsigned flags,
                                             uct_completion_t *comp)
 {
-    return ep->iface->ops.ep_am_zcopy(ep, id, header, header_length, iov, iovcnt, comp);
+    return ep->iface->ops.ep_am_zcopy(ep, id, header, header_length, iov, iovcnt,
+                                      flags, comp);
 }
 
 /**
@@ -1579,19 +1980,16 @@ UCT_INLINE_API void uct_ep_pending_purge(uct_ep_h ep,
  * this call. The operations are completed at the origin or at the target
  * as well. The exact completion semantic depends on @a flags parameter.
  *
- * @note Currently only one completion type is supported. It guarantees that
- * the data transfer is completed but the target buffer may not be updated yet.
- *
  * @param [in]    ep     Endpoint to flush communications from.
- * @param [in]    flags  Flags that control completion semantic (currently
- *                        unsupported - set to 0).
+ * @param [in]    flags  Flags @ref uct_flush_flags that control completion
+ *                       semantic.
  * @param [inout] comp   Completion handle as defined by @ref uct_completion_t.
- *                        Can be NULL, which means that the call will return the
- *                        current state of the endpoint and no completion will
- *                        be generated in case of outstanding communications.
- *                        If it is not NULL completion counter is decremented
- *                        by 1 when the call completes. Completion callback is
- *                        called when the counter reaches 0.
+ *                       Can be NULL, which means that the call will return the
+ *                       current state of the endpoint and no completion will
+ *                       be generated in case of outstanding communications.
+ *                       If it is not NULL completion counter is decremented
+ *                       by 1 when the call completes. Completion callback is
+ *                       called when the counter reaches 0.
  *
  * @return UCS_OK              - No outstanding communications left.
  *         UCS_ERR_NO_RESOURCE - Flush operation could not be initiated. A subsequent
@@ -1608,6 +2006,7 @@ UCT_INLINE_API ucs_status_t uct_ep_flush(uct_ep_h ep, unsigned flags,
     return ep->iface->ops.ep_flush(ep, flags, comp);
 }
 
+
 /**
  * @ingroup UCT_RESOURCE
  * @brief Ensures ordering of outstanding communications on the endpoint.
@@ -1617,12 +2016,343 @@ UCT_INLINE_API ucs_status_t uct_ep_flush(uct_ep_h ep, unsigned flags,
  *
  * @param [in]    ep     Endpoint to issue communications from.
  * @param [in]    flags  Flags that control ordering semantic (currently
- *                        unsupported - set to 0).
+ *                       unsupported - set to 0).
  * @return UCS_OK         - Ordering is inserted.
  */
 UCT_INLINE_API ucs_status_t uct_ep_fence(uct_ep_h ep, unsigned flags)
 {
     return ep->iface->ops.ep_fence(ep, flags);
 }
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Short eager tagged-send operation.
+ *
+ * This routine sends a message using @ref uct_short_protocol_desc "short"
+ * eager protocol. Eager protocol means that the whole data is sent to the peer
+ * immediately without any preceding notification.
+ * The data is provided as buffer and its length,and must not be larger than the
+ * corresponding @a max_short value in @ref uct_iface_attr.
+ * The immediate value delivered to the receiver is implicitly equal to 0.
+ * If it's required to pass non-zero imm value, @ref uct_ep_tag_eager_bcopy
+ * should be used.
+ *
+ * @param [in]  ep        Destination endpoint handle.
+ * @param [in]  tag       Tag to use for the eager message.
+ * @param [in]  data      Data to send.
+ * @param [in]  length    Data length.
+ *
+ * @return UCS_OK              - operation completed successfully.
+ * @return UCS_ERR_NO_RESOURCE - could not start the operation now due to lack
+ *                               of send resources.
+ */
+UCT_INLINE_API ucs_status_t uct_ep_tag_eager_short(uct_ep_h ep, uct_tag_t tag,
+                                                   const void *data, size_t length)
+{
+    return ep->iface->ops.ep_tag_eager_short(ep, tag, data, length);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Bcopy eager tagged-send operation.
+ *
+ * This routine sends a message using @ref uct_bcopy_protocol_desc "bcopy"
+ * eager protocol. Eager protocol means that the whole data is sent to the peer
+ * immediately without any preceding notification.
+ * Custom data callback is used to copy the data to the network buffers.
+ *
+ * @note The resulted data length must not be larger than the corresponding
+ *       @a max_bcopy value in @ref uct_iface_attr.
+ *
+ * @param [in]  ep        Destination endpoint handle.
+ * @param [in]  tag       Tag to use for the eager message.
+ * @param [in]  imm       Immediate value which will be available to the
+ *                        receiver.
+ * @param [in]  pack_cb   User callback to pack the data.
+ * @param [in]  arg       Custom argument to @a pack_cb.
+ *
+ * @return >=0       - The size of the data packed by @a pack_cb.
+ * @return otherwise - Error code.
+ */
+UCT_INLINE_API ssize_t uct_ep_tag_eager_bcopy(uct_ep_h ep, uct_tag_t tag,
+                                              uint64_t imm,
+                                              uct_pack_callback_t pack_cb,
+                                              void *arg)
+{
+    return ep->iface->ops.ep_tag_eager_bcopy(ep, tag, imm, pack_cb, arg);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Zcopy eager tagged-send operation.
+ *
+ * This routine sends a message using @ref uct_zcopy_protocol_desc "zcopy"
+ * eager protocol. Eager protocol means that the whole data is sent to the peer
+ * immediately without any preceding notification.
+ * The input data (which has to be previously registered) in @a iov array of
+ * @ref uct_iov_t structures sent to remote side ("gather output"). Buffers in
+ * @a iov are processed in array order, so the function complete @a iov[0]
+ * before proceeding to @a iov[1], and so on.
+ *
+ * @note The resulted data length must not be larger than the corresponding
+ *       @a max_zcopy value in @ref uct_iface_attr.
+ *
+ * @param [in]  ep        Destination endpoint handle.
+ * @param [in]  tag       Tag to use for the eager message.
+ * @param [in]  imm       Immediate value which will be available to the
+ *                        receiver.
+ * @param [in]  iov       Points to an array of @ref uct_iov_t structures.
+ *                        A particular structure pointer must be valid address.
+ *                        NULL terminated pointer is not required.
+ * @param [in]  iovcnt    Size of the @a iov array. If @a iovcnt is zero, the
+ *                        data is considered empty. Note that @a iovcnt is
+ *                        limited by the corresponding @a max_iov value in
+ *                        @ref uct_iface_attr.
+ * @param [in]  comp      Completion callback which will be called when the data
+ *                        is reliably received by the peer, and the buffer
+ *                        can be reused or invalidated.
+ *
+ * @return UCS_OK              - operation completed successfully.
+ * @return UCS_ERR_NO_RESOURCE - could not start the operation now due to lack
+ *                               of send resources.
+ * @return UCS_INPROGRESS      - operation started, and @a comp will be used to
+ *                               notify when it's completed.
+ */
+UCT_INLINE_API ucs_status_t uct_ep_tag_eager_zcopy(uct_ep_h ep, uct_tag_t tag,
+                                                   uint64_t imm,
+                                                   const uct_iov_t *iov,
+                                                   size_t iovcnt,
+                                                   uct_completion_t *comp)
+{
+    return ep->iface->ops.ep_tag_eager_zcopy(ep, tag, imm, iov, iovcnt, comp);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Rendezvous tagged-send operation.
+ *
+ * This routine sends a message using rendezvous protocol. Rendezvous protocol
+ * means that only a small notification is sent at first, and the data itself
+ * is transferred later (when there is a match) to avoid extra memory copy.
+ *
+ * @note The header will be available to the receiver in case of unexpected
+ *       rendezvous operation only, i.e. the peer has not posted tag for this
+ *       message yet (by means of @ref uct_iface_tag_recv_zcopy), when it is
+ *       arrived.
+ *
+ * @param [in]  ep            Destination endpoint handle.
+ * @param [in]  tag           Tag to use for the eager message.
+ * @param [in]  header        User defined header.
+ * @param [in]  header_length User defined header length in bytes. Note that
+ *                            it is limited by the corresponding @a max_hdr
+ *                            value in @ref uct_iface_attr.
+ * @param [in]  iov           Points to an array of @ref uct_iov_t structures.
+ *                            A particular structure pointer must be valid
+ *                            address. NULL terminated pointer is not required.
+ * @param [in]  iovcnt        Size of the @a iov array. If @a iovcnt is zero,
+ *                            the data is considered empty. Note that @a iovcnt
+ *                            is limited by the corresponding @a max_iov value
+ *                            in @ref uct_iface_attr.
+ * @param [in]  comp          Completion callback which will be called when the
+ *                            data is reliably received by the peer, and the
+ *                            buffer can be reused or invalidated.
+ *
+ * @return >=0       - The operation is in progress and the return value is a
+ *                     handle which can be used to cancel the outstanding
+ *                     rendezvous operation.
+ * @return otherwise - Error code.
+ */
+UCT_INLINE_API ucs_status_ptr_t uct_ep_tag_rndv_zcopy(uct_ep_h ep, uct_tag_t tag,
+                                                      const void *header,
+                                                      unsigned header_length,
+                                                      const uct_iov_t *iov,
+                                                      size_t iovcnt,
+                                                      uct_completion_t *comp)
+{
+    return ep->iface->ops.ep_tag_rndv_zcopy(ep, tag, header, header_length,
+                                            iov, iovcnt, comp);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Cancel outstanding rendezvous operation.
+ *
+ * This routine signals the underlying transport disregard the outstanding
+ * operation without calling completion callback provided in
+ * @ref uct_ep_tag_rndv_zcopy.
+ *
+ * @note The operation handle should be valid at the time the routine is
+ * invoked. I.e. it should be a handle of the real operation which is not
+ * completed yet.
+ *
+ * @param [in] ep Destination endpoint handle.
+ * @param [in] op Rendezvous operation handle, as returned from
+ *                @ref uct_ep_tag_rndv_zcopy.
+ *
+ * @return UCS_OK - The operation has been canceled.
+ */
+UCT_INLINE_API ucs_status_t uct_ep_tag_rndv_cancel(uct_ep_h ep, void *op)
+{
+    return ep->iface->ops.ep_tag_rndv_cancel(ep, op);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Send software rendezvous request.
+ *
+ * This routine sends a rendezvous request only, which indicates that the data
+ * transfer should be completed in software.
+ *
+ * @param [in]  ep            Destination endpoint handle.
+ * @param [in]  tag           Tag to use for matching.
+ * @param [in]  header        User defined header
+ * @param [in]  header_length User defined header length in bytes. Note that it
+ *                            is limited by the corresponding @a max_hdr value
+ *                            in @ref uct_iface_attr.
+ *
+ * @return UCS_OK              - operation completed successfully.
+ * @return UCS_ERR_NO_RESOURCE - could not start the operation now due to lack of
+ *                               send resources.
+ */
+UCT_INLINE_API ucs_status_t uct_ep_tag_rndv_request(uct_ep_h ep, uct_tag_t tag,
+                                                    const void* header,
+                                                    unsigned header_length)
+{
+    return ep->iface->ops.ep_tag_rndv_request(ep, tag, header, header_length);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Post a tag to a transport interface.
+ *
+ * This routine posts a tag to be matched on a transport interface. When a
+ * message with the corresponding tag arrives it is stored in the user buffer
+ * (described by @a iov and @a iovcnt) directly. The operation completion is
+ * reported using callbacks on the @a ctx structure.
+ *
+ * @param [in]    iface     Interface to post the tag on.
+ * @param [in]    tag       Tag to expect.
+ * @param [in]    tag_mask  Mask which specifies what bits of the tag to
+ *                          compare.
+ * @param [in]    iov       Points to an array of @ref ::uct_iov_t structures.
+ *                          The @a iov pointer must be valid address of an array
+ *                          of @ref ::uct_iov_t structures. A particular structure
+ *                          pointer must be valid address. NULL terminated pointer
+ *                          is not required.
+ * @param [in]    iovcnt    Size of the @a iov data @ref ::uct_iov_t structures
+ *                          array. If @a iovcnt is zero, the data is considered empty.
+ *                          @a iovcnt is limited by @ref uct_iface_attr_cap_tag_recv_iov
+ *                          "uct_iface_attr::cap::tag::max_iov"
+ * @param [inout] ctx       Context associated with this particular tag, "priv" field
+ *                          in this structure is used to track the state internally.
+ *
+ * @return UCS_OK                - The tag is posted to the transport.
+ * @return UCS_ERR_NO_RESOURCE   - Could not start the operation due to lack of
+ *                                 resources.
+ * @return UCS_ERR_EXCEEDS_LIMIT - No more room for tags in the transport.
+ */
+UCT_INLINE_API ucs_status_t uct_iface_tag_recv_zcopy(uct_iface_h iface,
+                                                     uct_tag_t tag,
+                                                     uct_tag_t tag_mask,
+                                                     const uct_iov_t *iov,
+                                                     size_t iovcnt,
+                                                     uct_tag_context_t *ctx)
+{
+    return iface->ops.iface_tag_recv_zcopy(iface, tag, tag_mask, iov, iovcnt, ctx);
+}
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Cancel a posted tag.
+ *
+ * This routine cancels a tag, which was previously posted by
+ * @ref uct_iface_tag_recv_zcopy. The tag would be either matched or canceled,
+ * in a bounded time, regardless of the peer actions. The original completion
+ * callback of the tag would be called with the status if @a force is not set.
+ *
+ * @param [in]  iface     Interface to cancel the tag on.
+ * @param [in]  ctx       Tag context which was used for posting the tag. If
+ *                        force is 0, @a ctx->completed_cb will be called with
+ *                        either UCS_OK which means the tag was matched and data
+ *                        received despite the cancel request, or
+ *                        UCS_ERR_CANCELED which means the tag was successfully
+ *                        canceled before it was matched.
+ * @param [in]  force     Whether to report completions to @a ctx->completed_cb.
+ *                        If nonzero, the cancel is assumed to be successful,
+ *                        and the callback is not called.
+ *
+ * @return UCS_OK  -      The tag is canceled in the transport.
+ */
+UCT_INLINE_API ucs_status_t uct_iface_tag_recv_cancel(uct_iface_h iface,
+                                                      uct_tag_context_t *ctx,
+                                                      int force)
+{
+    return iface->ops.iface_tag_recv_cancel(iface, ctx, force);
+}
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Enable synchronous progress for the interface
+ *
+ * Notify the transport that it should actively progress communications during
+ * @ref uct_worker_progress().
+ *
+ * When the interface is created, its progress is enabled.
+ *
+ * @param [in]  iface    The interface to enable progress.
+ * @param [in]  flags    The type of progress to enable as defined by
+ *                       @ref uct_progress_types.
+ *
+ */
+UCT_INLINE_API void uct_iface_progress_enable(uct_iface_h iface, unsigned flags)
+{
+    iface->ops.iface_progress_enable(iface, flags);
+}
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Disable synchronous progress for the interface
+ *
+ * Notify the transport that it should not progress its communications during
+ * @ref uct_worker_progress(). Thus the latency of other transports may be
+ * improved.
+ *
+ * By default, progress is enabled when the interface is created.
+ *
+ * @param [in]  iface    The interface to disable progress.
+ * @param [in]  flags    The type of progress to disable as defined by
+ *                       @ref uct_progress_types.
+ *
+ */
+UCT_INLINE_API void uct_iface_progress_disable(uct_iface_h iface, unsigned flags)
+{
+    iface->ops.iface_progress_disable(iface, flags);
+}
+
+
+/**
+ * Perform a progress on an interface.
+ */
+UCT_INLINE_API unsigned uct_iface_progress(uct_iface_h iface)
+{
+    return iface->ops.iface_progress(iface);
+}
+
+
+/**
+ * @example uct_hello_world.c
+ * UCT hello world client / server example utility.
+ */
+
 
 #endif

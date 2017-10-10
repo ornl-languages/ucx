@@ -56,6 +56,24 @@ AC_ARG_WITH([cm],
 
 
 #
+# mlx5 bare-metal support
+#
+AC_ARG_WITH([mlx5-hw],
+            [AC_HELP_STRING([--with-mlx5-hw], [Compile with mlx5 bare-metal support])],
+            [],
+            [with_mlx5_hw=yes])
+
+
+#
+# TM (IB Tag Matching) Support
+#
+AC_ARG_WITH([ib-hw-tm],
+            [AC_HELP_STRING([--with-ib-hw-tm], [Compile with IB Tag Matching support])],
+            [],
+            [with_ib_hw_tm=yes])
+
+
+#
 # Check basic IB support: User wanted at least one IB transport, and we found
 # verbs header file and library.
 #
@@ -114,9 +132,10 @@ AS_IF([test "x$with_ib" == xyes],
            verbs_exp=yes],
            [verbs_exp=no])
 
-       AC_CHECK_HEADERS([infiniband/mlx5_hw.h],
-                        [with_mlx5_hw=yes],
-                        [with_mlx5_hw=no])
+       AS_IF([test "x$with_mlx5_hw" != xno],
+             [AC_CHECK_HEADERS([infiniband/mlx5_hw.h],
+                               [with_mlx5_hw=yes],
+                               [with_mlx5_hw=no])])
 
        AC_CHECK_DECLS([ibv_mlx5_exp_get_qp_info,
                        ibv_mlx5_exp_get_cq_info,
@@ -153,6 +172,9 @@ AS_IF([test "x$with_ib" == xyes],
                        IBV_EXP_DEVICE_DC_TRANSPORT,
                        IBV_EXP_ATOMIC_HCA_REPLY_BE,
                        IBV_EXP_PREFETCH_WRITE_ACCESS,
+                       IBV_EXP_QP_OOO_RW_DATA_PLACEMENT,
+                       IBV_EXP_DCT_OOO_RW_DATA_PLACEMENT,
+                       IBV_EXP_CQ_MODERATION,
                        ibv_exp_reg_mr,
                        ibv_exp_create_qp,
                        ibv_exp_prefetch_mr,
@@ -240,6 +262,18 @@ AS_IF([test "x$with_ib" == xyes],
            [AC_DEFINE([HAVE_TL_CM], 1, [Connection manager support])
            transports="${transports},cm"])
 
+       # XRQ with Tag Matching support
+       AS_IF([test "x$with_ib_hw_tm" != xno],
+           [AC_CHECK_MEMBER([struct ibv_exp_tmh.tag], [], [with_ib_hw_tm=no],
+                            [[#include <infiniband/verbs_exp.h>]])
+           ])
+       AS_IF([test "x$with_ib_hw_tm" != xno],
+           [AC_DEFINE([IBV_EXP_HW_TM], 1, [IB Tag Matching support])
+            AC_CHECK_MEMBERS([struct ibv_exp_create_srq_attr.dc_offload_params],
+                             [AC_DEFINE([IBV_EXP_HW_TM_DC], 1, [DC Tag Matching support])],
+                             [], [#include <infiniband/verbs_exp.h>])
+           ])
+
        mlnx_valg_libdir=$with_verbs/lib${libsuff}/mlnx_ofed/valgrind
        AC_MSG_NOTICE([Checking OFED valgrind libs $mlnx_valg_libdir])
 
@@ -255,6 +289,7 @@ AS_IF([test "x$with_ib" == xyes],
         with_rc=no
         with_ud=no
         with_mlx5_hw=no
+        with_ib_hw_tm=no
     ])
 
 
@@ -267,4 +302,4 @@ AM_CONDITIONAL([HAVE_TL_DC],   [test "x$with_dc" != xno])
 AM_CONDITIONAL([HAVE_TL_UD],   [test "x$with_ud" != xno])
 AM_CONDITIONAL([HAVE_TL_CM],   [test "x$with_cm" != xno])
 AM_CONDITIONAL([HAVE_MLX5_HW], [test "x$with_mlx5_hw" != xno])
-
+AM_CONDITIONAL([HAVE_IBV_EX_HW_TM], [test "x$with_ib_hw_tm"  != xno])

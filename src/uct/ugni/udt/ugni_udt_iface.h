@@ -1,19 +1,16 @@
 /**
- * Copyright (c) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
+ * Copyright (c) UT-Battelle, LLC. 2014-2017. ALL RIGHTS RESERVED.
  * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
 
-#ifndef UCT_UGNI_IFACE_H
-#define UCT_UGNI_IFACE_H
+#ifndef UCT_UGNI_UDT_IFACE_H
+#define UCT_UGNI_UDT_IFACE_H
 
-#include <gni_pub.h>
-#include <uct/ugni/base/ugni_md.h>
-#include <uct/ugni/base/ugni_device.h>
+#include "ugni_udt_ep.h"
+#include <uct/ugni/base/ugni_types.h>
 #include <uct/ugni/base/ugni_iface.h>
 #include <ucs/datastruct/list.h>
-#include "ugni_udt_ep.h"
-
 #include <uct/base/uct_md.h>
 #include <ucs/async/async.h>
 #include <ucs/async/pipe.h>
@@ -27,6 +24,7 @@ typedef struct uct_ugni_udt_iface {
     gni_ep_handle_t         ep_any;       /**< Unbound endpoint that accept any datagram
                                                messages */
     uct_ugni_udt_desc_t     *desc_any;    /**< Segment that accepts datagram from any source */
+    uct_recv_desc_t         release_desc; /**< Callback for receive desc release */
     struct {
         unsigned            udt_seg_size; /**< Max UDT size */
         size_t              rx_headroom;  /**< The size of user defined header for am */
@@ -50,9 +48,10 @@ typedef struct uct_ugni_udt_header {
     uint8_t length;
 } uct_ugni_udt_header_t;
 
-void uct_ugni_udt_progress(void *arg);
+unsigned uct_ugni_udt_progress(void *arg);
+
 #define uct_ugni_udt_get_offset(i) ((size_t)(ucs_max(sizeof(uct_ugni_udt_header_t), ((i)->config.rx_headroom  + \
-                 sizeof(uct_am_recv_desc_t)))))
+                 sizeof(uct_recv_desc_t)))))
 
 #define uct_ugni_udt_get_diff(i) ((size_t)(uct_ugni_udt_get_offset(i) - sizeof(uct_ugni_udt_header_t)))
 
@@ -78,6 +77,8 @@ if (ucs_unlikely(GNI_RC_SUCCESS != rc)) {                          \
     }                                                              \
 }
 
+#define uct_ugni_udt_iface_nic_handle(_iface) uct_ugni_iface_nic_handle(&(_iface)->super)
+
 static inline void uct_ugni_udt_reset_desc(uct_ugni_udt_desc_t *desc, uct_ugni_udt_iface_t *iface)
 {
     uct_ugni_udt_header_t *sheader = uct_ugni_udt_get_sheader(desc, iface);
@@ -92,12 +93,14 @@ static inline int uct_ugni_udt_ep_any_post(uct_ugni_udt_iface_t *iface)
     gni_return_t ugni_rc;
 
     uct_ugni_udt_reset_desc(iface->desc_any, iface);
+    uct_ugni_device_lock(&iface->super.cdm);
     ugni_rc = GNI_EpPostDataWId(iface->ep_any,
                                 uct_ugni_udt_get_sheader(iface->desc_any, iface),
                                 iface->config.udt_seg_size,
                                 uct_ugni_udt_get_rheader(iface->desc_any, iface),
                                 iface->config.udt_seg_size,
                                 UCT_UGNI_UDT_ANY);
+    uct_ugni_device_unlock(&iface->super.cdm);
     UCT_UGNI_UDT_CHECK_RC(ugni_rc, iface->desc_any);
     return UCS_OK;
 }

@@ -14,13 +14,17 @@ extern "C" {
 
 namespace ucs {
 
+pthread_mutex_t test_base::m_logger_mutex = PTHREAD_MUTEX_INITIALIZER;
 unsigned test_base::m_total_warnings = 0;
+unsigned test_base::m_total_errors   = 0;
+std::vector<std::string> test_base::m_errors;
 
 test_base::test_base() :
                 m_state(NEW),
                 m_initialized(false),
                 m_num_threads(1),
                 m_num_valgrind_errors_before(0),
+                m_num_errors_before(0),
                 m_num_warnings_before(0)
 {
     push_config();
@@ -52,27 +56,64 @@ unsigned test_base::num_threads() const {
 void test_base::set_config(const std::string& config_str)
 {
     std::string::size_type pos = config_str.find("=");
+    std::string name, value;
+    bool optional;
+
     if (pos == std::string::npos) {
-        modify_config(config_str, "");
+        name  = config_str;
+        value = "";
     } else {
-        modify_config(config_str.substr(0, pos), config_str.substr(pos + 1));
+        name  = config_str.substr(0, pos);
+        value = config_str.substr(pos + 1);
+    }
+
+    optional = false;
+    if ((name.length() > 0) && name.at(name.length() - 1) == '?') {
+        name = name.substr(0, name.length() - 1);
+        optional = true;
+    }
+
+    modify_config(name, value, optional);
+}
+
+void test_base::get_config(const std::string& name, std::string& value, size_t max)
+{
+    ucs_status_t status;
+
+    value.resize(max, '\0');
+    status = ucs_global_opts_get_value(name.c_str(),
+                                       const_cast<char*>(value.c_str()),
+                                       max);
+    if (status != UCS_OK) {
+        GTEST_FAIL() << "Invalid UCS configuration for " << name
+                     << ", error message: " << ucs_status_string(status)
+                     << "(" << status << ")";
     }
 }
 
-void test_base::modify_config(const std::string& name, const std::string& value)
+void test_base::modify_config(const std::string& name, const std::string& value,
+                              bool optional)
 {
     ucs_status_t status = ucs_global_opts_set_value(name.c_str(), value.c_str());
-    if (status != UCS_OK) {
-        GTEST_FAIL() << "Invalid UCS configuration for " << name << " : "
-                        << value << ", error message: "
-                        << ucs_status_string(status) << "(" << status << ")";
+    if ((status == UCS_OK) || (optional && (status == UCS_ERR_NO_ELEM))) {
+        return;
     }
+
+    GTEST_FAIL() << "Invalid UCS configuration for " << name << " : "
+                    << value << ", error message: "
+                    << ucs_status_string(status) << "(" << status << ")";
 }
 
 void test_base::push_config()
 {
-    m_config_stack.push_back(ucs_global_opts_t());
-    ucs_global_opts_clone(&m_config_stack.back());
+    ucs_global_opts_t new_opts;
+    /* save current options to the vector
+     * it is important to keep the first original global options at the first
+     * vector element to release it at the end. Otherwise, memtrack will not work
+     */
+    m_config_stack.push_back(ucs_global_opts);
+    ucs_global_opts_clone(&new_opts);
+    ucs_global_opts = new_opts;
 }
 
 void test_base::pop_config()
@@ -82,14 +123,77 @@ void test_base::pop_config()
     m_config_stack.pop_back();
 }
 
-ucs_log_func_rc_t
-test_base::log_handler(const char *file, unsigned line, const char *function,
-                       ucs_log_level_t level, const char *prefix, const char *message,
-                       va_list ap)
+void test_base::hide_errors()
 {
-    if (level == UCS_LOG_LEVEL_WARN) {
+    ucs_log_push_handler(hide_errors_logger);
+}
+
+void test_base::wrap_errors()
+{
+    ucs_log_push_handler(wrap_errors_logger);
+}
+
+void test_base::restore_errors()
+{
+    ucs_log_pop_handler();
+}
+
+ucs_log_func_rc_t
+test_base::count_warns_logger(const char *file, unsigned line, const char *function,
+                              ucs_log_level_t level, const char *prefix,
+                              const char *message, va_list ap)
+{
+    pthread_mutex_lock(&m_logger_mutex);
+    if (level == UCS_LOG_LEVEL_ERROR) {
+        ++m_total_errors;
+    } else if (level == UCS_LOG_LEVEL_WARN) {
         ++m_total_warnings;
     }
+    pthread_mutex_unlock(&m_logger_mutex);
+    return UCS_LOG_FUNC_RC_CONTINUE;
+}
+
+std::string test_base::format_message(const char *message, va_list ap)
+{
+    char buf[ucs_global_opts.log_buffer_size];
+    vsnprintf(buf, ucs_global_opts.log_buffer_size, message, ap);
+    return std::string(buf);
+}
+
+ucs_log_func_rc_t
+test_base::hide_errors_logger(const char *file, unsigned line, const char *function,
+                              ucs_log_level_t level, const char *prefix,
+                              const char *message, va_list ap)
+{
+    if (level == UCS_LOG_LEVEL_ERROR) {
+        pthread_mutex_lock(&m_logger_mutex);
+        va_list ap2;
+        va_copy(ap2, ap);
+        m_errors.push_back(format_message(message, ap2));
+        va_end(ap2);
+        level = UCS_LOG_LEVEL_DEBUG;
+        pthread_mutex_unlock(&m_logger_mutex);
+    }
+
+    ucs_log_default_handler(file, line, function, level, prefix, message, ap);
+    return UCS_LOG_FUNC_RC_STOP;
+}
+
+ucs_log_func_rc_t
+test_base::wrap_errors_logger(const char *file, unsigned line, const char *function,
+                              ucs_log_level_t level, const char *prefix,
+                              const char *message, va_list ap)
+{
+    /* Ignore warnings about empty memory pool */
+    if (level == UCS_LOG_LEVEL_ERROR) {
+        pthread_mutex_lock(&m_logger_mutex);
+        std::string text = format_message(message, ap);
+        m_errors.push_back(text);
+        UCS_TEST_MESSAGE << "< " << text << " >";
+        pthread_mutex_unlock(&m_logger_mutex);
+        return UCS_LOG_FUNC_RC_STOP;
+    }
+
     return UCS_LOG_FUNC_RC_CONTINUE;
 }
 
@@ -97,8 +201,10 @@ void test_base::SetUpProxy() {
     ucs_assert(m_state == NEW);
     m_num_valgrind_errors_before = VALGRIND_COUNT_ERRORS;
     m_num_warnings_before        = m_total_warnings;
+    m_num_errors_before          = m_total_errors;
 
-    ucs_log_push_handler(log_handler);
+    m_errors.clear();
+    ucs_log_push_handler(count_warns_logger);
 
     try {
         init();
@@ -123,10 +229,15 @@ void test_base::TearDownProxy() {
     }
 
     ucs_log_pop_handler();
+    m_errors.clear();
 
     int num_valgrind_errors = VALGRIND_COUNT_ERRORS - m_num_valgrind_errors_before;
     if (num_valgrind_errors > 0) {
         ADD_FAILURE() << "Got " << num_valgrind_errors << " valgrind errors during the test";
+    }
+    int num_errors = m_total_errors - m_num_errors_before;
+    if (num_errors > 0) {
+        ADD_FAILURE() << "Got " << num_errors << " errors during the test";
     }
     int num_warnings = m_total_warnings - m_num_warnings_before;
     if (num_warnings > 0) {

@@ -1,17 +1,13 @@
 /**
- * Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
+ * Copyright (C) UT-Battelle, LLC. 2015-2017. ALL RIGHTS RESERVED.
  * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
-#include <ucs/datastruct/sglib_wrapper.h>
-#include <ucs/debug/memtrack.h>
-#include <ucs/debug/log.h>
-#include <uct/base/uct_log.h>
 
 #include "ugni_smsg_ep.h"
 #include "ugni_smsg_iface.h"
 #include <uct/ugni/base/ugni_device.h>
-#include <uct/ugni/base/ugni_ep.h>
+#include <uct/ugni/base/ugni_md.h>
 
 SGLIB_DEFINE_LIST_FUNCTIONS(uct_ugni_smsg_desc_t, uct_ugni_smsg_desc_compare, next);
 SGLIB_DEFINE_HASHED_CONTAINER_FUNCTIONS(uct_ugni_smsg_desc_t, UCT_UGNI_HASH_SIZE, uct_ugni_smsg_desc_hash);
@@ -55,15 +51,13 @@ static ucs_status_t uct_ugni_smsg_mbox_reg(uct_ugni_smsg_iface_t *iface, uct_ugn
         ucs_error("Unexpected length %zu", iface->bytes_per_mbox);
         return UCS_ERR_INVALID_PARAM;
     }
-    pthread_mutex_lock(&uct_ugni_global_lock);
 
-    ugni_rc = GNI_MemRegister(iface->super.nic_handle, (uint64_t)address,
+    uct_ugni_device_lock(&iface->super.cdm);
+    ugni_rc = GNI_MemRegister(uct_ugni_iface_nic_handle(&iface->super), (uint64_t)address,
                               iface->bytes_per_mbox, iface->remote_cq,
                               GNI_MEM_READWRITE,
                               -1, &(mbox->gni_mem));
-
-    pthread_mutex_unlock(&uct_ugni_global_lock);
-
+    uct_ugni_device_unlock(&iface->super.cdm);
     if (GNI_RC_SUCCESS != ugni_rc) {
         ucs_error("GNI_MemRegister failed (addr %p, size %zu), Error status: %s %d",
                   address, iface->bytes_per_mbox, gni_err_str[ugni_rc], ugni_rc);
@@ -78,12 +72,12 @@ static ucs_status_t uct_ugni_smsg_mbox_reg(uct_ugni_smsg_iface_t *iface, uct_ugn
 static ucs_status_t uct_ugni_smsg_mbox_dereg(uct_ugni_smsg_iface_t *iface, uct_ugni_smsg_mbox_t *mbox){
     gni_return_t ugni_rc;
 
-    pthread_mutex_lock(&uct_ugni_global_lock);
-    ugni_rc = GNI_MemDeregister(iface->super.nic_handle, &mbox->gni_mem);
-    pthread_mutex_unlock(&uct_ugni_global_lock);
+    uct_ugni_device_lock(&iface->super.cdm);
+    ugni_rc = GNI_MemDeregister(uct_ugni_iface_nic_handle(&iface->super), &mbox->gni_mem);
+    uct_ugni_device_unlock(&iface->super.cdm);
 
     if (GNI_RC_SUCCESS != ugni_rc) {
-        ucs_error("GNI_MemDeegister failed Error status: %s %d",
+        ucs_error("GNI_MemDeregister failed Error status: %s %d",
                   gni_err_str[ugni_rc], ugni_rc);
         return UCS_ERR_IO_ERROR;
     }
@@ -119,7 +113,6 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ugni_smsg_ep_t)
     } while(UCS_OK != status);
 
     progress_remote_cq(iface);
-
     uct_ugni_smsg_mbox_dereg(iface, self->smsg_attr);
     ucs_mpool_put(self->smsg_attr);
 }
@@ -163,38 +156,33 @@ ucs_status_t uct_ugni_smsg_ep_connect_to_ep(uct_ep_h tl_ep,
     uint32_t ep_hash;
 
     uncompact_smsg_attr(ucs_derived_of(iface, uct_ugni_smsg_iface_t), compact_remote_attr, &remote_attr);
-
-    pthread_mutex_lock(&uct_ugni_global_lock);
     rc = ugni_connect_ep(iface, ugni_dev_addr, &iface_addr->super, &ep->super);
 
     if(UCS_OK != rc){
         ucs_error("Could not connect ep in smsg");
-        goto exit_lock;
+        return rc;
     }
-
+    uct_ugni_device_lock(&iface->cdm);
     gni_rc = GNI_SmsgInit(ep->super.ep, local_attr, &remote_attr);
+    uct_ugni_device_unlock(&iface->cdm);
 
     if(GNI_RC_SUCCESS != gni_rc){
         ucs_error("Failed to initalize smsg. %s [%i]", gni_err_str[gni_rc], gni_rc);
         if(GNI_RC_INVALID_PARAM == gni_rc){
-            rc = UCS_ERR_INVALID_PARAM;
+            return UCS_ERR_INVALID_PARAM;
         } else {
-            rc = UCS_ERR_NO_MEMORY;
+            return UCS_ERR_NO_MEMORY;
         }
-        goto exit_lock;
     }
 
     ep_hash = (uint32_t)iface_addr->ep_hash;
-    gni_rc = GNI_EpSetEventData(ep->super.ep, iface->domain_id, ep_hash);
+    uct_ugni_device_lock(&iface->cdm);
+    gni_rc = GNI_EpSetEventData(ep->super.ep, iface->cdm.domain_id, ep_hash);
+    uct_ugni_device_unlock(&iface->cdm);
 
     if(GNI_RC_SUCCESS != gni_rc){
         ucs_error("Could not set GNI_EpSetEventData!");
     }
-
-
- exit_lock:
-    pthread_mutex_unlock(&uct_ugni_global_lock);
-
     return rc;
 }
 
@@ -205,21 +193,21 @@ uct_ugni_smsg_ep_am_common_send(uct_ugni_smsg_ep_t *ep, uct_ugni_smsg_iface_t *i
 {
     gni_return_t gni_rc;
 
-    if (ucs_unlikely(!uct_ugni_can_send(&ep->super))) {
+    if (ucs_unlikely(!uct_ugni_ep_can_send(&ep->super))) {
         goto exit_no_res;
     }
 
     desc->msg_id = iface->smsg_id++;
-    desc->ep = &ep->super;
-
+    desc->flush_group = ep->super.flush_group;
+    uct_ugni_device_lock(&iface->super.cdm);
     gni_rc = GNI_SmsgSendWTag(ep->super.ep, header, header_length, 
                               payload, payload_length, desc->msg_id, am_id);
-
+    uct_ugni_device_unlock(&iface->super.cdm);
     if(GNI_RC_SUCCESS != gni_rc){
         goto exit_no_res;
     }
 
-    ++ep->super.outstanding;
+    ++desc->flush_group->flush_comp.count;
     ++iface->super.outstanding;
 
     sglib_hashed_uct_ugni_smsg_desc_t_add(iface->smsg_list, desc);
@@ -227,8 +215,7 @@ uct_ugni_smsg_ep_am_common_send(uct_ugni_smsg_ep_t *ep, uct_ugni_smsg_iface_t *i
     return UCS_OK;
 
 exit_no_res:
-    ucs_trace("Can't send: arb_size = %u arb_sched = %u flush_flag = %u",
-              ep->super.arb_size, ep->super.arb_sched, ep->super.flush_flag);
+    ucs_trace("Smsg send failed.");
     ucs_mpool_put(desc);
     UCS_STATS_UPDATE_COUNTER(ep->super.super.stats, UCT_EP_STAT_NO_RES, 1);
     return UCS_ERR_NO_RESOURCE;
@@ -246,7 +233,7 @@ ucs_status_t uct_ugni_smsg_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t head
     ucs_status_t rc;
 
     UCT_CHECK_AM_ID(id);
-    UCT_CHECK_LENGTH(length, iface->config.smsg_seg_size -
+    UCT_CHECK_LENGTH(length, 0, iface->config.smsg_seg_size -
                      (sizeof(smsg_header) + sizeof(header)), "am_short");
 
     UCT_TL_IFACE_GET_TX_DESC(&iface->super.super, &iface->free_desc,
@@ -275,7 +262,7 @@ ucs_status_t uct_ugni_smsg_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t head
 
 ssize_t uct_ugni_smsg_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
                                   uct_pack_callback_t pack_cb,
-                                  void *arg)
+                                  void *arg, unsigned flags)
 {
     uct_ugni_smsg_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_ugni_smsg_iface_t);
     uct_ugni_smsg_ep_t *ep = ucs_derived_of(tl_ep, uct_ugni_smsg_ep_t);
@@ -299,6 +286,9 @@ ssize_t uct_ugni_smsg_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     packed = pack_cb(smsg_data, arg);
 
     smsg_header->length = packed;
+
+    UCT_CHECK_LENGTH(packed, 0, iface->config.smsg_seg_size -
+                     0, "am_bcopy");    
 
     uct_iface_trace_am(&iface->super.super, UCT_AM_TRACE_TYPE_SEND,
                        id, smsg_data, packed, "TX: AM_BCOPY");

@@ -32,22 +32,25 @@
 #define ucs_assert_always(_expression) \
     do { \
         if (!ucs_likely(_expression)) { \
-            __ucs_abort(__FILE__, __LINE__, __FUNCTION__, "Assertion `%s' failed", \
-                        #_expression); \
+            __ucs_abort("assertion failure", __FILE__, __LINE__, __FUNCTION__, \
+                        "Assertion `%s' failed", #_expression); \
         } \
     } while (0)
 
 #define ucs_assertv_always(_expression, _fmt, ...) \
     do { \
         if (!ucs_likely(_expression)) { \
-            __ucs_abort(__FILE__, __LINE__, __FUNCTION__, "Assertion `%s' failed: " _fmt, \
-                        #_expression, ## __VA_ARGS__); \
+            __ucs_abort("assertion failure", __FILE__, __LINE__, __FUNCTION__, \
+                        "Assertion `%s' failed: " _fmt, #_expression, \
+                        ## __VA_ARGS__); \
         } \
     } while (0)
 
 #if ENABLE_ASSERT
 
-#define ucs_bug(_message, ...)                  __ucs_abort(__FILE__, __LINE__, __FUNCTION__, "Bug: " _message, ## __VA_ARGS__)
+#define ucs_bug(_message, ...)                  __ucs_abort("bug", __FILE__, \
+                                                            __LINE__, __FUNCTION__, \
+                                                            "Bug: " _message, ## __VA_ARGS__)
 #define ucs_assert(_expression)                 ucs_assert_always(_expression)
 #define ucs_assertv(_expression, _fmt, ...)     ucs_assertv_always(_expression, _fmt, ## __VA_ARGS__)
 
@@ -61,7 +64,8 @@
 
 
 #define ucs_fatal(_message, ...) \
-    __ucs_abort(__FILE__, __LINE__, __FUNCTION__, "Fatal: " _message, ## __VA_ARGS__)
+    __ucs_abort("fatal error", __FILE__, __LINE__, __FUNCTION__, \
+                "Fatal: " _message, ## __VA_ARGS__)
 
 #define ucs_error(_message, ...)        ucs_log(UCS_LOG_LEVEL_ERROR, _message, ## __VA_ARGS__)
 #define ucs_warn(_message, ...)         ucs_log(UCS_LOG_LEVEL_WARN, _message,  ## __VA_ARGS__)
@@ -72,7 +76,28 @@
 #define ucs_trace_data(_message, ...)   ucs_log(UCS_LOG_LEVEL_TRACE_DATA, _message, ## __VA_ARGS__)
 #define ucs_trace_async(_message, ...)  ucs_log(UCS_LOG_LEVEL_TRACE_ASYNC, _message, ## __VA_ARGS__)
 #define ucs_trace_func(_message, ...)   ucs_log(UCS_LOG_LEVEL_TRACE_FUNC, "%s(" _message ")", __FUNCTION__, ## __VA_ARGS__)
-#define ucs_trace_poll(_message, ...)   ucs_log(UCS_LOG_LEVEL_TRACE_POLL, "%s(" _message ")", __FUNCTION__, ## __VA_ARGS__)
+#define ucs_trace_poll(_message, ...)   ucs_log(UCS_LOG_LEVEL_TRACE_POLL, _message, ## __VA_ARGS__)
+
+/**
+ * Print a message regardless of current log level. Output can be
+ * enabled/disabled via environment variable/configuration settings.
+ *
+ * During debugging it can be useful to add a few prints to the code
+ * without changing a current log level. Also it is useful to be able
+ * to see messages only from specific processes. For example, one may
+ * want to see prints only from rank 0 when debugging MPI.
+ *
+ * The function is intended for debugging only. It should not be used
+ * in the real code.
+ */
+
+#define ucs_print(_message, ...) \
+    do { \
+        if (ucs_global_opts.log_print_enable) { \
+            __ucs_log(__FILE__, __LINE__, __FUNCTION__, UCS_LOG_LEVEL_PRINT, \
+                      _message, ## __VA_ARGS__); \
+        } \
+    } while(0)
 
 
 typedef enum {
@@ -127,9 +152,9 @@ ucs_log_default_handler(const char *file, unsigned line, const char *function,
                         ucs_log_level_t level, const char *prefix, const char *message,
                         va_list ap);
 
-void __ucs_abort(const char *file, unsigned line, const char *function,
-                 const char *message, ...)
-    UCS_F_NORETURN UCS_F_PRINTF(4, 5);
+void __ucs_abort(const char *error_type, const char *file, unsigned line,
+                 const char *function, const char *message, ...)
+    UCS_F_NORETURN UCS_F_PRINTF(5, 6);
 
 void ucs_log_fatal_error(const char *fmt, ...);
 

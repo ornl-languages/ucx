@@ -9,6 +9,7 @@
 #include "cuda_ep.h"
 
 #include <ucs/type/class.h>
+#include <ucs/sys/string.h>
 
 
 static ucs_config_field_t uct_cuda_iface_config_table[] = {
@@ -48,6 +49,7 @@ static ucs_status_t uct_cuda_iface_query(uct_iface_h iface,
     iface_attr->iface_addr_len          = sizeof(int);
     iface_attr->device_addr_len         = 0;
     iface_attr->ep_addr_len             = 0;
+    iface_attr->max_conn_priv           = 0;
     iface_attr->cap.flags               = 0;
 
     iface_attr->cap.put.max_short       = 0;
@@ -74,7 +76,8 @@ static ucs_status_t uct_cuda_iface_query(uct_iface_h iface,
     iface_attr->cap.am.max_hdr          = 0;
     iface_attr->cap.am.max_iov          = 1;
 
-    iface_attr->latency                 = 1e-9;
+    iface_attr->latency.overhead        = 1e-9;
+    iface_attr->latency.growth          = 0;
     iface_attr->bandwidth               = 6911 * 1024.0 * 1024.0;
     iface_attr->overhead                = 0;
     iface_attr->priority                = 0;
@@ -83,15 +86,22 @@ static ucs_status_t uct_cuda_iface_query(uct_iface_h iface,
 }
 
 static uct_iface_ops_t uct_cuda_iface_ops = {
-    .iface_close         = UCS_CLASS_DELETE_FUNC_NAME(uct_cuda_iface_t),
-    .iface_get_address   = uct_cuda_iface_get_address,
+    .ep_put_short             = uct_cuda_ep_put_short,
+    .ep_am_short              = uct_cuda_ep_am_short,
+    .ep_flush                 = uct_base_ep_flush,
+    .ep_fence                 = uct_base_ep_fence,
+    .ep_create_connected      = UCS_CLASS_NEW_FUNC_NAME(uct_cuda_ep_t),
+    .ep_destroy               = UCS_CLASS_DELETE_FUNC_NAME(uct_cuda_ep_t),
+    .iface_flush              = uct_base_iface_flush,
+    .iface_fence              = uct_base_iface_fence,
+    .iface_progress_enable    = ucs_empty_function,
+    .iface_progress_disable   = ucs_empty_function,
+    .iface_progress           = ucs_empty_function_return_zero,
+    .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cuda_iface_t),
+    .iface_query              = uct_cuda_iface_query,
     .iface_get_device_address = (void*)ucs_empty_function_return_success,
-    .iface_query         = uct_cuda_iface_query,
-    .iface_is_reachable  = uct_cuda_iface_is_reachable,
-    .ep_create_connected = UCS_CLASS_NEW_FUNC_NAME(uct_cuda_ep_t),
-    .ep_destroy          = UCS_CLASS_DELETE_FUNC_NAME(uct_cuda_ep_t),
-    .ep_put_short        = uct_cuda_ep_put_short,
-    .ep_am_short         = uct_cuda_ep_am_short,
+    .iface_get_address        = uct_cuda_iface_get_address,
+    .iface_is_reachable       = uct_cuda_iface_is_reachable,
 };
 
 static UCS_CLASS_INIT_FUNC(uct_cuda_iface_t, uct_md_h md, uct_worker_h worker,
@@ -99,11 +109,11 @@ static UCS_CLASS_INIT_FUNC(uct_cuda_iface_t, uct_md_h md, uct_worker_h worker,
                            const uct_iface_config_t *tl_config)
 {
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cuda_iface_ops, md, worker,
-                              tl_config UCS_STATS_ARG(params->stats_root)
+                              params, tl_config UCS_STATS_ARG(params->stats_root)
                               UCS_STATS_ARG(UCT_CUDA_TL_NAME));
 
-    if (strcmp(params->dev_name, UCT_CUDA_DEV_NAME) != 0) {
-        ucs_error("No device was found: %s", params->dev_name);
+    if (strcmp(params->mode.device.dev_name, UCT_CUDA_DEV_NAME) != 0) {
+        ucs_error("No device was found: %s", params->mode.device.dev_name);
         return UCS_ERR_NO_DEVICE;
     }
 

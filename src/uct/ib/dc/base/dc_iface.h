@@ -14,6 +14,7 @@
 #define UCT_DC_IFACE_MAX_DCIS   16
 
 typedef struct uct_dc_ep     uct_dc_ep_t;
+typedef struct uct_dc_iface  uct_dc_iface_t;
 
 
 typedef struct uct_dc_iface_addr {
@@ -37,23 +38,49 @@ typedef struct uct_dc_iface_config {
 } uct_dc_iface_config_t;
 
 
+typedef enum {
+    UCT_DC_DCI_FLAG_EP_CANCELED         = UCS_BIT(0),
+    UCT_DC_DCI_FLAG_EP_DESTROYED        = UCS_BIT(1)
+} uct_dc_dci_state_t;
+
+
 typedef struct uct_dc_dci {
     uct_rc_txqp_t                 txqp; /* DCI qp */
     uct_dc_ep_t                   *ep;  /* points to an endpoint that currently
                                            owns the dci. Relevant only for dcs
                                            and dcs quota policies. */
+#if ENABLE_ASSERT
+    uint8_t                       flags; /* debug state, @ref uct_dc_dci_state_t */
+#endif
 } uct_dc_dci_t;
 
 
+typedef struct uct_dc_fc_sender_data {
+    uint64_t                      ep;
+    struct {
+        int                       is_global;
+        union ibv_gid             gid;
+    } UCS_S_PACKED global;
+} UCS_S_PACKED uct_dc_fc_sender_data_t;
+
 typedef struct uct_dc_fc_request {
     uct_rc_fc_request_t           super;
-    uintptr_t                     sender_ep;
+    uct_dc_fc_sender_data_t       sender;
     uint32_t                      dct_num;
+
+    /* Lid can be stored either in BE or in LE order. The endianess depends
+     * on the transport (BE for mlx5 and LE for dc verbs) */
     uint16_t                      lid;
 } uct_dc_fc_request_t;
 
 
-typedef struct uct_dc_iface {
+typedef struct uct_dc_iface_ops {
+    uct_rc_iface_ops_t            super;
+    ucs_status_t                  (*reset_dci)(uct_dc_iface_t *iface, int dci);
+} uct_dc_iface_ops_t;
+
+
+struct uct_dc_iface {
     uct_rc_iface_t                super;
     struct {
         uct_dc_dci_t              dcis[UCT_DC_IFACE_MAX_DCIS]; /* Array of dcis */
@@ -70,20 +97,26 @@ typedef struct uct_dc_iface {
 
         /* Used to send grant messages for all peers */
         uct_dc_ep_t               *fc_ep;
+
+        /* List of destroyed endpoints waiting for credit grant */
+        ucs_list_link_t           gc_list;
     } tx;
+
     struct {
         struct ibv_exp_dct        *dct;
     } rx;
-} uct_dc_iface_t;
+};
 
 
-UCS_CLASS_DECLARE(uct_dc_iface_t, uct_rc_iface_ops_t*, uct_md_h,
-                  uct_worker_h, const uct_iface_params_t*,
-                  unsigned, uct_dc_iface_config_t*)
+UCS_CLASS_DECLARE(uct_dc_iface_t, uct_dc_iface_ops_t*, uct_md_h,
+                  uct_worker_h, const uct_iface_params_t*, unsigned,
+                  uct_dc_iface_config_t*, unsigned, unsigned, int)
 
 extern ucs_config_field_t uct_dc_iface_config_table[];
 
-void uct_dc_iface_query(uct_dc_iface_t *iface, uct_iface_attr_t *iface_attr);
+ucs_status_t uct_dc_iface_create_dct(uct_dc_iface_t *iface);
+
+ucs_status_t uct_dc_iface_query(uct_dc_iface_t *iface, uct_iface_attr_t *iface_attr);
 
 ucs_status_t uct_dc_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *iface_addr);
 
@@ -104,7 +137,9 @@ ucs_status_t uct_dc_iface_fc_grant(uct_pending_req_t *self);
 
 ucs_status_t uct_dc_iface_fc_handler(uct_rc_iface_t *rc_iface, unsigned qp_num,
                                      uct_rc_hdr_t *hdr, unsigned length,
-                                     uint32_t imm_data, uint16_t lid, void *desc);
+                                     uint32_t imm_data, uint16_t lid, unsigned flags);
+
+void uct_dc_handle_failure(uct_ib_iface_t *ib_iface, uint32_t qp_num);
 
 /* TODO:
  * use a better seach algorithm (perfect hash, bsearch, hash) ???
@@ -114,10 +149,11 @@ ucs_status_t uct_dc_iface_fc_handler(uct_rc_iface_t *rc_iface, unsigned qp_num,
  */
 static inline uint8_t uct_dc_iface_dci_find(uct_dc_iface_t *iface, uint32_t qp_num)
 {
-    int i;
+    uct_dc_dci_t *dcis = iface->tx.dcis;
+    int i, ndci = iface->tx.ndci;
 
-    for (i = 0; i < iface->tx.ndci; i++) {
-        if (iface->tx.dcis[i].txqp.qp->qp_num == qp_num) {
+    for (i = 0; i < ndci; i++) {
+        if (dcis[i].txqp.qp->qp_num == qp_num) {
             return i;
         }
     }
@@ -156,7 +192,7 @@ static inline ucs_status_t uct_dc_iface_flush_dci(uct_dc_iface_t *iface, int dci
     if (!uct_dc_iface_dci_has_outstanding(iface, dci)) {
         return UCS_OK;
     }
-    ucs_trace_data("dci %d is not flushed %d/%d", dci,
+    ucs_trace_poll("dci %d is not flushed %d/%d", dci,
                    iface->tx.dcis[dci].txqp.available,
                    iface->super.config.tx_qp_len);
     ucs_assertv(uct_rc_txqp_unsignaled(&iface->tx.dcis[dci].txqp) == 0,

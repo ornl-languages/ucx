@@ -113,6 +113,17 @@
 #  define IBV_DEVICE_HAS_NOP(_attr)                 0
 #endif /* HAVE_DECL_IBV_EXP_WR_NOP */
 
+/*
+ * Adaptive Routing support
+ */
+#if HAVE_DECL_IBV_EXP_QP_OOO_RW_DATA_PLACEMENT
+#  define UCX_IB_DEV_IS_OOO_SUPPORTED(_attr, _transport)  \
+    (((_attr)->comp_mask & IBV_EXP_DEVICE_ATTR_OOO_CAPS) && \
+     ((_attr)->ooo_caps._transport##_caps & IBV_EXP_OOO_SUPPORT_RW_DATA_PLACEMENT))
+#else
+#  define UCX_IB_DEV_IS_OOO_SUPPORTED(_ibdev, _transport)   0
+#endif
+
 
 /*
  * Safe setenv
@@ -164,6 +175,28 @@ static inline int ibv_exp_cq_ignore_overrun(struct ibv_cq *cq)
 #  define IBV_PORT_IS_LINK_LAYER_ETHERNET(_attr)    ((_attr)->link_layer == IBV_LINK_LAYER_ETHERNET)
 #else
 #  define IBV_PORT_IS_LINK_LAYER_ETHERNET(_attr)    0
+#endif
+
+
+/*
+ * HW tag matching
+ */
+#if IBV_EXP_HW_TM
+   /* TM (eager) is supported if tm_caps.max_num_tags is not 0. */
+#  define IBV_DEVICE_TM_CAPS(_dev, _field)  ((_dev)->dev_attr.tm_caps._field)
+
+   /* If the gap between SW and HW counters is more than 32K, all messages will
+    * be dropped and RNR ACK will be returned. Set threshold to 16K to avoid
+    * hitting this gap at all. */
+#  define IBV_DEVICE_MAX_UNEXP_COUNT        UCS_BIT(14)
+#else
+#  define IBV_DEVICE_TM_CAPS(_dev, _field)  0
+#  define IBV_EXP_TM_CAP_RC                 0
+#endif
+
+
+#ifndef IBV_EXP_HW_TM_DC
+#  define IBV_EXP_TM_CAP_DC                 0
 #endif
 
 

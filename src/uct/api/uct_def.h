@@ -7,9 +7,11 @@
 #ifndef UCT_DEF_H_
 #define UCT_DEF_H_
 
-#include <ucs/sys/math.h>
 #include <ucs/type/status.h>
+
+#include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 
 #define UCT_TL_NAME_MAX          10
@@ -17,25 +19,12 @@
 #define UCT_MD_NAME_MAX          16
 #define UCT_DEVICE_NAME_MAX      32
 #define UCT_PENDING_REQ_PRIV_LEN 32
+#define UCT_TAG_PRIV_LEN         32
 #define UCT_AM_ID_BITS           5
 #define UCT_AM_ID_MAX            UCS_BIT(UCT_AM_ID_BITS)
-#define UCT_INVALID_MEM_HANDLE   NULL
+#define UCT_MEM_HANDLE_NULL      NULL
 #define UCT_INVALID_RKEY         ((uintptr_t)(-1))
 #define UCT_INLINE_API           static UCS_F_ALWAYS_INLINE
-
-
-/**
- * @ingroup UCT_RESOURCE
- * @brief  List of event types for interrupt notification.
- */
-enum uct_event_types {
-    UCP_EVENT_TX_COMPLETION = UCS_BIT(0),
-    UCP_EVENT_TX_RESOURCES  = UCS_BIT(1),
-    UCP_EVENT_RX_COMPLETION = UCS_BIT(2),
-    UCP_EVENT_RX_RESOURCES  = UCS_BIT(3),
-    UCP_EVENT_TX_ERROR      = UCS_BIT(4),
-    UCP_EVENT_RX_ERROR      = UCS_BIT(5),
-};
 
 
 /**
@@ -52,11 +41,34 @@ enum uct_am_trace_type {
 
 
 /**
+ * @ingroup UCT_RESOURCE
+ * @brief Flags for active message and tag-matching offload callbacks (callback's parameters).
+ */
+enum uct_cb_param_flags {
+
+    /**
+     * If this flag is enabled, then data is part of a descriptor which includes
+     * the user-defined rx_headroom, and the callback may return UCS_INPROGRESS
+     * and hold on to that descriptor. Otherwise, the data can't be used outside
+     * the callback. If needed, the data must be copied-out.
+     *
+       @verbatim
+       descriptor    data
+       |             |
+       +-------------+-------------------------+
+       | rx_headroom | payload                 |
+       +-------------+-------------------------+
+       @endverbatim
+     *
+     */
+    UCT_CB_PARAM_FLAG_DESC = UCS_BIT(0)
+};
+
+/**
  * @addtogroup UCT_RESOURCE
  * @{
  */
 typedef struct uct_iface         *uct_iface_h;
-typedef struct uct_wakeup        *uct_wakeup_h;
 typedef struct uct_iface_config  uct_iface_config_t;
 typedef struct uct_md_config     uct_md_config_t;
 typedef struct uct_ep            *uct_ep_h;
@@ -76,6 +88,9 @@ typedef enum uct_am_trace_type   uct_am_trace_type_t;
 typedef struct uct_device_addr   uct_device_addr_t;
 typedef struct uct_iface_addr    uct_iface_addr_t;
 typedef struct uct_ep_addr       uct_ep_addr_t;
+typedef struct uct_tag_context   uct_tag_context_t;
+typedef uint64_t                 uct_tag_t;  /* tag type - 64 bit */
+typedef int                      uct_worker_cb_id_t;
 /**
  * @}
  */
@@ -123,32 +138,30 @@ typedef struct uct_iov {
  * @ingroup UCT_AM
  * @brief Callback to process incoming active message
  *
- * When the callback is called, @a desc does not necessarily contain the payload.
- * In this case, @a data would not point inside @a desc, and user may want
- * copy the payload from @a data to @a desc before returning @ref UCS_INPROGRESS
- * (it's guaranteed @a desc has enough room to hold the payload).
+ * When the callback is called, @a flags indicates how @a data should be handled.
+ * If @a flags contain @ref UCT_CB_FLAG_DESC value, it means @a data is part of
+ * a descriptor which must be released later by @ref uct_iface_release_desc by
+ * the user if the callback returns @ref UCS_INPROGRESS.
  *
  * @param [in]  arg      User-defined argument.
- * @param [in]  data     Points to the received data.
+ * @param [in]  data     Points to the received data. This may be a part of
+ *                       a descriptor which may be released later.
  * @param [in]  length   Length of data.
- * @param [in]  desc     Points to the received descriptor, at the beginning of
- *                       the user-defined rx_headroom.
+ * @param [in]  flags    Mask with @ref uct_cb_param_flags
  *
  * @note This callback could be set and released
  *       by @ref uct_iface_set_am_handler function.
-
- * @warning If the user became the owner of the @a desc (by returning
- *          @ref UCS_INPROGRESS) the descriptor must be released later by
- *          @ref uct_iface_release_am_desc by the user.
  *
  * @retval UCS_OK         - descriptor was consumed, and can be released
  *                          by the caller.
  * @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be
- *                          released later.
+ *                          released later. Supported only if @a flags contain
+ *                          @ref UCT_CB_FLAG_DESC value. Otherwise, this is
+ *                          an error.
  *
  */
 typedef ucs_status_t (*uct_am_callback_t)(void *arg, void *data, size_t length,
-                                          void *desc);
+                                          unsigned flags);
 
 
 /**
@@ -198,6 +211,21 @@ typedef void (*uct_completion_callback_t)(uct_completion_t *self,
  */
 typedef ucs_status_t (*uct_pending_callback_t)(uct_pending_req_t *self);
 
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback to process peer failure.
+ *
+ * @param [in]  arg      User argument to be passed to the callback.
+ * @param [in]  ep       Endpoint which has failed. Upon return from the callback,
+ *                       this @a ep is no longer usable and all subsequent
+ *                       operations on this @a ep will fail with the error code
+ *                       passed in @a status.
+ * @param [in]  status   Status indicating error.
+ */
+typedef void (*uct_error_handler_t)(void *arg, uct_ep_h ep, ucs_status_t status);
+
+
 /**
  * @ingroup UCT_RESOURCE
  * @brief Callback to purge pending requests.
@@ -232,6 +260,152 @@ typedef size_t (*uct_pack_callback_t)(void *dest, void *arg);
  * @note The arguments for this callback are in the same order as libc's memcpy().
  */
 typedef void (*uct_unpack_callback_t)(void *arg, const void *data, size_t length);
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback to process an incoming connection request message on the server
+ *        side.
+ *
+ * This callback routine will be invoked on the server side upon receiving an
+ * incoming connection request. It should be set by the server side while
+ * initializing an interface.
+ * Incoming data is placed inside the conn_priv_data buffer and outgoing data should
+ * be filled inside this function and placed in the reply_priv_data.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is allowed to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  arg              User defined argument for this callback.
+ * @param [in]  conn_priv_data   Points to the received data.
+ *                               This is the private data that was passed to the
+ *                               @ref uct_ep_create_sockaddr function on the
+ *                               client side.
+ * @param [in]  length           Length of the received data.
+ * @param [out] reply_priv_data  Points to the user's data which was written in
+ *                               this callback. It will be passed to reply_data
+ *                               on client side upon invoking the @ref
+ *                               uct_sockaddr_conn_reply_callback_t callback.
+ *
+ * @return  Size of the data that was written. Negative in case of an error.
+ *
+ */
+typedef ssize_t (*uct_sockaddr_conn_request_callback_t)(void *arg,
+                                                        const void *conn_priv_data,
+                                                        size_t length,
+                                                        void *reply_priv_data);
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback to process an incoming reply message from the server.
+ *
+ * This callback routine will be invoked on the client side upon receiving a
+ * reply message from the server side. It should be set by the client side while
+ * creating an endpoint to the remote server.
+ * Incoming reply data, which was filled by the server @ref
+ * uct_sockaddr_conn_request_callback_t callback, is placed inside the
+ * reply_data buffer.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is allowed to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  arg         User defined argument for this callback.
+ * @param [in]  reply_data  Points to the received reply data from server side.
+ * @param [in]  length      Length of the received data.
+ *
+ */
+typedef void (*uct_sockaddr_conn_reply_callback_t)(void *arg, const void *reply_data,
+                                                   size_t length);
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback to process an incoming 'ready' message from the client.
+ *
+ * This callback routine will be invoked on the server side upon receiving a
+ * message from the client indicating that the connection is ready.
+ * It should be set by the server side while initializing an interface.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is allowed to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  arg         User defined argument for this callback.
+ *
+ */
+typedef void (*uct_sockaddr_conn_ready_callback_t)(void *arg);
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Callback to process unexpected eager tagged message.
+ *
+ * This callback is invoked when tagged message sent by eager protocol has
+ * arrived and no corresponding tag has been posted.
+ *
+ * @note The callback is always invoked from the context (thread, process)
+ *       that called @a uct_iface_progress().
+ *
+ * @note It is allowed to call other communication routines from the callback.
+ *
+ * @param [in]  arg     User-defined argument
+ * @param [in]  data    Points to the received unexpected data.
+ * @param [in]  length  Length of data.
+ * @param [in]  desc    Points to the received descriptor, at the beginning of
+ *                      the user-defined rx_headroom.
+ * @param [in]  stag    Tag from sender.
+ * @param [in]  imm     Immediate data from sender.
+ *
+ * @warning If the user became the owner of the @a desc (by returning
+ *          @ref UCS_INPROGRESS) the descriptor must be released later by
+ *          @ref uct_iface_release_desc by the user.
+ *
+ * @retval UCS_OK         - descriptor was consumed, and can be released
+ *                          by the caller.
+ * @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be
+ *                          released later.
+ */
+typedef ucs_status_t (*uct_tag_unexp_eager_cb_t)(void *arg, void *data,
+                                                 size_t length, unsigned flags,
+                                                 uct_tag_t stag, uint64_t imm);
+
+
+/**
+ * @ingroup UCT_TAG
+ * @brief Callback to process unexpected rendezvous tagged message.
+ *
+ * This callback is invoked when rendezvous send notification has arrived
+ * and no corresponding tag has been posted.
+ *
+ * @note The callback is always invoked from the context (thread, process)
+ *       that called @a uct_iface_progress().
+ *
+ * @note It is allowed to call other communication routines from the callback.
+ *
+ * @param [in]  arg           User-defined argument
+ * @param [in]  flags         Mask with @ref uct_cb_param_flags
+ * @param [in]  stag          Tag from sender.
+ * @param [in]  header        User defined header.
+ * @param [in]  header_length User defined header length in bytes.
+ * @param [in]  remote_addr   Sender's buffer virtual address.
+ * @param [in]  length        Sender's buffer length.
+ * @param [in]  rkey_buf      Sender's buffer packed remote key. It can be
+ *                            passed to uct_rkey_unpack() to create uct_rkey_t.
+ *
+ * @warning If the user became the owner of the @a desc (by returning
+ *          @ref UCS_INPROGRESS) the descriptor must be released later by
+ *          @ref uct_iface_release_desc by the user.
+ *
+ * @retval UCS_OK         - descriptor was consumed, and can be released
+ *                          by the caller.
+ * @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be
+ *                          released later.
+ */
+typedef ucs_status_t (*uct_tag_unexp_rndv_cb_t)(void *arg, unsigned flags,
+                                                uint64_t stag, const void *header,
+                                                unsigned header_length,
+                                                uint64_t remote_addr, size_t length,
+                                                const void *rkey_buf);
 
 
 #endif

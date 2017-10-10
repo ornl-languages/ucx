@@ -8,6 +8,7 @@
 #include "uct_md.h"
 
 #include <ucs/arch/cpu.h>
+#include <ucs/debug/profile.h>
 
 
 typedef struct {
@@ -24,6 +25,7 @@ typedef struct {
 
 
 const char *uct_alloc_method_names[] = {
+    [UCT_ALLOC_METHOD_THP]  = "thp",
     [UCT_ALLOC_METHOD_MD]   = "md",
     [UCT_ALLOC_METHOD_HEAP] = "heap",
     [UCT_ALLOC_METHOD_MMAP] = "mmap",
@@ -32,8 +34,24 @@ const char *uct_alloc_method_names[] = {
 };
 
 
-ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t *methods,
-                           unsigned num_methods, uct_md_h *mds, unsigned num_mds,
+static inline int uct_mem_get_mmap_flags(unsigned uct_mmap_flags)
+{
+    int mm_flags = 0;
+
+    if (uct_mmap_flags & UCT_MD_MEM_FLAG_NONBLOCK) {
+        mm_flags |= MAP_NONBLOCK;
+    }
+
+    if (uct_mmap_flags & UCT_MD_MEM_FLAG_FIXED) {
+        mm_flags |= MAP_FIXED;
+    }
+
+    return mm_flags;
+}
+
+ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
+                           uct_alloc_method_t *methods, unsigned num_methods,
+                           uct_md_h *mds, unsigned num_mds,
                            const char *alloc_name, uct_allocated_memory_t *mem)
 {
     uct_alloc_method_t *method;
@@ -56,6 +74,12 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
         return UCS_ERR_INVALID_PARAM;
     }
 
+    if ((flags & UCT_MD_MEM_FLAG_FIXED) &&
+        (!addr || ((uintptr_t)addr % ucs_get_page_size()))) {
+        ucs_debug("UCT_MD_MEM_FLAG_FIXED requires valid page size aligned address");
+        return UCS_ERR_INVALID_PARAM;
+    }
+
     for (method = methods; method < methods + num_methods; ++method) {
         ucs_debug("trying allocation method %s", uct_alloc_method_names[*method]);
 
@@ -75,12 +99,20 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
                     continue;
                 }
 
+                /* Check if MD supports allocation with fixed address
+                 * if it's requested */
+                if ((flags & UCT_MD_MEM_FLAG_FIXED) &&
+                    !(md_attr.cap.flags & UCT_MD_FLAG_FIXED)) {
+                    continue;
+                }
+
                 /* Allocate memory using the MD.
                  * If the allocation fails, it's considered an error and we don't
                  * fall-back, because this MD already exposed support for memory
                  * allocation.
                  */
                 alloc_length = min_length;
+                address = addr;
                 status = uct_md_mem_alloc(md, &alloc_length, &address, flags,
                                           alloc_name, &memh);
                 if (status != UCS_OK) {
@@ -90,7 +122,7 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
                     return status;
                 }
 
-                ucs_assert(memh != UCT_INVALID_MEM_HANDLE);
+                ucs_assert(memh != UCT_MEM_HANDLE_NULL);
                 mem->md   = md;
                 mem->memh = memh;
                 goto allocated;
@@ -98,8 +130,45 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
             }
             break;
 
+        case UCT_ALLOC_METHOD_THP:
+#ifdef MADV_HUGEPAGE
+            if (!ucs_is_thp_enabled()) {
+                break;
+            }
+
+            /* Fixed option is not supported for thp allocation*/
+            if (flags & UCT_MD_MEM_FLAG_FIXED) {
+                break;
+            }
+
+            alloc_length = ucs_align_up(min_length, ucs_get_huge_page_size());
+            address = ucs_memalign(ucs_get_huge_page_size(), alloc_length
+                                   UCS_MEMTRACK_VAL);
+            if (address != NULL) {
+                status = madvise(address, alloc_length, MADV_HUGEPAGE);
+                if (status != UCS_OK) {
+                    ucs_error("madvise failure status (%d) address(%p) len(%zu):"
+                              " %m", status, address, alloc_length);
+                    ucs_free(address);
+                    break;
+                } else {
+                    goto allocated_without_md;
+                }
+            }
+
+            ucs_debug("failed to allocate by thp %zu bytes: %m", alloc_length);
+#endif
+
+            break;
+
         case UCT_ALLOC_METHOD_HEAP:
             /* Allocate aligned memory using libc allocator */
+
+            /* Fixed option is not supported for heap allocation*/
+            if (flags & UCT_MD_MEM_FLAG_FIXED) {
+                break;
+            }
+
             alloc_length = min_length;
             address = ucs_memalign(UCS_SYS_CACHE_LINE_SIZE, alloc_length
                                    UCS_MEMTRACK_VAL);
@@ -112,19 +181,24 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
 
         case UCT_ALLOC_METHOD_MMAP:
             /* Request memory from operating system using mmap() */
-            alloc_length = ucs_align_up_pow2(min_length, ucs_get_page_size());
-            address = ucs_mmap(NULL, alloc_length, PROT_READ|PROT_WRITE,
-                               MAP_PRIVATE|MAP_ANON, -1, 0 UCS_MEMTRACK_VAL);
-            if (address != MAP_FAILED) {
+            alloc_length = min_length;
+            address      = addr;
+
+            status = ucs_mmap_alloc(&alloc_length, &address,
+                                    uct_mem_get_mmap_flags(flags)
+                                    UCS_MEMTRACK_VAL);
+            if (status== UCS_OK) {
                 goto allocated_without_md;
             }
 
-            ucs_debug("failed to mmap %zu bytes: %m", alloc_length);
+            ucs_debug("failed to mmap %zu bytes: %s", min_length,
+                      ucs_status_string(status));
             break;
 
         case UCT_ALLOC_METHOD_HUGE:
             /* Allocate huge pages */
             alloc_length = min_length;
+            address = (flags & UCT_MD_MEM_FLAG_FIXED) ? addr : NULL;
             status = ucs_sysv_alloc(&alloc_length, &address, SHM_HUGETLB, &shmid
                                     UCS_MEMTRACK_VAL);
             if (status == UCS_OK) {
@@ -146,7 +220,7 @@ ucs_status_t uct_mem_alloc(size_t min_length, unsigned flags, uct_alloc_method_t
 
 allocated_without_md:
     mem->md      = NULL;
-    mem->memh    = UCT_INVALID_MEM_HANDLE;
+    mem->memh    = UCT_MEM_HANDLE_NULL;
 allocated:
     ucs_debug("allocated %zu bytes at %p using %s", alloc_length, address,
               (mem->md == NULL) ? uct_alloc_method_names[*method]
@@ -159,24 +233,17 @@ allocated:
 
 ucs_status_t uct_mem_free(const uct_allocated_memory_t *mem)
 {
-    int ret;
-
     switch (mem->method) {
     case UCT_ALLOC_METHOD_MD:
         return uct_md_mem_free(mem->md, mem->memh);
 
+    case UCT_ALLOC_METHOD_THP:
     case UCT_ALLOC_METHOD_HEAP:
         ucs_free(mem->address);
         return UCS_OK;
 
     case UCT_ALLOC_METHOD_MMAP:
-        ret = ucs_munmap(mem->address, mem->length);
-        if (ret != 0) {
-            ucs_warn("munmap(address=%p, length=%zu) failed: %m", mem->address,
-                     mem->length);
-            return UCS_ERR_INVALID_PARAM;
-        }
-        return UCS_OK;
+        return ucs_mmap_free(mem->address, mem->length);
 
     case UCT_ALLOC_METHOD_HUGE:
         return ucs_sysv_free(mem->address);
@@ -194,7 +261,8 @@ ucs_status_t uct_iface_mem_alloc(uct_iface_h tl_iface, size_t length, unsigned f
     uct_md_attr_t md_attr;
     ucs_status_t status;
 
-    status = uct_mem_alloc(length, 0, iface->config.alloc_methods,
+    status = uct_mem_alloc(NULL, length, UCT_MD_MEM_ACCESS_ALL,
+                           iface->config.alloc_methods,
                            iface->config.num_alloc_methods, &iface->md, 1,
                            name, mem);
     if (status != UCS_OK) {
@@ -217,9 +285,9 @@ ucs_status_t uct_iface_mem_alloc(uct_iface_h tl_iface, size_t length, unsigned f
                 goto err_free;
             }
 
-            ucs_assert(mem->memh != UCT_INVALID_MEM_HANDLE);
+            ucs_assert(mem->memh != UCT_MEM_HANDLE_NULL);
         } else {
-            mem->memh = UCT_INVALID_MEM_HANDLE;
+            mem->memh = UCT_MEM_HANDLE_NULL;
         }
 
         mem->md = iface->md;
@@ -236,9 +304,9 @@ err:
 void uct_iface_mem_free(const uct_allocated_memory_t *mem)
 {
     if ((mem->method != UCT_ALLOC_METHOD_MD) &&
-        (mem->memh != UCT_INVALID_MEM_HANDLE))
+        (mem->memh != UCT_MEM_HANDLE_NULL))
     {
-        uct_md_mem_dereg(mem->md, mem->memh);
+        (void)uct_md_mem_dereg(mem->md, mem->memh);
     }
     uct_mem_free(mem);
 }
@@ -248,8 +316,8 @@ static inline uct_iface_mp_priv_t* uct_iface_mp_priv(ucs_mpool_t *mp)
     return (uct_iface_mp_priv_t*)ucs_mpool_priv(mp);
 }
 
-static ucs_status_t uct_iface_mp_chunk_alloc(ucs_mpool_t *mp, size_t *size_p,
-                                             void **chunk_p)
+UCS_PROFILE_FUNC(ucs_status_t, uct_iface_mp_chunk_alloc, (mp, size_p, chunk_p),
+                 ucs_mpool_t *mp, size_t *size_p, void **chunk_p)
 {
     uct_base_iface_t *iface = uct_iface_mp_priv(mp)->iface;
     uct_iface_mp_chunk_hdr_t *hdr;
@@ -258,13 +326,14 @@ static ucs_status_t uct_iface_mp_chunk_alloc(ucs_mpool_t *mp, size_t *size_p,
     size_t length;
 
     length = sizeof(*hdr) + *size_p;
-    status = uct_iface_mem_alloc(&iface->super, length, 0, ucs_mpool_name(mp),
+    status = uct_iface_mem_alloc(&iface->super, length,
+                                 UCT_MD_MEM_ACCESS_ALL, ucs_mpool_name(mp),
                                  &mem);
     if (status != UCS_OK) {
         return status;
     }
 
-    ucs_assert(mem.memh != UCT_INVALID_MEM_HANDLE);
+    ucs_assert(mem.memh != UCT_MEM_HANDLE_NULL);
     ucs_assert(mem.md == iface->md);
 
     hdr         = mem.address;
@@ -276,7 +345,8 @@ static ucs_status_t uct_iface_mp_chunk_alloc(ucs_mpool_t *mp, size_t *size_p,
     return UCS_OK;
 }
 
-static void uct_iface_mp_chunk_release(ucs_mpool_t *mp, void *chunk)
+UCS_PROFILE_FUNC_VOID(uct_iface_mp_chunk_release, (mp, chunk),
+                      ucs_mpool_t *mp, void *chunk)
 {
     uct_base_iface_t *iface = uct_iface_mp_priv(mp)->iface;
     uct_iface_mp_chunk_hdr_t *hdr;
@@ -335,4 +405,3 @@ ucs_status_t uct_iface_mpool_init(uct_base_iface_t *iface, ucs_mpool_t *mp,
     uct_iface_mp_priv(mp)->init_obj_cb = init_obj_cb;
     return UCS_OK;
 }
-

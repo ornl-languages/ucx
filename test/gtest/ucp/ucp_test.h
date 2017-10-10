@@ -9,6 +9,12 @@
 extern "C" {
 #include <ucp/api/ucp.h>
 #include <ucs/time/time.h>
+
+/* ucp version compile time test */
+#if (UCP_API_VERSION != UCP_VERSION(UCP_API_MAJOR,UCP_API_MINOR))
+#error possible bug in UCP version
+#endif
+
 }
 #include <common/test.h>
 
@@ -16,7 +22,6 @@ extern "C" {
 
 struct ucp_test_param {
     ucp_params_t              ctx_params;
-    ucp_worker_params_t       worker_params;
     std::vector<std::string>  transports;
     int                       variant;
     int                       thread_type;
@@ -31,43 +36,49 @@ public:
     };
 
     class entity {
+        typedef std::vector<ucs::handle<ucp_ep_h, entity *> > ep_vec_t;
+        typedef std::vector<std::pair<ucs::handle<ucp_worker_h>,
+                                      ep_vec_t> > worker_vec_t;
+
     public:
-        entity(const ucp_test_param& test_param, ucp_config_t* ucp_config);
+        entity(const ucp_test_param& test_param, ucp_config_t* ucp_config,
+               const ucp_worker_params_t& worker_params);
 
         ~entity();
 
-        void connect(const entity* other);
+        void connect(const entity* other, const ucp_ep_params_t& ep_params,
+                     int ep_idx = 0);
 
-        void flush_ep(int ep_index = 0) const;
+        void flush_ep(int worker_index = 0, int ep_index = 0) const;
 
         void flush_worker(int worker_index = 0) const;
 
         void fence(int worker_index = 0) const;
 
-        void disconnect(int ep_index = 0);
+        void disconnect(int worker_index = 0, int ep_index = 0);
 
-        void* disconnect_nb(int ep_index = 0) const;
+        void* disconnect_nb(int worker_index = 0, int ep_index = 0) const;
 
         void destroy_worker(int worker_index = 0);
 
-        ucp_ep_h ep(int ep_index = 0) const;
+        ucp_ep_h ep(int worker_index = 0, int ep_index = 0) const;
 
-        ucp_ep_h revoke_ep(int ep_index = 0) const;
+        ucp_ep_h revoke_ep(int worker_index = 0, int ep_index = 0) const;
 
         ucp_worker_h worker(int worker_index = 0) const;
 
         ucp_context_h ucph() const;
 
-        void progress(int worker_index = 0);
+        unsigned progress(int worker_index = 0);
 
         int get_num_workers() const;
 
         void cleanup();
 
+        static void ep_destructor(ucp_ep_h ep, entity *e);
     protected:
         ucs::handle<ucp_context_h> m_ucph;
-        std::vector<ucs::handle<ucp_worker_h> >  m_workers;
-        std::vector<ucs::handle<ucp_ep_h> >      m_eps;
+        worker_vec_t               m_workers;
 
         int num_workers;
     };
@@ -96,17 +107,16 @@ public:
 
     static std::vector<ucp_test_param>
     enum_test_params(const ucp_params_t& ctx_params,
-                     const ucp_worker_params_t& worker_params,
                      const std::string& name,
                      const std::string& test_case_name,
                      const std::string& tls);
 
     static ucp_params_t get_ctx_params();
-    static ucp_worker_params_t get_worker_params();
+    virtual ucp_worker_params_t get_worker_params();
+    virtual ucp_ep_params_t get_ep_params();
 
     static void
     generate_test_params_variant(const ucp_params_t& ctx_params,
-                                 const ucp_worker_params_t& worker_params,
                                  const std::string& name,
                                  const std::string& test_case_name,
                                  const std::string& tls,
@@ -114,22 +124,30 @@ public:
                                  std::vector<ucp_test_param>& test_params,
                                  int thread_type = SINGLE_THREAD);
 
-    virtual void modify_config(const std::string& name, const std::string& value);
+    virtual void modify_config(const std::string& name, const std::string& value,
+                               bool optional = false);
     void stats_activate();
     void stats_restore();
 
 protected:
     virtual void init();
+    bool is_self() const;
     virtual void cleanup();
     entity* create_entity(bool add_in_front = false);
 
-    void progress(int worker_index = 0) const;
+    unsigned progress(int worker_index = 0) const;
     void short_progress_loop(int worker_index = 0) const;
-    void wait_for_flag(volatile size_t *flag, double timeout = 10.0);
     void disconnect(const entity& entity);
     void wait(void *req, int worker_index = 0);
-    static void disable_errors();
-    static void restore_errors();
+    void set_ucp_config(ucp_config_t *config);
+
+    template <typename T>
+    void wait_for_flag(volatile T *flag, double timeout = 10.0) {
+        ucs_time_t loop_end_limit = ucs_get_time() + ucs_time_from_sec(timeout);
+        while ((ucs_get_time() < loop_end_limit) && (!(*flag))) {
+            short_progress_loop();
+        }
+    }
 
 private:
     static void set_ucp_config(ucp_config_t *config,
@@ -137,12 +155,6 @@ private:
     static bool check_test_param(const std::string& name,
                                  const std::string& test_case_name,
                                  const ucp_test_param& test_param);
-    static ucs_log_func_rc_t empty_log_handler(const char *file, unsigned line,
-                                               const char *function, ucs_log_level_t level,
-                                               const char *prefix, const char *message,
-                                               va_list ap);
-
-    static std::string m_last_err_msg;
 };
 
 
@@ -159,7 +171,6 @@ std::ostream& operator<<(std::ostream& os, const ucp_test_param& test_param);
 #define UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, _name, _tls) \
     INSTANTIATE_TEST_CASE_P(_name,  _test_case, \
                             testing::ValuesIn(_test_case::enum_test_params(_test_case::get_ctx_params(), \
-                                                                           _test_case::get_worker_params(), \
                                                                            #_name, \
                                                                            #_test_case, \
                                                                            _tls)));

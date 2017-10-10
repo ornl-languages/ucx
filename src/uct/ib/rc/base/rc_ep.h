@@ -10,7 +10,10 @@
 #include "rc_iface.h"
 
 #include <uct/api/uct.h>
-#include <uct/ib/base/ib_instr.h>
+#include <ucs/debug/debug.h>
+
+
+#define RC_UNSIGNALED_INF UINT16_MAX
 
 
 enum {
@@ -74,19 +77,36 @@ enum {
 /*
  * Check for send resources
  */
-#define UCT_RC_CHECK_CQE(_iface, _ep) \
-    if (!uct_rc_iface_have_tx_cqe_avail(_iface)) { \
-        UCS_STATS_UPDATE_COUNTER((_iface)->stats, UCT_RC_IFACE_STAT_NO_CQE, 1); \
-        UCS_STATS_UPDATE_COUNTER((_ep)->super.stats, UCT_EP_STAT_NO_RES, 1); \
-        return UCS_ERR_NO_RESOURCE; \
+#define UCT_RC_CHECK_CQE_RET(_iface, _ep, _txqp, _ret) \
+    /* tx_moderation == 0 for TLs which don't support it */ \
+    if (ucs_unlikely((_iface)->tx.cq_available <= \
+        (signed)(_iface)->config.tx_moderation)) { \
+        if (!uct_rc_iface_have_tx_cqe_avail(_iface)) { \
+            UCS_STATS_UPDATE_COUNTER((_iface)->stats, UCT_RC_IFACE_STAT_NO_CQE, 1); \
+            UCS_STATS_UPDATE_COUNTER((_ep)->super.stats, UCT_EP_STAT_NO_RES, 1); \
+            return _ret; \
+        } \
+        /* if unsignaled == RC_UNSIGNALED_INF this value was already saved and \
+           next operation will be defenitly signaled */ \
+        if ((_txqp)->unsignaled != RC_UNSIGNALED_INF) { \
+            (_txqp)->unsignaled_store_count++; \
+            (_txqp)->unsignaled_store += (_txqp)->unsignaled; \
+            (_txqp)->unsignaled        = RC_UNSIGNALED_INF; \
+        } \
     }
 
-#define UCT_RC_CHECK_TXQP(_iface, _ep, _txqp) \
+#define UCT_RC_CHECK_TXQP_RET(_iface, _ep, _txqp, _ret) \
     if (uct_rc_txqp_available(_txqp) <= 0) { \
         UCS_STATS_UPDATE_COUNTER((_txqp)->stats, UCT_RC_TXQP_STAT_QP_FULL, 1); \
         UCS_STATS_UPDATE_COUNTER((_ep)->super.stats, UCT_EP_STAT_NO_RES, 1); \
-        return UCS_ERR_NO_RESOURCE; \
+        return _ret; \
     }
+
+#define UCT_RC_CHECK_CQE(_iface, _ep, _txqp) \
+    UCT_RC_CHECK_CQE_RET(_iface, _ep, _txqp, UCS_ERR_NO_RESOURCE)
+
+#define UCT_RC_CHECK_TXQP(_iface, _ep, _txqp) \
+    UCT_RC_CHECK_TXQP_RET(_iface, _ep, _txqp, UCS_ERR_NO_RESOURCE) \
 
 /*
  * check for FC credits and add FC protocol bits (if any)
@@ -140,17 +160,27 @@ enum {
     }
 
 #define UCT_RC_CHECK_RES(_iface, _ep) \
-    UCT_RC_CHECK_CQE(_iface, (_ep)) \
+    UCT_RC_CHECK_CQE(_iface, (_ep), &(_ep)->txqp) \
     UCT_RC_CHECK_TXQP(_iface, (_ep), &(_ep)->txqp);
 
+
 /* this is a common type for all rc and dc transports */
-typedef struct uct_rc_txqp {
+struct uct_rc_txqp {
     struct ibv_qp       *qp;
     ucs_queue_head_t    outstanding;
+    /* RC_UNSIGNALED_INF value forces signaled in moderation logic when
+     * CQ credits are close to zero (less tx_moderation value) */
     uint16_t            unsignaled;
+    /* Saved unsignaled value before it was set to inf to have possibility
+     * to return correct amount of CQ credits on TX completion */
+    uint16_t            unsignaled_store;
+    /* If unsignaled was stored several times to aggregative value, let's return
+     * credits only when this counter == 0 because it's impossible to return
+     * exact value on each signaled completion */
+    uint16_t            unsignaled_store_count;
     int16_t             available;
     UCS_STATS_NODE_DECLARE(stats);
-} uct_rc_txqp_t;
+};
 
 typedef struct uct_rc_fc {
     /* Not more than fc_wnd active messages can be sent w/o acknowledgment */
@@ -185,7 +215,7 @@ ucs_status_t uct_rc_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr);
 ucs_status_t uct_rc_ep_connect_to_ep(uct_ep_h tl_ep, const uct_device_addr_t *dev_addr,
                                      const uct_ep_addr_t *ep_addr);
 
-void uct_rc_ep_reset_qp(uct_rc_ep_t *ep);
+ucs_status_t uct_rc_modify_qp(uct_rc_txqp_t *txqp, enum ibv_qp_state state);
 
 void uct_rc_ep_am_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
                               void *data, size_t length, size_t valid_length,
@@ -196,7 +226,7 @@ void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp);
 void uct_rc_ep_get_bcopy_handler_no_completion(uct_rc_iface_send_op_t *op,
                                                const void *resp);
 
-void uct_rc_ep_send_completion_proxy_handler(uct_rc_iface_send_op_t *op,
+void uct_rc_ep_send_op_completion_handler(uct_rc_iface_send_op_t *op,
                                              const void *resp);
 
 ucs_status_t uct_rc_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n);
@@ -216,6 +246,9 @@ ucs_status_t uct_rc_ep_fc_grant(uct_pending_req_t *self);
 
 void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
                                    int is_log);
+
+ucs_status_t uct_rc_ep_flush(uct_rc_ep_t *ep, int16_t max_available,
+                             unsigned flags);
 
 void UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC_NAME(32, 0)(uct_rc_iface_send_op_t *op,
                                                    const void *resp);
@@ -271,13 +304,16 @@ uct_rc_txqp_add_send_op(uct_rc_txqp_t *txqp, uct_rc_iface_send_op_t *op)
      * than completion zero-based index).
      */
     ucs_assert(op != NULL);
+    ucs_assertv(!(op->flags & UCT_RC_IFACE_SEND_OP_FLAG_INUSE), "op=%p", op);
+    op->flags |= UCT_RC_IFACE_SEND_OP_FLAG_INUSE;
     ucs_queue_push(&txqp->outstanding, &op->queue);
-    UCT_IB_INSTRUMENT_RECORD_SEND_OP(op);
 }
 
 static UCS_F_ALWAYS_INLINE void
 uct_rc_txqp_add_send_op_sn(uct_rc_txqp_t *txqp, uct_rc_iface_send_op_t *op, uint16_t sn)
 {
+    ucs_trace_poll("txqp %p add send op %p sn %d handler %s", txqp, op, sn,
+                   ucs_debug_get_symbol_name((void*)op->handler));
     op->sn = sn;
     uct_rc_txqp_add_send_op(txqp, op);
 }
@@ -293,33 +329,42 @@ uct_rc_txqp_add_send_comp(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
     }
 
     op            = uct_rc_iface_get_send_op(iface);
-    op->handler   = uct_rc_ep_send_completion_proxy_handler;
     op->user_comp = comp;
     uct_rc_txqp_add_send_op_sn(txqp, op, sn);
 }
 
-static inline void
+static UCS_F_ALWAYS_INLINE void
+uct_rc_txqp_completion_op(uct_rc_iface_send_op_t *op, const void *resp)
+{
+    ucs_trace_poll("complete op %p sn %d handler %s", op, op->sn,
+                   ucs_debug_get_symbol_name((void*)op->handler));
+    ucs_assert(op->flags & UCT_RC_IFACE_SEND_OP_FLAG_INUSE);
+    op->flags &= ~UCT_RC_IFACE_SEND_OP_FLAG_INUSE;
+    op->handler(op, resp);
+}
+
+static UCS_F_ALWAYS_INLINE void
 uct_rc_txqp_completion_desc(uct_rc_txqp_t *txqp, uint16_t sn)
 {
     uct_rc_iface_send_op_t *op;
 
+    ucs_trace_poll("txqp %p complete ops up to sn %d", txqp, sn);
     ucs_queue_for_each_extract(op, &txqp->outstanding, queue,
                                UCS_CIRCULAR_COMPARE16(op->sn, <=, sn)) {
-        op->handler(op, ucs_derived_of(op, uct_rc_iface_send_desc_t) + 1);
+        uct_rc_txqp_completion_op(op, ucs_derived_of(op, uct_rc_iface_send_desc_t) + 1);
     }
-    UCT_IB_INSTRUMENT_RECORD_SEND_OP(op);
 }
 
-static inline void
+static UCS_F_ALWAYS_INLINE void
 uct_rc_txqp_completion_inl_resp(uct_rc_txqp_t *txqp, const void *resp, uint16_t sn)
 {
     uct_rc_iface_send_op_t *op;
 
+    ucs_trace_poll("txqp %p complete ops up to sn %d", txqp, sn);
     ucs_queue_for_each_extract(op, &txqp->outstanding, queue,
                                UCS_CIRCULAR_COMPARE16(op->sn, <=, sn)) {
-        op->handler(op, resp);
+        uct_rc_txqp_completion_op(op, resp);
     }
-    UCT_IB_INSTRUMENT_RECORD_SEND_OP(op);
 }
 
 static UCS_F_ALWAYS_INLINE uint8_t
@@ -334,11 +379,15 @@ uct_rc_txqp_posted(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface, uint16_t res_coun
     if (signaled) {
         ucs_assert(uct_rc_iface_have_tx_cqe_avail(iface));
         txqp->unsignaled = 0;
-        --iface->tx.cq_available;
         UCS_STATS_UPDATE_COUNTER(txqp->stats, UCT_RC_TXQP_STAT_SIGNAL, 1);
     } else {
-        txqp->unsignaled++;
+        ucs_assert(txqp->unsignaled != RC_UNSIGNALED_INF);
+        ++txqp->unsignaled;
     }
+
+    /* reserve cq credits for every posted operation,
+     * in case it would complete with error */
+    iface->tx.cq_available -= res_count;
     txqp->available -= res_count;
 }
 
@@ -356,13 +405,5 @@ uct_rc_fc_req_moderation(uct_rc_fc_t *fc, uct_rc_iface_t *iface)
            (fc->fc_wnd == iface->config.fc_soft_thresh) ?
             UCT_RC_EP_FC_FLAG_SOFT_REQ : 0;
 }
-
-static inline void uct_rc_ep_process_tx_completion(uct_rc_iface_t *iface,
-                                                   uct_rc_ep_t *ep,
-                                                   const void *resp,
-                                                   uint16_t sn)
-{
- }
-
 
 #endif

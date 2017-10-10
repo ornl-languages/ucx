@@ -10,6 +10,7 @@
 #include "test_perf.h"
 
 extern "C" {
+#include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 }
 #include <pthread.h>
@@ -173,7 +174,8 @@ test_perf::test_result test_perf::run_multi_threaded(const test_spec &test, unsi
     rte_comm c0to1, c1to0;
 
     ucx_perf_params_t params;
-    params.api             = test.api;
+    memset(&params, 0, sizeof(params));
+    params.api = test.api;
     params.command         = test.command;
     params.test_type       = test.test_type;
     params.thread_mode     = UCS_THREAD_MODE_SINGLE;
@@ -184,20 +186,28 @@ test_perf::test_result test_perf::run_multi_threaded(const test_spec &test, unsi
     params.am_hdr_size     = 8;
     params.alignment       = ucs_get_page_size();
     params.max_outstanding = test.max_outstanding;
-    params.warmup_iter     = test.iters / 10;
-    params.max_iter        = test.iters;
+    if (ucs::test_time_multiplier() == 1) {
+        params.warmup_iter     = test.iters / 10;
+        params.max_iter        = test.iters;
+    } else {
+        params.warmup_iter     = 0;
+        params.max_iter        = ucs_min(20u,
+                                         test.iters / ucs::test_time_multiplier());
+    }
     params.max_time        = 0.0;
     params.report_interval = 1.0;
     params.rte_group       = NULL;
     params.rte             = &rte::test_rte;
     params.report_arg      = NULL;
-    strncpy(params.uct.dev_name, dev_name.c_str(), sizeof(params.uct.dev_name));
-    strncpy(params.uct.tl_name , tl_name.c_str(),  sizeof(params.uct.tl_name));
-    params.uct.data_layout = test.data_layout;
+    ucs_strncpy_zero(params.uct.dev_name, dev_name.c_str(), sizeof(params.uct.dev_name));
+    ucs_strncpy_zero(params.uct.tl_name , tl_name.c_str(),  sizeof(params.uct.tl_name));
+    params.uct.data_layout = (uct_perf_data_layout_t)test.data_layout;
     params.uct.fc_window   = UCT_PERF_TEST_MAX_FC_WINDOW;
     params.msg_size_cnt    = test.msglencnt;
     params.msg_size_list   = (size_t *)test.msglen;
     params.iov_stride      = test.msg_stride;
+    params.ucp.send_datatype = (ucp_perf_datatype_t)test.data_layout;
+    params.ucp.recv_datatype = (ucp_perf_datatype_t)test.data_layout;
 
     thread_arg arg0;
     arg0.params   = params;
@@ -238,13 +248,9 @@ test_perf::test_result test_perf::run_multi_threaded(const test_spec &test, unsi
     return result;
 }
 
-void test_perf::run_test(const test_spec& test, unsigned flags, double min, double max,
+void test_perf::run_test(const test_spec& test, unsigned flags, bool check_perf,
                          const std::string &tl_name, const std::string &dev_name)
 {
-    if (ucs::test_time_multiplier() > 1) {
-        UCS_TEST_SKIP;
-    }
-
     std::vector<int> cpus = get_affinity();
     if (cpus.size() < 2) {
         UCS_TEST_MESSAGE << "Need at least 2 CPUs (got: " << cpus.size() << " )";
@@ -274,12 +280,13 @@ void test_perf::run_test(const test_spec& test, unsigned flags, double min, doub
             UCS_TEST_MESSAGE << result_str << " (attempt " << i << ")";
         }
 
-        if ((value >= min) && (value <= max)) {
+        if (!check_perf || (ucs::test_time_multiplier() > 1) ||
+            ((value >= test.min) && (value <= test.max))) {
             return; /* Success */
         }
     }
 
-    ADD_FAILURE() << "Invalid " << test.title << " performance, expected: " <<
-                    std::setprecision(3) << min << ".." << max;
+     ADD_FAILURE() << "Invalid " << test.title << " performance, expected: " <<
+                      std::setprecision(3) << test.min << ".." << test.max;
 }
 

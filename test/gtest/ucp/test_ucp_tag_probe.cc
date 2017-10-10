@@ -25,9 +25,10 @@ public:
      * */
     void test_send_probe (size_t s_size, size_t r_size, bool is_sync,
                           int is_recv_msg) {
-        ucp_tag_recv_info info;
-        ucp_tag_message_h message;
-        request *send_req = NULL, *recv_req = NULL;
+        ucp_tag_recv_info_t info;
+        ucp_tag_message_h   message;
+        request             *send_req = NULL;
+        request             *recv_req = NULL;
 
         std::vector<char> sendbuf(s_size, 0);
         std::vector<char> recvbuf(r_size, 0);
@@ -43,7 +44,7 @@ public:
                                     0x111337);
 
         } else {
-            send_b(&sendbuf[0], sendbuf.size(), DATATYPE, 0x111337);
+            send_req = send_nb(&sendbuf[0], sendbuf.size(), DATATYPE, 0x111337);
         }
 
         do {
@@ -79,7 +80,7 @@ public:
         }
         request_release(recv_req);
 
-        if (is_sync) {
+        if (UCS_PTR_IS_PTR(send_req)) {
             wait(send_req);
             EXPECT_TRUE(send_req->completed);
             EXPECT_EQ(UCS_OK, send_req->status);
@@ -89,9 +90,9 @@ public:
 
     int probe_all(std::string &recvbuf)
     {
-        ucp_tag_message_h message;
+        ucp_tag_message_h   message;
         ucp_tag_recv_info_t info;
-        request *req;
+        request             *req;
 
         int count = 0;
         for (;;) {
@@ -129,13 +130,11 @@ UCS_TEST_P(test_ucp_tag_probe, send_medium_msg_probe_truncated, "RNDV_THRESH=104
 
 UCS_TEST_P(test_ucp_tag_probe, send_rndv_msg_probe, "RNDV_THRESH=1048576") {
     static const size_t size = 1148576;
-    ucp_tag_recv_info info;
-    ucp_tag_message_h message;
-    request *my_send_req, *my_recv_req;
+    ucp_tag_recv_info_t info;
+    ucp_tag_message_h   message;
+    request             *my_send_req, *my_recv_req;
 
-    if (&sender() == &receiver()) {
-        UCS_TEST_SKIP_R("loop-back unsupported");
-    }
+    skip_loopback();
 
     std::vector<char> sendbuf(size, 0);
     std::vector<char> recvbuf(size, 0);
@@ -150,7 +149,7 @@ UCS_TEST_P(test_ucp_tag_probe, send_rndv_msg_probe, "RNDV_THRESH=1048576") {
     ASSERT_TRUE(!UCS_PTR_IS_ERR(my_send_req));
 
     /* receiver - get the RTS and put it into unexpected */
-    short_progress_loop();
+    wait_for_unexpected_msg(receiver().ucph(), 10.0);
 
     /* receiver - match the rts, remove it from unexpected and return it */
     message = ucp_tag_probe_nb(receiver().worker(), 0x1337, 0xffff, 1, &info);
@@ -181,6 +180,80 @@ UCS_TEST_P(test_ucp_tag_probe, send_rndv_msg_probe, "RNDV_THRESH=1048576") {
     request_release(my_recv_req);
 }
 
+UCS_TEST_P(test_ucp_tag_probe, send_2_msg_probe, "RNDV_THRESH=inf") {
+    const ucp_datatype_t DT_INT = ucp_dt_make_contig(sizeof(int));
+    const ucp_tag_t      TAG    = 0xaaa;
+    const size_t         COUNT  = 20000;
+    std::vector<request*> reqs;
+
+    /*
+     * send in order: 1, 2
+     */
+    std::vector<int> sdata1(COUNT, 1);
+    std::vector<int> sdata2(COUNT, 2);
+    request *sreq1 = send_nb(&sdata1[0], COUNT, DT_INT, TAG);
+    if (sreq1 != NULL) {
+        reqs.push_back(sreq1);
+    }
+    request *sreq2 = send_nb(&sdata2[0], COUNT, DT_INT, TAG);
+    if (sreq2 != NULL) {
+        reqs.push_back(sreq2);
+    }
+
+    /*
+     * probe in order: 1, 2
+     */
+    ucp_tag_message_h   message1, message2;
+    ucp_tag_recv_info_t info;
+    do {
+        progress();
+        message1 = ucp_tag_probe_nb(receiver().worker(), TAG, 0xffff, 1, &info);
+    } while (message1 == NULL);
+    do {
+        progress();
+        message2 = ucp_tag_probe_nb(receiver().worker(), TAG, 0xffff, 1, &info);
+    } while (message2 == NULL);
+
+    /*
+     * receive in **reverse** order: 2, 1
+     */
+    std::vector<int> rdata2(COUNT);
+    request *rreq2 = (request*)ucp_tag_msg_recv_nb(receiver().worker(), &rdata2[0],
+                                                   COUNT, DT_INT, message2,
+                                                   recv_callback);
+    reqs.push_back(rreq2);
+    ASSERT_TRUE(!UCS_PTR_IS_ERR(rreq2));
+    wait(rreq2);
+
+    std::vector<int> rdata1(COUNT);
+    request *rreq1 = (request*)ucp_tag_msg_recv_nb(receiver().worker(), &rdata1[0],
+                                                   COUNT, DT_INT, message1,
+                                                   recv_callback);
+    reqs.push_back(rreq1);
+    ASSERT_TRUE(!UCS_PTR_IS_ERR(rreq1));
+    wait(rreq1);
+
+    if (sreq1 != NULL) {
+        wait(sreq1);
+    }
+    if (sreq2 != NULL) {
+        wait(sreq2);
+    }
+
+    /*
+     * expect data to arrive in probe order (rather than recv order)
+     */
+    EXPECT_EQ(sdata1, rdata1);
+    EXPECT_EQ(sdata2, rdata2);
+    while (!reqs.empty()) {
+        request *req = reqs.back();
+        EXPECT_TRUE(req->completed);
+        EXPECT_EQ(UCS_OK, req->status);
+        request_release(req);
+        reqs.pop_back();
+    }
+}
+
 UCS_TEST_P(test_ucp_tag_probe, limited_probe_size) {
     static const int COUNT = 1000;
     std::string sendbuf, recvbuf;
@@ -189,9 +262,7 @@ UCS_TEST_P(test_ucp_tag_probe, limited_probe_size) {
     request *req;
     int recvd;
 
-    if (&sender() == &receiver()) {
-        UCS_TEST_SKIP_R("loop-back unsupported");
-    }
+    skip_loopback();
 
     sendbuf.resize(100, '1');
     recvbuf.resize(100, '0');
@@ -219,7 +290,7 @@ UCS_TEST_P(test_ucp_tag_probe, limited_probe_size) {
 
     /* probe should not have too many messages here because we poll once */
     recvd = probe_all(recvbuf);
-    EXPECT_LE(recvd, 32);
+    EXPECT_LE(recvd, 128);
 
     /* receive all the rest */
     while (recvd < COUNT) {

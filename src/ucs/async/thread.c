@@ -13,6 +13,8 @@
 #include "pipe.h"
 
 #include <ucs/arch/atomic.h>
+#include <ucs/sys/checker.h>
+#include <ucs/sys/sys.h>
 
 
 #define UCS_ASYNC_EPOLL_MAX_EVENTS      16
@@ -81,9 +83,13 @@ static void *ucs_async_thread_func(void *arg)
 
         /* Wait until the remainder of current period */
         timer_interval = ucs_timerq_min_interval(&thread->timerq);
-        time_spent     = curr_time - last_time;
-        timeout_ms     = ucs_time_to_msec(timer_interval - ucs_min(time_spent,
-                                                                   timer_interval));
+        if (timer_interval == UCS_TIME_INFINITY) {
+            timeout_ms = -1;
+        } else {
+            time_spent = curr_time - last_time;
+            timeout_ms = ucs_time_to_msec(timer_interval -
+                                          ucs_min(time_spent, timer_interval));
+        }
         nready = epoll_wait(thread->epfd, events, UCS_ASYNC_EPOLL_MAX_EVENTS,
                             timeout_ms);
         if ((nready < 0) && (errno != EINTR)) {
@@ -311,6 +317,26 @@ static ucs_status_t ucs_async_thread_remove_event_fd(ucs_async_context_t *async,
     return UCS_OK;
 }
 
+static ucs_status_t ucs_async_thread_modify_event_fd(ucs_async_context_t *async,
+                                                     int event_fd, int events)
+{
+    ucs_async_thread_t *thread = ucs_async_thread_global_context.thread;
+    struct epoll_event event;
+    int ret;
+
+    memset(&event, 0, sizeof(event));
+    event.events  = events;
+    event.data.fd = event_fd;
+    ret = epoll_ctl(thread->epfd, EPOLL_CTL_MOD, event_fd, &event);
+    if (ret < 0) {
+        ucs_error("epoll_ctl(epfd=%d, ADD, fd=%d) failed: %m", thread->epfd,
+                  event_fd);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    return UCS_OK;
+}
+
 static int ucs_async_thread_try_block(ucs_async_context_t *async)
 {
     return
@@ -385,6 +411,7 @@ ucs_async_ops_t ucs_async_thread_ops = {
     .context_unblock    = ucs_async_thread_unblock,
     .add_event_fd       = ucs_async_thread_add_event_fd,
     .remove_event_fd    = ucs_async_thread_remove_event_fd,
+    .modify_event_fd    = ucs_async_thread_modify_event_fd,
     .add_timer          = ucs_async_thread_add_timer,
     .remove_timer       = ucs_async_thread_remove_timer,
 };
