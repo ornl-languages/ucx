@@ -2332,6 +2332,9 @@ ucs_status_t ucp_put(ucp_ep_h ep, const void *buffer, size_t length,
 ucs_status_t ucp_put_nbi(ucp_ep_h ep, const void *buffer, size_t length,
                          uint64_t remote_addr, ucp_rkey_h rkey);
 
+ucs_status_ptr_t ucp_put_nbe(ucp_ep_h ep, const void *buffer, size_t length,
+                             uint64_t remote_addr, ucp_rkey_h rkey,
+                             ucp_send_callback_t send_cb, void *cb_data);
 
 /**
  * @ingroup UCP_COMM
@@ -2386,6 +2389,10 @@ ucs_status_t ucp_get(ucp_ep_h ep, void *buffer, size_t length,
  */
 ucs_status_t ucp_get_nbi(ucp_ep_h ep, void *buffer, size_t length,
                          uint64_t remote_addr, ucp_rkey_h rkey);
+
+ucs_status_ptr_t ucp_get_nbe(ucp_ep_h ep, void *buffer, size_t length,
+                             uint64_t remote_addr, ucp_rkey_h rkey,
+                             ucp_send_callback_t send_cb, void *cb_data);
 
 
 /**
@@ -2713,6 +2720,11 @@ ucp_atomic_fetch_nb(ucp_ep_h ep, ucp_atomic_fetch_op_t opcode,
                      uint64_t remote_addr, ucp_rkey_h rkey,
                      ucp_send_callback_t cb);
 
+ucs_status_ptr_t
+ucp_atomic_fetch_nbe(ucp_ep_h ep, ucp_atomic_fetch_op_t opcode,
+                     uint64_t value, void *result, size_t op_size,
+                     uint64_t remote_addr, ucp_rkey_h rkey,
+                     ucp_send_callback_t cb, void *cb_data);
 
 /**
  * @ingroup UCP_COMM
@@ -2769,6 +2781,8 @@ ucs_status_t ucp_tag_recv_request_test(void *request, ucp_tag_recv_info_t *info)
  */
 void ucp_request_cancel(ucp_worker_h worker, void *request);
 
+
+void ucp_request_get_cb_data(void *request, void **data);
 
 /**
  * @ingroup UCP_COMM

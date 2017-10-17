@@ -96,6 +96,7 @@ struct ucp_request {
             ucp_datatype_t        datatype; /* Send type */
             size_t                length;   /* Total length, in bytes */
             ucp_send_callback_t   cb;       /* Completion callback */
+            void                  *cb_data; /* Call back data for _nbe api */
 
             union {
                 ucp_tag_t         tag;      /* Tagged send */
